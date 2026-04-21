@@ -1,9 +1,4 @@
-"""Launcher for the NIfTI Tool Suite.
-
-Just run:
-
-    python run.py
-"""
+'''Launcher'''
 
 from niftitool import main
 
