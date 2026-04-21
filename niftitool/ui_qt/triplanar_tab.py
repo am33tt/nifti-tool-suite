@@ -330,13 +330,18 @@ class TriplanarMixin:
         else:
             sl = g[:, :, idx].T
         sl_win = apply_window(sl.astype(np.float32, copy=False), ww, wc)
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(6, 6), facecolor='white')
+        # Use Figure + Agg canvas directly rather than pyplot: deps.py sets
+        # the global backend to TkAgg for the legacy tk UI, and switching
+        # backends while Qt owns the main loop raises ImportError.
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = Figure(figsize=(6, 6), facecolor='white')
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
         ax.imshow(sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1)
         ax.axis('off')
         fig.tight_layout(pad=0)
         fig.savefig(path, dpi=200, bbox_inches='tight')
-        plt.close(fig)
         self._append_log(f"  Exported {axis} slice → {Path(path).name}", 'ok')
 
 

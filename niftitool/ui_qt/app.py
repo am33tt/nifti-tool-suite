@@ -257,6 +257,20 @@ class NiftiApp(
         if path:
             self._load_path(path)
 
+    # ── shutdown ─────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        # Stop QTimers before the event loop tears down so late signals from
+        # daemon threads can't trigger QBasicTimer::start warnings.
+        for name in ('_ram_timer', '_tri_debounce_timer', '_emap_debounce_timer'):
+            t = getattr(self, name, None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:
+                    pass
+        super().closeEvent(event)
+
     # ── dependency check ─────────────────────────────────────────────────────
 
     def _check_deps(self):
@@ -452,7 +466,7 @@ class NiftiApp(
         sb_lay.addWidget(div)
 
         self._ram_label = QLabel("RAM  --", status_bar)
-        self._ram_label.setFont(QFont("Segoe UI", 9))
+        self._ram_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self._ram_label.setStyleSheet(
             f"color: {TEXT_DIM}; background-color: {PANEL2};"
         )
