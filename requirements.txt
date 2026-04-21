@@ -1,0 +1,9 @@
+PyQt6
+numpy
+scipy
+nibabel
+matplotlib
+scikit-image
+vtk
+psutil
+tkinterdnd2
