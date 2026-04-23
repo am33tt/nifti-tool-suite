@@ -9,10 +9,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIntValidator
 from PyQt6.QtWidgets import (
-    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
-    QSlider, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QSlider, QVBoxLayout, QWidget,
 )
 
 from ..config import (
@@ -108,13 +108,17 @@ class TriplanarMixin:
             sl = QSlider(Qt.Orientation.Horizontal, row_w)
             sl.setMinimum(0); sl.setMaximum(100)
             row_lay.addWidget(sl, 1)
-            idx_lbl = QLabel("--", row_w)
-            idx_lbl.setFont(QFont("Consolas", 10))
-            idx_lbl.setStyleSheet(
-                f"color: {ax_col}; background-color: {PANEL2};"
+            idx_edit = QLineEdit("--", row_w)
+            idx_edit.setFont(QFont("Consolas", 10))
+            idx_edit.setStyleSheet(
+                f"color: {ax_col}; background-color: {PANEL2}; "
+                f"border: 1px solid {BORDER}; padding: 1px 3px;"
             )
-            idx_lbl.setFixedWidth(40)
-            row_lay.addWidget(idx_lbl)
+            idx_edit.setFixedWidth(50)
+            idx_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+            idx_edit.setValidator(QIntValidator(0, 10_000, idx_edit))
+            idx_edit.setToolTip("Type a slice index and press Enter to jump.")
+            row_lay.addWidget(idx_edit)
             col_lay.addWidget(row_w)
 
             sb_grid.addWidget(col_frame, 0, col)
@@ -123,8 +127,11 @@ class TriplanarMixin:
             sl.valueChanged.connect(
                 lambda val, a=ax: self._on_tri_drag(a, val)
             )
+            idx_edit.editingFinished.connect(
+                lambda a=ax, e=idx_edit: self._on_tri_idx_entered(a, e)
+            )
             self._tri_sliders[ax] = sl
-            self._tri_idx_widgets[ax] = idx_lbl
+            self._tri_idx_widgets[ax] = idx_edit
 
         root.addWidget(slider_bar)
 
@@ -157,11 +164,36 @@ class TriplanarMixin:
     def _on_tri_drag(self, axis, val):
         idx = int(val)
         self._tri_idx[axis] = idx
-        self._tri_idx_widgets[axis].setText(str(idx))
+        w = self._tri_idx_widgets[axis]
+        w.blockSignals(True)
+        w.setText(str(idx))
+        w.blockSignals(False)
         if self._gray is None:
             return
         # Debounce
         self._tri_debounce_timer.start(SLIDER_DEBOUNCE_MS)
+
+    def _on_tri_idx_entered(self, axis, edit):
+        """User typed a slice number and committed (Enter / focus out).
+
+        Clamp to the slider range and jump. Setting the slider value re-emits
+        valueChanged, which refreshes the canvas through the debounce timer.
+        """
+        txt = edit.text().strip()
+        if not txt:
+            edit.setText(str(self._tri_idx[axis]))
+            return
+        try:
+            idx = int(txt)
+        except ValueError:
+            edit.setText(str(self._tri_idx[axis]))
+            return
+        sl = self._tri_sliders[axis]
+        idx = max(sl.minimum(), min(idx, sl.maximum()))
+        edit.setText(str(idx))
+        if sl.value() == idx:
+            return
+        sl.setValue(idx)
 
     def _on_tri_click(self, event):
         if self._gray is None or event.inaxes is None:
@@ -282,11 +314,11 @@ class TriplanarMixin:
                 h_pos, v_pos = crosshair_pos[axis]
                 h_axis, v_axis = crosshair_axes[axis]
                 self._tri_hline[axis] = ax_obj.axhline(
-                    h_pos, color=AXIS_COLOR[h_axis], lw=1.0, alpha=0.85,
+                    h_pos, color=AXIS_COLOR[h_axis], lw=1.8, alpha=1.0,
                     linestyle='--',
                 )
                 self._tri_vline[axis] = ax_obj.axvline(
-                    v_pos, color=AXIS_COLOR[v_axis], lw=1.0, alpha=0.85,
+                    v_pos, color=AXIS_COLOR[v_axis], lw=1.8, alpha=1.0,
                     linestyle='--',
                 )
             else:

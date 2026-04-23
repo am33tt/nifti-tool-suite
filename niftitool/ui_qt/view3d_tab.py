@@ -6,11 +6,14 @@ use the same pipeline 3D Slicer and ParaView use, with no Tcl/Tk.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIntValidator
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QRadioButton, QSlider, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QRadioButton, QSlider, QVBoxLayout,
+    QWidget,
 )
 
 from ..config import (
@@ -56,25 +59,23 @@ class View3DMixin:
         ctrl_lay.setContentsMargins(8, 4, 8, 4)
         ctrl_lay.setSpacing(6)
 
-        # Mode
-        mode_box = QWidget(ctrl)
-        mode_box_lay = QVBoxLayout(mode_box)
-        mode_box_lay.setContentsMargins(0, 0, 0, 0)
-        mode_box_lay.setSpacing(2)
-        mode_lbl = QLabel("Mode", mode_box)
-        mode_lbl.setFont(QFont("Segoe UI", 9))
-        mode_lbl.setStyleSheet(f"color: {TEXT_DIM}; background-color: {BG};")
-        mode_box_lay.addWidget(mode_lbl)
-        mode_row = QWidget(mode_box)
+        # Mode radios (no heading — the two labels are self-explanatory).
+        mode_row = QWidget(ctrl)
         mr_lay = QHBoxLayout(mode_row)
         mr_lay.setContentsMargins(0, 0, 0, 0); mr_lay.setSpacing(4)
 
         self._3d_mode_group = QButtonGroup(mode_row)
         self._3d_mode_radios: dict = {}
+        mode_rb_style = (
+            f"QRadioButton {{ color: {TEXT_DIM}; background-color: transparent; "
+            f"padding: 2px 6px; border-radius: 3px; }}"
+            f"QRadioButton:checked {{ color: {ACCENT}; font-weight: bold; "
+            f"background-color: {PANEL2}; }}"
+        )
         for label, value in (("Volume", "volume"), ("Slice planes", "planes")):
             rb = QRadioButton(label, mode_row)
             rb.setFont(QFont("Segoe UI", 9))
-            rb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
+            rb.setStyleSheet(mode_rb_style)
             self._3d_mode_group.addButton(rb)
             self._3d_mode_radios[value] = rb
             mr_lay.addWidget(rb)
@@ -82,8 +83,7 @@ class View3DMixin:
         self._3d_mode = _RadioVar(self._3d_mode_radios, default="volume")
         for rb in self._3d_mode_radios.values():
             rb.toggled.connect(self._on_3d_mode_toggled)
-        mode_box_lay.addWidget(mode_row)
-        ctrl_lay.addWidget(mode_box)
+        ctrl_lay.addWidget(mode_row)
 
         ctrl_lay.addWidget(
             styled_btn(ctrl, "▶  Render", self._do_3d_render,
@@ -92,6 +92,31 @@ class View3DMixin:
         ctrl_lay.addWidget(
             styled_btn(ctrl, "Reset View", self._reset_3d_camera, small=True)
         )
+
+        # Camera presets: click-to-frame the volume from a standard anatomical
+        # angle. Labels follow radiology convention (A=anterior, P=posterior,
+        # L/R=patient left/right, S=superior, I=inferior).
+        preset_lbl = QLabel("View:", ctrl)
+        preset_lbl.setFont(QFont("Segoe UI", 9))
+        preset_lbl.setStyleSheet(f"color: {TEXT_DIM}; background-color: transparent;")
+        ctrl_lay.addWidget(preset_lbl)
+        for label, preset, tip in (
+            ("S",   "superior",  "Superior (top-down, axial view)"),
+            ("I",   "inferior",  "Inferior (bottom-up)"),
+            ("A",   "anterior",  "Anterior (front, coronal view)"),
+            ("P",   "posterior", "Posterior (back)"),
+            ("L",   "left",      "Patient left (sagittal view)"),
+            ("R",   "right",     "Patient right (sagittal view)"),
+            ("Iso", "iso",       "Isometric / angled 3-quarter view"),
+        ):
+            btn = styled_btn(
+                ctrl, label,
+                lambda _=False, p=preset: self._set_3d_view_preset(p),
+                small=True,
+            )
+            btn.setToolTip(tip)
+            ctrl_lay.addWidget(btn)
+
         ctrl_lay.addWidget(
             styled_btn(ctrl, "Sync to Tri-Planar",
                        self._sync_3d_to_triplanar, small=True)
@@ -104,8 +129,34 @@ class View3DMixin:
         self._3d_axes_cb.toggled.connect(self._on_3d_axes_toggled)
         ctrl_lay.addWidget(self._3d_axes_cb)
 
+        self._3d_move_cb = QCheckBox("Move", ctrl)
+        self._3d_move_cb.setChecked(False)
+        self._3d_move_cb.setFont(QFont("Segoe UI", 9))
+        self._3d_move_cb.setToolTip(
+            "When on, click-drag translates the picked volume or STL "
+            "instead of rotating the view — useful for aligning an STL "
+            "overlay with the volume."
+        )
+        self._3d_move_cb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
+        self._3d_move_cb.toggled.connect(self._on_3d_move_toggled)
+        ctrl_lay.addWidget(self._3d_move_cb)
+
+        ctrl_lay.addWidget(
+            styled_btn(ctrl, "+ STL", self._load_stl_dialog, small=True)
+        )
+
         ctrl_lay.addStretch(1)
         root.addWidget(ctrl)
+
+        # STL overlay list (hidden until the user loads one)
+        self._stl_list_frame = QFrame(parent)
+        self._stl_list_frame.setStyleSheet(f"background-color: {PANEL2};")
+        stl_lay = QVBoxLayout(self._stl_list_frame)
+        stl_lay.setContentsMargins(8, 2, 8, 2)
+        stl_lay.setSpacing(2)
+        self._stl_list_layout = stl_lay
+        self._stl_list_frame.setVisible(False)
+        root.addWidget(self._stl_list_frame)
 
         # slider bar (only used in "planes" mode)
         sliders = QFrame(parent)
@@ -133,11 +184,17 @@ class View3DMixin:
             sl = QSlider(Qt.Orientation.Horizontal, row_w)
             sl.setMinimum(0); sl.setMaximum(100)
             row_lay.addWidget(sl, 1)
-            idx_lbl = QLabel("--", row_w)
-            idx_lbl.setFont(QFont("Segoe UI", 9))
-            idx_lbl.setStyleSheet(f"color: {ACCENT}; background-color: {PANEL2};")
-            idx_lbl.setFixedWidth(40)
-            row_lay.addWidget(idx_lbl)
+            idx_edit = QLineEdit("--", row_w)
+            idx_edit.setFont(QFont("Segoe UI", 9))
+            idx_edit.setStyleSheet(
+                f"color: {ACCENT}; background-color: {PANEL2}; "
+                f"border: 1px solid {BORDER}; padding: 1px 3px;"
+            )
+            idx_edit.setFixedWidth(50)
+            idx_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+            idx_edit.setValidator(QIntValidator(0, 10_000, idx_edit))
+            idx_edit.setToolTip("Type a slice index and press Enter to jump.")
+            row_lay.addWidget(idx_edit)
             cf_lay.addWidget(row_w)
 
             sgrid.addWidget(cf, 0, col)
@@ -146,8 +203,11 @@ class View3DMixin:
             sl.valueChanged.connect(
                 lambda val, a=ax: self._on_3d_drag(a, val)
             )
+            idx_edit.editingFinished.connect(
+                lambda a=ax, e=idx_edit: self._on_3d_idx_entered(a, e)
+            )
             self._3d_sliders[ax] = sl
-            self._3d_idx_widgets[ax] = idx_lbl
+            self._3d_idx_widgets[ax] = idx_edit
 
         root.addWidget(sliders)
 
@@ -171,6 +231,19 @@ class View3DMixin:
         self._vtk_iren.Initialize()
         # Do NOT call ``Start()`` - the Qt event loop drives the interactor.
 
+        # Two interactor styles: camera (rotate the scene) and actor (drag the
+        # grabbed prop). Default is camera. ``MotionFactor`` slows both down
+        # so fine analysis doesn't overshoot on small mouse moves.
+        self._style_camera = vtk.vtkInteractorStyleTrackballCamera()
+        self._style_actor = vtk.vtkInteractorStyleTrackballActor()
+        # Only the camera style exposes ``SetMotionFactor``; the actor
+        # style translates by screen-pixel math and has no equivalent
+        # scalar knob. Guard so future VTK versions don't crash us either.
+        for style in (self._style_camera, self._style_actor):
+            if hasattr(style, 'SetMotionFactor'):
+                style.SetMotionFactor(6.0)
+        self._vtk_iren.SetInteractorStyle(self._style_camera)
+
         self._vtk_image = None
         self._vtk_volume = None
         self._vtk_plane_actors = []
@@ -185,6 +258,162 @@ class View3DMixin:
         # voxel extents straight off the viewport.
         self._cube_axes = None
         self._build_axes_indicators()
+
+        # STL overlay registry. Each entry:
+        # {"path": Path, "name": str, "color": (r,g,b), "actor": vtkActor,
+        #  "row": QWidget, "checkbox": QCheckBox}
+        self._stl_overlays: list[dict] = []
+
+    # STL overlays (boundary-condition preprocessing)
+
+    # Qualitative palette for distinguishing BC regions at a glance. Cycles
+    # when the user loads more STLs than colors — the user can still tell
+    # them apart from the list label.
+    _STL_PALETTE = (
+        "#E5484D", "#2FA84F", "#3B82F6", "#F59E0B",
+        "#8B5CF6", "#14B8A6", "#EC4899", "#06B6D4",
+    )
+
+    def _load_stl_dialog(self):
+        if not HAS_VTK:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self._vtk_widget, "Load STL overlay",
+            "", "STL files (*.stl);;All files (*)",
+        )
+        for p in paths:
+            self._add_stl_overlay(p)
+
+    def _add_stl_overlay(self, path: str):
+        import vtk
+        p = Path(path)
+        if not p.exists():
+            self._append_log(f"  STL not found: {p}", 'err')
+            return
+
+        reader = vtk.vtkSTLReader()
+        reader.SetFileName(str(p))
+        reader.Update()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(reader.GetOutputPort())
+        mapper.ScalarVisibilityOff()
+
+        color_hex = self._STL_PALETTE[len(self._stl_overlays) % len(self._STL_PALETTE)]
+        rgb = self._hex_to_rgb(color_hex)
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(*rgb)
+        prop.SetOpacity(0.55)
+        prop.SetEdgeVisibility(0)
+
+        self._vtk_renderer.AddActor(actor)
+
+        row, checkbox = self._make_stl_row(p.name, color_hex)
+        self._stl_list_layout.addWidget(row)
+        self._stl_list_frame.setVisible(True)
+
+        entry = {
+            "path": p, "name": p.name, "color": color_hex,
+            "actor": actor, "row": row, "checkbox": checkbox,
+        }
+        self._stl_overlays.append(entry)
+
+        checkbox.toggled.connect(
+            lambda on, e=entry: self._on_stl_visibility(e, on)
+        )
+
+        # If no volume has framed the scene yet, reset the camera so the
+        # newly added STL is actually in view.
+        if self._vtk_image is None and len(self._stl_overlays) == 1:
+            self._vtk_renderer.ResetCamera()
+        self._vtk_widget.GetRenderWindow().Render()
+        self._append_log(f"  Loaded STL overlay: {p.name}", 'info')
+
+    def _make_stl_row(self, name: str, color_hex: str):
+        row = QWidget(self._stl_list_frame)
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.setSpacing(6)
+
+        cb = QCheckBox(row)
+        cb.setChecked(True)
+        cb.setStyleSheet("background-color: transparent;")
+        row_lay.addWidget(cb)
+
+        dot = QLabel(row)
+        dot.setFixedSize(10, 10)
+        dot.setStyleSheet(
+            f"background-color: {color_hex}; border-radius: 5px;"
+        )
+        row_lay.addWidget(dot)
+
+        lbl = QLabel(name, row)
+        lbl.setFont(QFont("Segoe UI", 9))
+        lbl.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
+        row_lay.addWidget(lbl, 1)
+
+        focus = QPushButton("Focus", row)
+        focus.setFlat(True)
+        focus.setToolTip("Zoom the camera to this STL's bounds.")
+        focus.setStyleSheet(
+            f"color: {TEXT_DIM}; background-color: transparent; border: none;"
+        )
+        focus.clicked.connect(lambda _=False, r=row: self._focus_stl_by_row(r))
+        row_lay.addWidget(focus)
+
+        rm = QPushButton("×", row)
+        rm.setFixedWidth(22)
+        rm.setFlat(True)
+        rm.setStyleSheet(
+            f"color: {TEXT_DIM}; background-color: transparent; "
+            f"border: none; font-weight: bold;"
+        )
+        rm.clicked.connect(lambda _=False, r=row: self._remove_stl_row(r))
+        row_lay.addWidget(rm)
+
+        return row, cb
+
+    def _focus_stl_by_row(self, row):
+        entry = next((e for e in self._stl_overlays if e["row"] is row), None)
+        if entry is not None:
+            self._focus_on_stl(entry)
+
+    def _on_stl_visibility(self, entry: dict, visible: bool):
+        entry["actor"].SetVisibility(1 if visible else 0)
+        self._vtk_widget.GetRenderWindow().Render()
+
+    def _on_3d_move_toggled(self, checked: bool):
+        """Swap the interactor style between rotate-camera and translate-actor.
+
+        Trackball-actor mode is needed to drag an STL overlay into place on
+        top of the NIfTI volume when the two were authored in different
+        coordinate frames.
+        """
+        style = self._style_actor if checked else self._style_camera
+        self._vtk_iren.SetInteractorStyle(style)
+
+    def _focus_on_stl(self, entry: dict):
+        """Zoom the camera onto a single STL's bounds — handy when the
+        STL is tiny relative to the volume and otherwise invisible."""
+        actor = entry["actor"]
+        b = actor.GetBounds()
+        self._vtk_renderer.ResetCamera(b)
+        self._vtk_widget.GetRenderWindow().Render()
+
+    def _remove_stl_row(self, row):
+        entry = next((e for e in self._stl_overlays if e["row"] is row), None)
+        if entry is None:
+            return
+        self._vtk_renderer.RemoveActor(entry["actor"])
+        entry["row"].setParent(None)
+        entry["row"].deleteLater()
+        self._stl_overlays.remove(entry)
+        if not self._stl_overlays:
+            self._stl_list_frame.setVisible(False)
+        self._vtk_widget.GetRenderWindow().Render()
 
     # axis indicators
 
@@ -323,10 +552,35 @@ class View3DMixin:
     def _on_3d_drag(self, axis, val):
         idx = int(val)
         self._3d_idx[axis] = idx
-        self._3d_idx_widgets[axis].setText(str(idx))
+        w = self._3d_idx_widgets[axis]
+        w.blockSignals(True)
+        w.setText(str(idx))
+        w.blockSignals(False)
         if self._3d_mode.get() != "planes":
             return
         self._update_plane_position(axis, idx)
+
+    def _on_3d_idx_entered(self, axis, edit):
+        """Jump the 3-D slice slider to a typed index.
+
+        Only meaningful in "planes" mode, but we still sync the slider in
+        "volume" mode so the value sticks if the user later toggles modes.
+        """
+        txt = edit.text().strip()
+        if not txt:
+            edit.setText(str(self._3d_idx[axis]))
+            return
+        try:
+            idx = int(txt)
+        except ValueError:
+            edit.setText(str(self._3d_idx[axis]))
+            return
+        sl = self._3d_sliders[axis]
+        idx = max(sl.minimum(), min(idx, sl.maximum()))
+        edit.setText(str(idx))
+        if sl.value() == idx:
+            return
+        sl.setValue(idx)
 
     def _sync_3d_to_triplanar(self):
         if self._gray is None:
@@ -346,6 +600,57 @@ class View3DMixin:
         if not HAS_VTK or self._vtk_image is None:
             return
         self._vtk_renderer.ResetCamera()
+        self._vtk_widget.GetRenderWindow().Render()
+
+    def _set_3d_view_preset(self, preset: str):
+        """Aim the camera at a canonical anatomical view.
+
+        Voxel index axes in this viewer are (X=sagittal, Y=coronal, Z=axial),
+        so patient-left = +X, anterior = +Y, superior = +Z in world space.
+        We pick a unit direction from focal-point → camera, then let VTK's
+        ``ResetCamera`` fit the distance so the whole volume stays visible.
+        """
+        if not HAS_VTK:
+            return
+        ren = self._vtk_renderer
+        bounds = ren.ComputeVisiblePropBounds()
+        # Empty scene — ComputeVisiblePropBounds returns an inverted range.
+        if bounds[0] > bounds[1]:
+            return
+        cx = 0.5 * (bounds[0] + bounds[1])
+        cy = 0.5 * (bounds[2] + bounds[3])
+        cz = 0.5 * (bounds[4] + bounds[5])
+
+        # (direction-from-focal-point-to-camera, view-up)
+        presets = {
+            "superior":  (( 0,  0,  1), (0,  1, 0)),
+            "inferior":  (( 0,  0, -1), (0,  1, 0)),
+            "anterior":  (( 0, -1,  0), (0,  0, 1)),
+            "posterior": (( 0,  1,  0), (0,  0, 1)),
+            "left":      ((-1,  0,  0), (0,  0, 1)),
+            "right":     (( 1,  0,  0), (0,  0, 1)),
+            "iso":       (( 1, -1,  1), (0,  0, 1)),
+        }
+        spec = presets.get(preset)
+        if spec is None:
+            return
+        direction, view_up = spec
+
+        diag = (
+            (bounds[1] - bounds[0]) ** 2
+            + (bounds[3] - bounds[2]) ** 2
+            + (bounds[5] - bounds[4]) ** 2
+        ) ** 0.5
+        d = max(diag, 1.0)
+
+        cam = ren.GetActiveCamera()
+        cam.SetFocalPoint(cx, cy, cz)
+        cam.SetPosition(cx + direction[0] * d,
+                        cy + direction[1] * d,
+                        cz + direction[2] * d)
+        cam.SetViewUp(*view_up)
+        ren.ResetCamera()
+        ren.ResetCameraClippingRange()
         self._vtk_widget.GetRenderWindow().Render()
 
     # render
@@ -470,6 +775,11 @@ class View3DMixin:
 
         self._ensure_cube_axes((nx, ny, nz), (sx, sy, sz))
         self._vtk_renderer.AddActor(self._cube_axes)
+
+        # Re-attach STL overlays wiped by RemoveAllViewProps above so the
+        # user's BC regions survive a volume reload.
+        for entry in getattr(self, '_stl_overlays', ()):
+            self._vtk_renderer.AddActor(entry["actor"])
 
     def _window_bounds(self, arr):
         ww, wc = self._ww, self._wc
