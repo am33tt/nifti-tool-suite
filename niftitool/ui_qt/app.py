@@ -1,9 +1,7 @@
-"""Main application window (PyQt6 port of the tkinter ``app.py``).
+"""Main application window.
 
-:class:`NiftiApp` is the thin composition layer — it owns the shared
-volume state and wires the individual tab mixins together.  Each mixin
-lives in its own file so behaviour for a given tab can be edited (and
-bugs tracked) in isolation.
+NiftiApp owns the shared volume state and wires the tab mixins together.
+Each mixin lives in its own file so bugs and edits stay local.
 """
 
 from __future__ import annotations
@@ -11,8 +9,9 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut, QFont
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMainWindow, QScrollArea, QSplitter,
-    QStatusBar, QTabWidget, QVBoxLayout, QWidget,
+    QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
+    QScrollArea, QSplitter, QStackedWidget, QStatusBar, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from ..config import (
@@ -37,7 +36,7 @@ def _build_qss() -> str:
 
     Applied at the ``QApplication`` level so it reaches top-level dialogs
     (``QMessageBox``, ``QFileDialog``, etc.) which are not descendants of
-    the main window and would otherwise fall back to the OS palette —
+    the main window and would otherwise fall back to the OS palette -
     on Windows 11 that means dark mode, which makes our light-themed
     dialogs unreadable.
     """
@@ -149,12 +148,12 @@ class NiftiApp(
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("NIfTI Tool Suite  v6  —  SimReady")
+        self.setWindowTitle("NIfTI Tool Suite  v6  -  SimReady")
         self.resize(1600, 1000)
         self.setMinimumSize(1200, 750)
 
         # Apply QSS at application level so top-level dialogs (QMessageBox,
-        # QFileDialog) pick it up too — otherwise Windows dark mode leaks in.
+        # QFileDialog) pick it up too - otherwise Windows dark mode leaks in.
         from PyQt6.QtWidgets import QApplication
         qapp = QApplication.instance()
         if qapp is not None:
@@ -162,7 +161,7 @@ class NiftiApp(
         else:
             self.setStyleSheet(_build_qss())
 
-        # ── volume state ─────────────────────────────────────────────────────
+        # volume state
         self._img = None
         self._gray = None
         self._path = None
@@ -171,7 +170,7 @@ class NiftiApp(
         self._ww = None
         self._wc = None
 
-        # ── material state ───────────────────────────────────────────────────
+        # material state
         self._hu_vol = None
         self._E_map = None
         self._labels = None
@@ -179,10 +178,10 @@ class NiftiApp(
         self._E_stats: dict = {}
         self._porosity = 0.0
 
-        # ── perf aids ────────────────────────────────────────────────────────
+        # perf aids
         self._slice_cache = SliceCache()
 
-        # ── build ────────────────────────────────────────────────────────────
+        # build
         self._build_ui()
         self._connect_thread_signals()
         self._check_deps()
@@ -192,7 +191,7 @@ class NiftiApp(
 
         self._start_ram_monitor()
 
-    # ── thread-safe plumbing ────────────────────────────────────────────────
+    # thread-safe plumbing
 
     def _connect_thread_signals(self):
         self._post_log_signal.connect(self._do_append_log)
@@ -206,7 +205,7 @@ class NiftiApp(
             pass
 
     def after(self, ms: int, fn, *args):
-        """Tkinter compatibility shim — schedule ``fn(*args)`` on the GUI
+        """Tkinter compatibility shim - schedule ``fn(*args)`` on the GUI
         thread after ``ms`` milliseconds.  All existing ``actions.py``
         call sites continue to work unchanged.
         """
@@ -227,7 +226,7 @@ class NiftiApp(
         timers each time."""
         return None
 
-    # ── tab switching ────────────────────────────────────────────────────────
+    # tab switching
 
     def _on_tab_changed(self, index: int):
         """Fire deferred work when the user switches tabs."""
@@ -240,7 +239,7 @@ class NiftiApp(
             if callable(fn):
                 fn()
 
-    # ── drag-and-drop ────────────────────────────────────────────────────────
+    # drag-and-drop
 
     def _setup_dnd(self):
         self.setAcceptDrops(True)
@@ -257,9 +256,22 @@ class NiftiApp(
         if path:
             self._load_path(path)
 
-    # ── shutdown ─────────────────────────────────────────────────────────────
+    # shutdown
 
     def closeEvent(self, event):
+        from PyQt6.QtWidgets import QMessageBox
+
+        reply = QMessageBox.question(
+            self,
+            "Quit NIfTI Tool Suite",
+            "Are you sure you want to close?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+
         # Stop QTimers before the event loop tears down so late signals from
         # daemon threads can't trigger QBasicTimer::start warnings.
         for name in ('_ram_timer', '_tri_debounce_timer', '_emap_debounce_timer'):
@@ -271,7 +283,7 @@ class NiftiApp(
                     pass
         super().closeEvent(event)
 
-    # ── dependency check ─────────────────────────────────────────────────────
+    # dependency check
 
     def _check_deps(self):
         missing = missing_report()
@@ -282,7 +294,7 @@ class NiftiApp(
                 'warn',
             )
 
-    # ── RAM monitor ──────────────────────────────────────────────────────────
+    # RAM monitor
 
     def _start_ram_monitor(self):
         self._ram_timer = QTimer(self)
@@ -295,9 +307,9 @@ class NiftiApp(
         if mb is not None:
             self._ram_label.setText(f"RAM  {mb:.0f} MiB")
         else:
-            self._ram_label.setText("RAM  — (pip install psutil)")
+            self._ram_label.setText("RAM  - (pip install psutil)")
 
-    # ── clipboard helper (used by actions._copy_cpp) ────────────────────────
+    # clipboard helper (used by actions._copy_cpp)
 
     def clipboard_clear(self):
         from PyQt6.QtWidgets import QApplication
@@ -312,7 +324,7 @@ class NiftiApp(
             existing = cb.text() or ""
             cb.setText(existing + text)
 
-    # ── UI skeleton ──────────────────────────────────────────────────────────
+    # UI skeleton
 
     def _build_ui(self):
         central = QWidget(self)
@@ -321,7 +333,7 @@ class NiftiApp(
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Top bar ─────────────────────────────────────────────────────────
+        # Top bar
         top = QFrame(self)
         top.setStyleSheet(f"background-color: {BG};")
         top_lay = QHBoxLayout(top)
@@ -344,7 +356,7 @@ class NiftiApp(
         # Separator
         root.addWidget(hline(self))
 
-        # ── File info bar ───────────────────────────────────────────────────
+        # File info bar
         inf = QFrame(self)
         inf.setStyleSheet(f"background-color: {PANEL2};")
         inf_lay = QHBoxLayout(inf)
@@ -360,37 +372,106 @@ class NiftiApp(
         inf_lay.addStretch(1)
         root.addWidget(inf)
 
-        # ── Main splitter ───────────────────────────────────────────────────
-        splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.setHandleWidth(6)
+        # Build all tool panels (populates self._tool_panels)
+        self._build_controls()
 
-        # Left: scrollable control panel
-        ctrl_outer = QWidget(splitter)
-        ctrl_outer_lay = QVBoxLayout(ctrl_outer)
-        ctrl_outer_lay.setContentsMargins(0, 0, 0, 0)
-        ctrl_outer_lay.setSpacing(0)
+        # Tool navigation bar
+        # One exclusive toggle button per tool; clicking swaps the stacked
+        # page on the left.  Order here = display order.
+        tool_order = [
+            ("viewer",   "Viewer"),
+            ("metadata", "Metadata"),
+            ("stats",    "Stats"),
+            ("hu",       "HU Calibration"),
+            ("material", "Material"),
+            ("reorient", "Reorient"),
+            ("rotate",   "Rotate"),
+            ("crop",     "Crop"),
+        ]
 
-        ctrl_scroll = QScrollArea(ctrl_outer)
-        ctrl_scroll.setWidgetResizable(True)
-        ctrl_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        nav = QFrame(self)
+        nav.setStyleSheet(f"background-color: {PANEL2};")
+        nav_lay = QHBoxLayout(nav)
+        nav_lay.setContentsMargins(10, 4, 10, 4)
+        nav_lay.setSpacing(4)
 
-        self._ctrl_frame = QWidget()
-        self._ctrl_frame.setStyleSheet(f"background-color: {BG};")
-        self._ctrl_layout = QVBoxLayout(self._ctrl_frame)
-        self._ctrl_layout.setContentsMargins(10, 8, 10, 8)
-        self._ctrl_layout.setSpacing(3)
+        self._tool_nav_group = QButtonGroup(self)
+        self._tool_nav_group.setExclusive(True)
+        self._tool_nav_buttons: dict[str, QPushButton] = {}
 
-        ctrl_scroll.setWidget(self._ctrl_frame)
-        ctrl_outer_lay.addWidget(ctrl_scroll)
-        ctrl_outer.setMinimumWidth(320)
-        splitter.addWidget(ctrl_outer)
+        def _nav_btn_qss() -> str:
+            return (
+                f"QPushButton {{"
+                f"  background-color: transparent; color: {TEXT_DIM};"
+                f"  border: none; padding: 6px 14px; font-weight: 600;"
+                f"  border-bottom: 2px solid transparent;"
+                f"}}"
+                f"QPushButton:hover {{ color: {TEXT}; }}"
+                f"QPushButton:checked {{"
+                f"  color: {ACCENT};"
+                f"  border-bottom: 2px solid {ACCENT};"
+                f"}}"
+            )
 
-        self._build_controls(self._ctrl_frame)
-        # Final stretch so controls don't expand vertically to fill
-        self._ctrl_layout.addStretch(1)
+        for key, label in tool_order:
+            btn = QPushButton(label, nav)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(_nav_btn_qss())
+            nav_lay.addWidget(btn)
+            self._tool_nav_group.addButton(btn)
+            self._tool_nav_buttons[key] = btn
+        nav_lay.addStretch(1)
+        root.addWidget(nav)
+        root.addWidget(hline(self))
 
-        # Right: notebook
-        right = QWidget(splitter)
+        # Vertical splitter: main area on top, log pane on the bottom
+        v_split = QSplitter(Qt.Orientation.Vertical, self)
+        v_split.setHandleWidth(6)
+        v_split.setChildrenCollapsible(False)
+
+        # Horizontal splitter inside: tool stack (left) | viz tabs (right)
+        h_split = QSplitter(Qt.Orientation.Horizontal, v_split)
+        h_split.setHandleWidth(6)
+
+        # Left: stacked widget of tool panels, wrapped in a scroll area so
+        # tall panels (e.g. Material Mapping) don't force the window wider.
+        left = QWidget(h_split)
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(0)
+
+        left_scroll = QScrollArea(left)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self._tool_stack = QStackedWidget()
+        self._tool_stack.setStyleSheet(f"background-color: {BG};")
+        self._tool_stack_index: dict[str, int] = {}
+        for key, _label in tool_order:
+            panel = self._tool_panels[key]
+            idx = self._tool_stack.addWidget(panel)
+            self._tool_stack_index[key] = idx
+
+        left_scroll.setWidget(self._tool_stack)
+        left_lay.addWidget(left_scroll)
+        left.setMinimumWidth(320)
+        h_split.addWidget(left)
+
+        # Wire nav buttons → stack page
+        for key, btn in self._tool_nav_buttons.items():
+            btn.clicked.connect(
+                lambda _chk, k=key: self._tool_stack.setCurrentIndex(
+                    self._tool_stack_index[k]
+                )
+            )
+
+        # Default selection
+        self._tool_nav_buttons["viewer"].setChecked(True)
+        self._tool_stack.setCurrentIndex(self._tool_stack_index["viewer"])
+
+        # Right: visualisation notebook (Log tab removed - log is its own pane)
+        right = QWidget(h_split)
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(0)
@@ -398,18 +479,16 @@ class NiftiApp(
         nb = QTabWidget(right)
         right_lay.addWidget(nb)
         right.setMinimumWidth(700)
-        splitter.addWidget(right)
+        h_split.addWidget(right)
 
-        # Create empty tab container widgets; each build_* populates them.
         self._triplanar_tab = QWidget()
         self._viewer3d_tab = QWidget()
         self._histogram_tab = QWidget()
         self._emap_tab = QWidget()
         self._export_tab = QWidget()
-        self._log_tab = QWidget()
 
         for w in (self._triplanar_tab, self._viewer3d_tab, self._histogram_tab,
-                  self._emap_tab, self._export_tab, self._log_tab):
+                  self._emap_tab, self._export_tab):
             w.setStyleSheet(f"background-color: {BG};")
 
         nb.addTab(self._triplanar_tab, "  Tri-Planar  ")
@@ -417,7 +496,6 @@ class NiftiApp(
         nb.addTab(self._histogram_tab, "  Histogram  ")
         nb.addTab(self._emap_tab, "  E-Map Viewer  ")
         nb.addTab(self._export_tab, "  Sim Export  ")
-        nb.addTab(self._log_tab, "  Log  ")
 
         self._nb = nb
 
@@ -427,12 +505,24 @@ class NiftiApp(
         self._build_histogram_tab(self._histogram_tab)
         self._build_emap_tab(self._emap_tab)
         self._build_export_tab(self._export_tab)
-        self._build_log(self._log_tab)
 
-        splitter.setSizes([380, 1200])
-        root.addWidget(splitter, 1)
+        h_split.setSizes([380, 1200])
+        v_split.addWidget(h_split)
 
-        # ── Status bar ──────────────────────────────────────────────────────
+        # Bottom: always-visible log pane
+        log_pane = QWidget(v_split)
+        log_pane.setStyleSheet(f"background-color: {BG};")
+        log_pane.setMinimumHeight(120)
+        self._build_log(log_pane)
+        v_split.addWidget(log_pane)
+
+        v_split.setStretchFactor(0, 4)
+        v_split.setStretchFactor(1, 1)
+        v_split.setSizes([720, 220])
+
+        root.addWidget(v_split, 1)
+
+        # Status bar
         root.addWidget(hline(self))
         status_bar = QFrame(self)
         status_bar.setStyleSheet(f"background-color: {PANEL2};")
@@ -474,7 +564,7 @@ class NiftiApp(
 
         root.addWidget(status_bar)
 
-    # ── convenience shims for Tk StringVar-style call sites ─────────────────
+    # convenience shims for Tk StringVar-style call sites
 
     # ``_info_var`` / ``_status_var`` / ``_probe_var`` / ``_ram_var`` used to
     # be ``tk.StringVar`` instances on which ``.set(...)`` was called from

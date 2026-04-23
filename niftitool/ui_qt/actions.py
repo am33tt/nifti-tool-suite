@@ -1,6 +1,6 @@
-"""High-level user-triggered actions (PyQt6 port).
+"""High-level user-triggered actions.
 
-This mixin contains every ``_do_*`` and ``_export_*`` handler — the
+This mixin contains every ``_do_*`` and ``_export_*`` handler - the
 glue between the controls panel and the pure :mod:`niftitool.core`
 functions.  Actions that do heavy lifting run in a daemon thread and
 marshal results back onto the Qt main thread via :meth:`NiftiApp.after`
@@ -26,6 +26,7 @@ from ..core.mapping import compute_E_map
 from ..core.metadata import get_axis_labels, read_metadata
 from ..core.segmentation import phase_statistics, segment_phases
 from ..deps import HAS_NIBABEL, nib, np
+from ..utils import available_ram_mb
 
 
 class ActionsMixin:
@@ -36,7 +37,7 @@ class ActionsMixin:
       _E_stats, _porosity, _axis_labels, _ww, _wc, _slice_cache``.
     """
 
-    # ── File loading ─────────────────────────────────────────────────────────
+    # File loading
 
     def _open_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -60,6 +61,23 @@ class ActionsMixin:
         self._hu_cal = {}
         self._cal_result_var.set("Not calibrated")
         self._log_sep(f"Loading: {Path(path).name}")
+
+        # nibabel can mmap plain .nii but has to decompress .nii.gz entirely
+        # into RAM. For large gzipped files that's the quickest way to OOM;
+        # steer the user at the Gunzip button early.
+        try:
+            sz_mb = Path(path).stat().st_size / (1024 ** 2)
+            if path.lower().endswith('.gz') and sz_mb > 500:
+                self._append_log(
+                    f"  Large gzipped file ({sz_mb:.0f} MiB). nibabel must "
+                    f"decompress to RAM before any read — consider the "
+                    f"Gunzip button on the top bar first for lower memory "
+                    f"use.",
+                    'warn',
+                )
+        except OSError:
+            pass
+
         self._status_var.set(f"Opening {Path(path).name}...")
         self._prog.begin_staged()
         threading.Thread(target=self._staged_load, args=(path,), daemon=True).start()
@@ -118,6 +136,25 @@ class ActionsMixin:
             g = self._gray
             if not isinstance(g, LazyGrayVolume):
                 return
+
+            # Estimate the float32 footprint of the full volume and skip the
+            # eager materialisation if it would consume more than ~60% of
+            # free RAM. Staying on the lazy proxy keeps the slice viewer
+            # responsive (nibabel serves slices straight from the mmap);
+            # the heavy compute actions (`_get_gray`) still materialise on
+            # demand, which is where the user is paying for it anyway.
+            est_mb = g.size * 4 / (1024 ** 2)
+            free_mb = available_ram_mb()
+            if free_mb is not None and est_mb > 0.60 * free_mb:
+                self._append_log(
+                    f"  Volume is {est_mb:.0f} MiB float32 vs {free_mb:.0f} "
+                    f"MiB free — staying on the lazy proxy. Slicing reads "
+                    f"through the file mmap; compute steps will still "
+                    f"materialise on demand.",
+                    'warn',
+                )
+                return
+
             arr = g.to_array()
 
             def _swap():
@@ -126,12 +163,17 @@ class ActionsMixin:
                     self._slice_cache.set_volume(arr)
                     self._slice_cache.invalidate()
                     self._append_log(
-                        "  Volume materialised — interactive mode.", 'dim',
+                        "  Volume materialised - interactive mode.", 'dim',
                     )
                     notify = getattr(self, '_on_volume_materialised', None)
                     if callable(notify):
                         notify()
             self.after(0, _swap)
+        except MemoryError:
+            self._append_log(
+                "  Not enough RAM to materialise full volume — staying lazy.",
+                'warn',
+            )
         except Exception as ex:
             self._append_log(f"  Background materialisation error: {ex}", 'err')
 
@@ -166,7 +208,7 @@ class ActionsMixin:
         )
         return path or None
 
-    # ── Stats (live) ─────────────────────────────────────────────────────────
+    # Stats (live)
 
     def _update_stats(self):
         if self._gray is None:
@@ -190,7 +232,7 @@ class ActionsMixin:
         for k, v in vals.items():
             self._stat_labels[k].set(v)
 
-    # ── Standard actions ─────────────────────────────────────────────────────
+    # Standard actions
 
     def _do_gunzip(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -396,7 +438,7 @@ class ActionsMixin:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    # ── Material mapping actions ─────────────────────────────────────────────
+    # Material mapping actions
 
     def _do_calibrate(self):
         if not self._require_img():
@@ -510,7 +552,7 @@ class ActionsMixin:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    # ── Exports ──────────────────────────────────────────────────────────────
+    # Exports
 
     def _export_emap_nifti(self):
         if not self._require_emap():
@@ -665,7 +707,7 @@ class ActionsMixin:
                 self._nb.setCurrentIndex(idx)
         except Exception:
             pass
-        self._append_log("  ct.hpp snippet generated — see Sim Export tab.", 'teal')
+        self._append_log("  ct.hpp snippet generated - see Sim Export tab.", 'teal')
 
     def _copy_cpp(self):
         txt = self._cpp_text.get('1.0', 'end')

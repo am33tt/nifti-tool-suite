@@ -1,6 +1,6 @@
 """Reusable PyQt6 widgets (styled button, collapsible section, progress).
 
-Nothing here knows about the application state — all widgets are pure
+Nothing here knows about the application state - all widgets are pure
 presentation components.  Styling is applied inline via stylesheets so
 they look approximately like the Tk originals.
 """
@@ -20,7 +20,7 @@ from ..config import (
 )
 
 
-# ── atoms ─────────────────────────────────────────────────────────────────────
+# atoms
 
 def _btn_stylesheet(bg: str, fg: str, hover_bg: str) -> str:
     return (
@@ -35,7 +35,7 @@ def styled_btn(parent, text, cmd, *, accent=False, danger=False, small=False,
                teal=False, **_kw):
     """Return a themed :class:`QPushButton`.
 
-    The signature is the same as the Tk ``styled_btn`` — a ``parent``
+    The signature is the same as the Tk ``styled_btn`` - a ``parent``
     widget is passed but it does not dictate layout; callers add the
     button to their own layout explicitly.
     """
@@ -94,7 +94,7 @@ def lbl(parent, text, *, dim=False, head=False, bg=PANEL, **_kw):
     return q
 
 
-# ── composite widgets ────────────────────────────────────────────────────────
+# composite widgets
 
 class CollapsibleSection(QWidget):
     """Click-to-toggle panel with an accent-coloured header."""
@@ -129,7 +129,7 @@ class CollapsibleSection(QWidget):
         divider.setStyleSheet(f"background-color: {BORDER};")
         self._root.addWidget(divider)
 
-        # Content widget — callers add to .content_layout
+        # Content widget - callers add to .content_layout
         self.content = QFrame(self)
         self.content.setStyleSheet(
             f"QFrame {{ background-color: {PANEL}; border: 1px solid {BORDER}; }}"
@@ -205,7 +205,7 @@ class IntRangeRow(QWidget):
 
 
 class _LineEditVar:
-    """Duck-typed ``tk.StringVar`` — ``.get()`` / ``.set()`` on a QLineEdit.
+    """Duck-typed ``tk.StringVar`` - ``.get()`` / ``.set()`` on a QLineEdit.
 
     Keeps the Tk-style call sites in ``actions.py`` working byte-for-byte
     without forcing us to rewrite widget reads.
@@ -251,7 +251,7 @@ class StageProgressBar(QWidget):
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._hide)
 
-    # ── public API ───────────────────────────────────────────────────────────
+    # public API
 
     def begin_staged(self):
         self._stage_idx = 0
@@ -293,7 +293,7 @@ class StageProgressBar(QWidget):
         self.setVisible(True)
         self._update_from_stage()
 
-    # ── drawing ──────────────────────────────────────────────────────────────
+    # drawing
 
     def sizeHint(self) -> QSize:
         return QSize(260, 18)
@@ -375,7 +375,7 @@ class StageProgressBar(QWidget):
         p.end()
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# helpers
 
 def hline(parent=None, color=None):
     f = QFrame(parent)

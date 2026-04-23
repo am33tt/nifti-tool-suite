@@ -22,19 +22,17 @@ except ImportError:
 # ── matplotlib ────────────────────────────────────────────────────────────────
 try:
     import matplotlib
-    matplotlib.use("TkAgg")
+    # Headless default: each UI picks its own backend when it builds a
+    # canvas (QtAgg for ui_qt, TkAgg for the legacy tk UI). Forcing TkAgg
+    # globally spawns a hidden Tk root that eventually pops to the front.
+    matplotlib.use("Agg")
     from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import (
-        FigureCanvasTkAgg, NavigationToolbar2Tk,
-    )
     import matplotlib.cm as mcm
     import matplotlib.colors as mcolors
     HAS_MPL = True
 except ImportError:
     matplotlib = None            # type: ignore
     Figure = None                # type: ignore
-    FigureCanvasTkAgg = None     # type: ignore
-    NavigationToolbar2Tk = None  # type: ignore
     mcm = None                   # type: ignore
     mcolors = None               # type: ignore
     HAS_MPL = False
@@ -59,12 +57,19 @@ except ImportError:
 # ── VTK (GPU 3-D rendering, Slicer-style) ─────────────────────────────────────
 try:
     import vtk  # noqa: F401
-    from vtkmodules.tk.vtkTkRenderWidget import vtkTkRenderWidget  # noqa: F401
     from vtkmodules.util import numpy_support as vtk_numpy_support  # noqa: F401
+    # VTK's default output window on Windows is a native Win32 pop-up that
+    # steals focus whenever anything in the pipeline emits a warning.
+    # Redirect to a string sink so warnings stay reachable via
+    # ``GetOutput()`` for debugging but never surface as a blank window.
+    try:
+        _vtk_log = vtk.vtkStringOutputWindow()
+        vtk.vtkOutputWindow.SetInstance(_vtk_log)
+    except Exception:
+        pass
     HAS_VTK = True
 except Exception:
     vtk = None                 # type: ignore
-    vtkTkRenderWidget = None   # type: ignore
     vtk_numpy_support = None   # type: ignore
     HAS_VTK = False
 

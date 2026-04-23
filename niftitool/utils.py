@@ -18,6 +18,21 @@ def process_rss_mb() -> float | None:
         return None
 
 
+def available_ram_mb() -> float | None:
+    """System-wide free RAM in MiB. ``None`` if psutil is missing.
+
+    Used as a soft budget: callers that are about to allocate a multi-GB
+    float32 array check this and stay on the lazy (memory-mapped) path
+    when they would blow past available headroom.
+    """
+    if not HAS_PSUTIL:
+        return None
+    try:
+        return psutil.virtual_memory().available / (1024 ** 2)
+    except Exception:
+        return None
+
+
 @contextmanager
 def timed(label: str, logger=None):
     """Context manager that records wall-clock duration. If *logger* is a

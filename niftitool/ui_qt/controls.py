@@ -1,8 +1,12 @@
-"""Left-hand controls panel (PyQt6 port).
+"""Left-hand controls panel.
 
 Everything the user adjusts before running an action lives here:
 viewer settings, intensity stats, HU calibration, material model,
 reorientation, angle rotation, crop ROI.
+
+Each tool is built into its own :class:`_ToolPanel` and stored in
+``self._tool_panels``; the main window stacks them and exposes one at
+a time via the top navigation bar.
 """
 
 from __future__ import annotations
@@ -22,12 +26,45 @@ from ..config import (
     ACCENT, BG, BORDER, CMAPS, CT_PRESETS, ENTRY_BG, MATERIAL_PRESETS, PANEL,
     TEAL, TEXT, TEXT_DIM,
 )
-from .widgets import (
-    CollapsibleSection, IntRangeRow, styled_btn, styled_entry,
-)
+from .widgets import IntRangeRow, styled_btn, styled_entry
 
 
-# ── small shims ---------------------------------------------------------------
+class _ToolPanel(QWidget):
+    """One tool page shown in the left stacked panel.
+
+    Exposes ``.content`` / ``.content_layout`` so the existing section
+    body code (originally written for ``CollapsibleSection``) keeps
+    working unchanged.
+    """
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(6)
+
+        title_lbl = QLabel(title, self)
+        title_lbl.setFont(QFont("Segoe UI Semibold", 12))
+        title_lbl.setStyleSheet(
+            f"color: {ACCENT}; background-color: transparent;"
+        )
+        root.addWidget(title_lbl)
+
+        divider = QFrame(self)
+        divider.setFixedHeight(1)
+        divider.setStyleSheet(f"background-color: {BORDER};")
+        root.addWidget(divider)
+
+        self.content = QWidget(self)
+        self.content.setStyleSheet("background-color: transparent;")
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 6, 0, 0)
+        self.content_layout.setSpacing(3)
+        root.addWidget(self.content)
+        root.addStretch(1)
+
+
+# small shims
 
 class _WidgetVar:
     """Shim that lets call-sites use ``.get()`` / ``.set()`` on a QLineEdit
@@ -73,20 +110,24 @@ def _small_label(text, parent=None, *, width=None, color=TEXT_DIM, bold=False):
 class ControlsMixin:
     """Adds ``_build_controls`` and all its helpers to :class:`NiftiApp`."""
 
-    def _build_controls(self, parent):
-        # ``parent`` is the scrollable QWidget; we use ``self._ctrl_layout``.
-        layout = self._ctrl_layout
+    def _build_controls(self):
+        """Populate ``self._tool_panels`` - one :class:`_ToolPanel` per tool.
 
-        # ── File info ─────────────────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "📋 Metadata / File Info")
-        layout.addWidget(sec)
+        The main window owns a :class:`QStackedWidget` that swaps these in
+        as the user clicks the top navigation buttons.
+        """
+        self._tool_panels: dict[str, _ToolPanel] = {}
+
+        # File info
+        sec = _ToolPanel("📋 Metadata / File Info")
+        self._tool_panels["metadata"] = sec
         btn = styled_btn(sec.content, "Read Full Metadata",
                          self._do_metadata, small=True)
         sec.content_layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        # ── Viewer ───────────────────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "🎨 Viewer Controls")
-        layout.addWidget(sec)
+        # Viewer
+        sec = _ToolPanel("🎨 Viewer Controls")
+        self._tool_panels["viewer"] = sec
 
         # Colormap / preset rows
         for label, attr_name, default, values in [
@@ -140,9 +181,9 @@ class ControlsMixin:
         brl.addStretch(1)
         sec.content_layout.addWidget(btn_row)
 
-        # ── Intensity statistics ─────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "📊 Intensity Statistics")
-        layout.addWidget(sec)
+        # Intensity statistics
+        sec = _ToolPanel("📊 Intensity Statistics")
+        self._tool_panels["stats"] = sec
         sec.content_layout.addWidget(
             styled_btn(sec.content, "Compute Histogram",
                        self._do_histogram, small=True),
@@ -162,9 +203,9 @@ class ControlsMixin:
             sec.content_layout.addWidget(row)
             self._stat_labels[key] = _LabelVar(lv)
 
-        # ── HU calibration ───────────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "🔬 HU Calibration")
-        layout.addWidget(sec)
+        # HU calibration
+        sec = _ToolPanel("🔬 HU Calibration")
+        self._tool_panels["hu"] = sec
         sec.content_layout.addWidget(
             _small_label("Two-point linear: HU = m·raw + c", sec.content)
         )
@@ -212,9 +253,9 @@ class ControlsMixin:
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
-        # ── Material mapping ─────────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "⚙️  Material Mapping  →  E [MPa]")
-        layout.addWidget(sec)
+        # Material mapping
+        sec = _ToolPanel("⚙️  Material Mapping  →  E [MPa]")
+        self._tool_panels["material"] = sec
 
         pr_row = QWidget(sec.content); prl = QHBoxLayout(pr_row)
         prl.setContentsMargins(0, 2, 0, 2); prl.setSpacing(4)
@@ -321,10 +362,9 @@ class ControlsMixin:
         self._update_model_panel()
         self._apply_material_preset()
 
-        # ── Reorientation ────────────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "🔄 Reorientation  (no resample)",
-                                 start_open=False)
-        layout.addWidget(sec)
+        # Reorientation
+        sec = _ToolPanel("🔄 Reorientation  (no resample)")
+        self._tool_panels["reorient"] = sec
 
         row = QWidget(sec.content); rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 2, 0, 2); rl.setSpacing(4)
@@ -356,10 +396,9 @@ class ControlsMixin:
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
-        # ── Angle Rotation ───────────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "↩  Angle Rotation  (resample)",
-                                 start_open=False)
-        layout.addWidget(sec)
+        # Angle Rotation
+        sec = _ToolPanel("↩  Angle Rotation  (resample)")
+        self._tool_panels["rotate"] = sec
 
         row = QWidget(sec.content); rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 2, 0, 2); rl.setSpacing(4)
@@ -408,10 +447,9 @@ class ControlsMixin:
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
-        # ── Crop ─────────────────────────────────────────────────────────────
-        sec = CollapsibleSection(parent, "✂️  Crop  (ROI selection)",
-                                 start_open=False)
-        layout.addWidget(sec)
+        # Crop
+        sec = _ToolPanel("✂️  Crop  (ROI selection)")
+        self._tool_panels["crop"] = sec
 
         self._crop_rows: dict = {}
         for axis in ('X', 'Y', 'Z'):
@@ -441,7 +479,7 @@ class ControlsMixin:
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
-    # ── Model params panel ───────────────────────────────────────────────────
+    # Model params panel
 
     def _on_model_toggled(self, checked: bool):
         # Only rebuild once, on the *newly-checked* button.
@@ -595,7 +633,7 @@ class ControlsMixin:
         except Exception as ex:
             QMessageBox.critical(self, "JSON Error", str(ex))
 
-    # ── Windowing helpers ────────────────────────────────────────────────────
+    # Windowing helpers
 
     def _apply_preset(self, *_args):
         name = self._preset_var.get()
@@ -622,7 +660,7 @@ class ControlsMixin:
         self._preset_var.set("-- preset --")
         self._refresh_triplanar()
 
-    # ── Crop autofill ────────────────────────────────────────────────────────
+    # Crop autofill
 
     def _autofill_crop(self):
         if self._img is None:
@@ -632,7 +670,7 @@ class ControlsMixin:
             self._crop_rows[axis].end_var.set(str(dim))
 
 
-# ── small shims reused above --------------------------------------------------
+# small shims reused above
 
 class _LabelVar:
     """QLabel wrapper that exposes ``get()`` / ``set(value)``."""

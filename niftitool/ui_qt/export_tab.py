@@ -1,4 +1,4 @@
-"""Simulation Export tab — PyQt6 port."""
+"""Simulation Export tab"""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class ExportTabMixin:
 
         for label, tip, cmd in [
             ("Export E-Map as NIfTI (.nii.gz)",
-             "Float32 NIfTI — direct input to FCM / FEM pipeline",
+             "Float32 NIfTI - direct input to FCM / FEM pipeline",
              self._export_emap_nifti),
             ("Export E-Map as raw float32 binary",
              "C-order binary + JSON header sidecar (e.g. for custom solvers)",

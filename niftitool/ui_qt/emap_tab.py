@@ -1,4 +1,4 @@
-"""E-Map viewer tab (PyQt6 port)."""
+"""E-Map viewer tab."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QSlider, QVBoxLayout, QWidget,
+    QSlider, QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..config import (
@@ -128,7 +128,24 @@ class EmapTabMixin:
             ax.axis('off')
         self._emap_fig.tight_layout(pad=0.4)
         self._emap_canvas = FigureCanvasTkAgg(self._emap_fig)
-        root.addWidget(self._emap_canvas, 1)
+
+        # Per-slice histogram - lives beside the tri-planar plot so the log
+        # pane below can stay expanded without squashing either.
+        self._emap_slice_fig = Figure(figsize=(4, 3), facecolor=BG)
+        self._emap_slice_ax = self._emap_slice_fig.add_subplot(111)
+        self._emap_slice_ax.set_facecolor(PANEL2)
+        self._emap_slice_canvas = FigureCanvasTkAgg(self._emap_slice_fig)
+        self._emap_slice_canvas.setMinimumWidth(220)
+
+        plots_split = QSplitter(Qt.Orientation.Horizontal, parent)
+        plots_split.setHandleWidth(6)
+        plots_split.setChildrenCollapsible(False)
+        plots_split.addWidget(self._emap_canvas)
+        plots_split.addWidget(self._emap_slice_canvas)
+        plots_split.setStretchFactor(0, 3)
+        plots_split.setStretchFactor(1, 1)
+        plots_split.setSizes([900, 320])
+        root.addWidget(plots_split, 1)
 
         tb = QWidget(parent)
         tb_lay = QHBoxLayout(tb)
@@ -137,7 +154,6 @@ class EmapTabMixin:
         tb_lay.addStretch(1)
         root.addWidget(tb)
 
-        # Slider bar
         slider_bar = QFrame(parent)
         slider_bar.setStyleSheet(f"background-color: {PANEL2};")
         sgrid = QGridLayout(slider_bar)
@@ -189,21 +205,10 @@ class EmapTabMixin:
             ax: _QLabelVar(lbl) for ax, lbl in self._emap_idx_widgets.items()
         }
 
-        # Per-slice histogram
-        self._emap_slice_fig = Figure(figsize=(4, 1.8), facecolor=BG)
-        self._emap_slice_ax = self._emap_slice_fig.add_subplot(111)
-        self._emap_slice_ax.set_facecolor(PANEL2)
-        self._emap_slice_canvas = FigureCanvasTkAgg(self._emap_slice_fig)
-        self._emap_slice_canvas.setFixedHeight(170)
-        root.addWidget(self._emap_slice_canvas)
-
-        # Debounce
         self._emap_redraw_pending = None
         self._emap_debounce_timer = QTimer(self)
         self._emap_debounce_timer.setSingleShot(True)
         self._emap_debounce_timer.timeout.connect(self._refresh_emap_viewer)
-
-    # ── interaction ──────────────────────────────────────────────────────────
 
     def _on_emap_drag(self, axis, val):
         idx = int(val)
@@ -224,8 +229,6 @@ class EmapTabMixin:
             sl.blockSignals(False)
             self._emap_idx[ax] = mid
             self._emap_idx_widgets[ax].setText(str(mid))
-
-    # ── refresh ──────────────────────────────────────────────────────────────
 
     def _refresh_emap_viewer(self):
         self._emap_redraw_pending = None

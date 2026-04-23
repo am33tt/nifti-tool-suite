@@ -1,9 +1,7 @@
-"""3-D viewer (VTK-backed, Slicer-style) — PyQt6 port.
+"""3-D viewer (VTK-backed, Slicer-style).
 
-Uses :class:`QVTKRenderWindowInteractor` from ``vtkmodules.qt`` to embed
-the same VTK render window that 3D Slicer and ParaView use — no
-dependency on Tcl/Tk.  The volume-rendering pipeline itself is
-unchanged from the tkinter version.
+Embeds the VTK render window via QVTKRenderWindowInteractor so we can
+use the same pipeline 3D Slicer and ParaView use, with no Tcl/Tk.
 """
 
 from __future__ import annotations
@@ -11,23 +9,24 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QRadioButton,
-    QSlider, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QRadioButton, QSlider, QVBoxLayout, QWidget,
 )
 
 from ..config import (
-    ACCENT, BG, BORDER, ENTRY_BG, PANEL2, TEXT, TEXT_DIM, WARN,
+    ACCENT, AXIS_COLOR, BG, BORDER, ENTRY_BG, PANEL2, TEXT, TEXT_DIM, WARN,
 )
 from ..core.io import LazyGrayVolume
 from ..core.windowing import auto_window
 from ..deps import HAS_VTK, np
+from ..utils import available_ram_mb
 from .widgets import styled_btn
 
 
 class View3DMixin:
     """Adds the GPU 3-D View tab to :class:`NiftiApp`."""
 
-    # ── build ────────────────────────────────────────────────────────────────
+    # build
 
     def _build_3d_view(self, parent):
         root = QVBoxLayout(parent)
@@ -51,7 +50,7 @@ class View3DMixin:
         import vtk
         from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
-        # ── top toolbar ─────────────────────────────────────────────────────
+        # top toolbar
         ctrl = QWidget(parent)
         ctrl_lay = QHBoxLayout(ctrl)
         ctrl_lay.setContentsMargins(8, 4, 8, 4)
@@ -97,10 +96,18 @@ class View3DMixin:
             styled_btn(ctrl, "Sync to Tri-Planar",
                        self._sync_3d_to_triplanar, small=True)
         )
+
+        self._3d_axes_cb = QCheckBox("Axes", ctrl)
+        self._3d_axes_cb.setChecked(False)
+        self._3d_axes_cb.setFont(QFont("Segoe UI", 9))
+        self._3d_axes_cb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
+        self._3d_axes_cb.toggled.connect(self._on_3d_axes_toggled)
+        ctrl_lay.addWidget(self._3d_axes_cb)
+
         ctrl_lay.addStretch(1)
         root.addWidget(ctrl)
 
-        # ── slider bar (only used in "planes" mode) ────────────────────────
+        # slider bar (only used in "planes" mode)
         sliders = QFrame(parent)
         sliders.setStyleSheet(f"background-color: {PANEL2};")
         sgrid = QGridLayout(sliders)
@@ -149,7 +156,7 @@ class View3DMixin:
             ax: _QLabelVar(lbl) for ax, lbl in self._3d_idx_widgets.items()
         }
 
-        # ── VTK render widget ──────────────────────────────────────────────
+        # VTK render widget
         self._vtk_widget = QVTKRenderWindowInteractor(parent)
         root.addWidget(self._vtk_widget, 1)
 
@@ -162,9 +169,8 @@ class View3DMixin:
 
         self._vtk_iren = rw.GetInteractor()
         self._vtk_iren.Initialize()
-        # Do NOT call ``Start()`` — the Qt event loop drives the interactor.
+        # Do NOT call ``Start()`` - the Qt event loop drives the interactor.
 
-        # Per-volume state
         self._vtk_image = None
         self._vtk_volume = None
         self._vtk_plane_actors = []
@@ -174,7 +180,117 @@ class View3DMixin:
 
         self._3d_redraw_pending = None
 
-    # ── volume materialisation hook (called from ActionsMixin) ─────────────
+        # Orientation marker (bottom-left corner, rotates with camera) plus a
+        # cube-axes actor planted on the volume bounds so the user can read
+        # voxel extents straight off the viewport.
+        self._cube_axes = None
+        self._build_axes_indicators()
+
+    # axis indicators
+
+    def _build_axes_indicators(self):
+        """Corner XYZ gizmo that rotates with the camera. Built once."""
+        import vtk
+
+        marker = vtk.vtkAxesActor()
+        marker.SetXAxisLabelText("X")
+        marker.SetYAxisLabelText("Y")
+        marker.SetZAxisLabelText("Z")
+        for cap in (marker.GetXAxisCaptionActor2D(),
+                    marker.GetYAxisCaptionActor2D(),
+                    marker.GetZAxisCaptionActor2D()):
+            tp = cap.GetCaptionTextProperty()
+            tp.SetColor(0.1, 0.1, 0.1)
+            tp.ShadowOff()
+            tp.BoldOff()
+            tp.ItalicOff()
+        self._axes_marker_actor = marker
+
+        widget = vtk.vtkOrientationMarkerWidget()
+        widget.SetOrientationMarker(marker)
+        widget.SetInteractor(self._vtk_iren)
+        widget.SetViewport(0.0, 0.0, 0.18, 0.22)
+        widget.SetEnabled(1 if self._3d_axes_cb.isChecked() else 0)
+        widget.InteractiveOff()
+        self._axes_marker_widget = widget
+
+    @staticmethod
+    def _hex_to_rgb(h: str):
+        h = h.lstrip('#')
+        return (int(h[0:2], 16) / 255.0,
+                int(h[2:4], 16) / 255.0,
+                int(h[4:6], 16) / 255.0)
+
+    def _ensure_cube_axes(self, shape, spacing):
+        """Rebuild the cube-axes bounds and tick style for the current volume.
+
+        Ticks are in world-space units (voxel index * spacing), so a 400x400x600
+        volume at unit spacing reads 400 / 400 / 600 directly off the X / Y / Z
+        edges. Cheap: VTK just emits line + text primitives on the bounding box.
+        """
+        import vtk
+
+        nx, ny, nz = shape
+        sx, sy, sz = spacing
+        bounds = (0.0, nx * sx, 0.0, ny * sy, 0.0, nz * sz)
+
+        if self._cube_axes is None:
+            axes = vtk.vtkCubeAxesActor()
+            axes.SetCamera(self._vtk_renderer.GetActiveCamera())
+            # Titles are set to a single space rather than "" — an empty
+            # string makes the internal vtkVectorText fire "Text is not
+            # set!" every frame. Opacity=0 hides the space visually.
+            axes.SetXTitle(" "); axes.SetYTitle(" "); axes.SetZTitle(" ")
+            axes.SetXUnits(""); axes.SetYUnits(""); axes.SetZUnits("")
+            axes.SetFlyModeToStaticEdges()
+            axes.XAxisMinorTickVisibilityOff()
+            axes.YAxisMinorTickVisibilityOff()
+            axes.ZAxisMinorTickVisibilityOff()
+            axes.DrawXGridlinesOff()
+            axes.DrawYGridlinesOff()
+            axes.DrawZGridlinesOff()
+            # Try to switch labels to screen-space 2D text so SetFontSize
+            # has a predictable effect (VTK 8.x+ supports SetUse2DMode).
+            try:
+                axes.SetUse2DMode(1)
+            except AttributeError:
+                pass
+            for i, ax_letter in enumerate(('X', 'Y', 'Z')):
+                rgb = self._hex_to_rgb(AXIS_COLOR[ax_letter])
+                tp_title = axes.GetTitleTextProperty(i)
+                tp_title.SetOpacity(0.0)
+                tp_title.SetFontSize(1)
+                lp = axes.GetLabelTextProperty(i)
+                lp.SetColor(*rgb)
+                lp.SetFontSize(11)
+                lp.BoldOn()
+                lp.ShadowOn()
+                lp.ItalicOff()
+            for line_prop in (axes.GetXAxesLinesProperty(),
+                              axes.GetYAxesLinesProperty(),
+                              axes.GetZAxesLinesProperty()):
+                line_prop.SetLineWidth(3.0)
+            axes.GetXAxesLinesProperty().SetColor(*self._hex_to_rgb(AXIS_COLOR['X']))
+            axes.GetYAxesLinesProperty().SetColor(*self._hex_to_rgb(AXIS_COLOR['Y']))
+            axes.GetZAxesLinesProperty().SetColor(*self._hex_to_rgb(AXIS_COLOR['Z']))
+            # Tick marks + gridline properties: match the axis colors so the
+            # small ticks at each label stay visible against the volume.
+            for tick_prop in (axes.GetXAxesGridlinesProperty(),
+                              axes.GetYAxesGridlinesProperty(),
+                              axes.GetZAxesGridlinesProperty()):
+                tick_prop.SetLineWidth(1.5)
+            self._cube_axes = axes
+
+        self._cube_axes.SetBounds(*bounds)
+        self._cube_axes.SetVisibility(self._3d_axes_cb.isChecked())
+
+    def _on_3d_axes_toggled(self, checked: bool):
+        if getattr(self, '_axes_marker_widget', None) is not None:
+            self._axes_marker_widget.SetEnabled(1 if checked else 0)
+        if self._cube_axes is not None:
+            self._cube_axes.SetVisibility(bool(checked))
+        if hasattr(self, '_vtk_widget'):
+            self._vtk_widget.GetRenderWindow().Render()
 
     def _on_volume_materialised(self):
         """The lazy proxy was promoted to a real ndarray.  Invalidate any
@@ -193,7 +309,7 @@ class View3DMixin:
         if not self._vtk_first_render_done:
             self._do_3d_render()
 
-    # ── slider / mode handlers ─────────────────────────────────────────────
+    # slider / mode handlers
 
     def _on_3d_mode_toggled(self, checked: bool):
         if not checked:
@@ -232,24 +348,72 @@ class View3DMixin:
         self._vtk_renderer.ResetCamera()
         self._vtk_widget.GetRenderWindow().Render()
 
-    # ── render ─────────────────────────────────────────────────────────────
+    # render
+
+    def _pick_downsample(self, shape) -> int:
+        """Pick an isotropic stride so the GPU copy fits in a fraction of the
+        free RAM budget. Returns 1 (no downsample) when we have headroom or
+        psutil isn't available. Cheap to call — just arithmetic."""
+        nx, ny, nz = shape
+        voxels = float(nx) * float(ny) * float(nz)
+        # float32 scalars on the GPU side
+        est_full_mb = voxels * 4.0 / (1024.0 ** 2)
+        free_mb = available_ram_mb()
+        if free_mb is None or est_full_mb <= 0.35 * free_mb:
+            return 1
+        budget_mb = max(256.0, 0.25 * free_mb)
+        ds = 1
+        while est_full_mb / (ds ** 3) > budget_mb and ds < 8:
+            ds += 1
+        return ds
+
+    def _get_3d_array(self):
+        """Return the 3-D array to upload, downsampled when RAM is tight.
+
+        For :class:`LazyGrayVolume` we read a strided slice straight from
+        the mmap-backed proxy, so we never pay for the full float32 copy
+        when the user is working with 5-12 GiB files on a crowded box.
+        """
+        if self._gray is None:
+            return None, 1
+        shape = self._gray.shape
+
+        ds = self._pick_downsample(shape)
+
+        if isinstance(self._gray, LazyGrayVolume):
+            if ds == 1:
+                self._set_status("Materialising volume for 3-D...", busy=True)
+                arr = self._get_gray()
+                return arr, 1
+            self._set_status(
+                f"Large volume - loading at 1/{ds} for 3-D...", busy=True,
+            )
+            # Strided read from the lazy proxy -- no full materialisation.
+            arr = np.asarray(self._gray[::ds, ::ds, ::ds], dtype=np.float32)
+            return arr, ds
+
+        arr = self._gray
+        if arr is None:
+            return None, 1
+        if ds == 1:
+            return arr, 1
+        self._set_status(
+            f"Large volume - downsampling 1/{ds} for 3-D...", busy=True,
+        )
+        return np.ascontiguousarray(arr[::ds, ::ds, ::ds]), ds
 
     def _do_3d_render(self):
         if not HAS_VTK or not self._require_img():
             return
 
         try:
-            if isinstance(self._gray, LazyGrayVolume):
-                self._set_status("Materialising volume for 3-D...", busy=True)
-                arr = self._get_gray()
-            else:
-                arr = self._gray
+            arr, ds = self._get_3d_array()
             if arr is None:
                 return
 
             if id(arr) != self._vtk_built_for_id or arr.shape != self._vtk_built_shape:
                 self._set_status("Uploading volume to GPU...", busy=True)
-                self._upload_volume(arr)
+                self._upload_volume(arr, downsample=ds)
                 self._init_3d_sliders(arr.shape)
 
             mode = self._3d_mode.get()
@@ -267,20 +431,28 @@ class View3DMixin:
             self._append_log(f"  3-D render error: {ex}", 'err')
             self._set_status("3-D render error.", busy=False)
 
-    # ── VTK helpers ────────────────────────────────────────────────────────
+    # VTK helpers
 
-    def _upload_volume(self, arr):
+    def _upload_volume(self, arr, downsample: int = 1):
         import vtk
         from vtkmodules.util import numpy_support
 
         nx, ny, nz = arr.shape
         spacing = self._img.header.get_zooms() if self._img is not None else (1, 1, 1)
-        sx, sy, sz = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+        # Scale spacing by the downsample factor so the cube-axes bounds
+        # stay in original-world units (voxel index * original spacing).
+        sx = float(spacing[0]) * float(downsample)
+        sy = float(spacing[1]) * float(downsample)
+        sz = float(spacing[2]) * float(downsample)
 
-        flat = np.asfortranarray(arr).ravel(order='F')
+        # Single float32 Fortran-ordered buffer handed to VTK with
+        # deep=False — saves a ~4*nx*ny*nz byte copy. The Python
+        # reference is retained so the buffer outlives the VTK array.
+        flat = np.asarray(arr, dtype=np.float32, order='F').ravel(order='F')
+        self._vtk_flat_buffer = flat
 
         vtk_arr = numpy_support.numpy_to_vtk(
-            flat, deep=True, array_type=vtk.VTK_FLOAT,
+            flat, deep=False, array_type=vtk.VTK_FLOAT,
         )
         img = vtk.vtkImageData()
         img.SetDimensions(nx, ny, nz)
@@ -296,6 +468,9 @@ class View3DMixin:
         self._vtk_plane_actors = []
         self._vtk_first_render_done = False
 
+        self._ensure_cube_axes((nx, ny, nz), (sx, sy, sz))
+        self._vtk_renderer.AddActor(self._cube_axes)
+
     def _window_bounds(self, arr):
         ww, wc = self._ww, self._wc
         if ww is None or wc is None:
@@ -306,7 +481,7 @@ class View3DMixin:
             hi = lo + 1.0
         return lo, hi
 
-    # ── volume rendering ───────────────────────────────────────────────────
+    # volume rendering
 
     def _build_volume_actor(self, arr):
         import vtk
@@ -357,7 +532,7 @@ class View3DMixin:
         otf.AddPoint(lo + (hi - lo) * 0.55,       0.30)
         otf.AddPoint(hi,                          0.85)
 
-    # ── slice-plane mode ───────────────────────────────────────────────────
+    # slice-plane mode
 
     def _init_3d_sliders(self, shape):
         for i, ax in enumerate(('X', 'Y', 'Z')):
@@ -413,7 +588,7 @@ class View3DMixin:
             self._vtk_widget.GetRenderWindow().Render()
 
 
-# ── shims ────────────────────────────────────────────────────────────────────
+# shims
 
 class _RadioVar:
     """QButtonGroup shim with tk.StringVar-compatible ``get()`` / ``set()``."""

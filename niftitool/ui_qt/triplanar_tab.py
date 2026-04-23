@@ -1,8 +1,7 @@
-"""Tri-planar (sagittal / coronal / axial) viewer — PyQt6 port.
+"""Tri-planar (sagittal / coronal / axial) viewer.
 
-See ``ui/triplanar_tab.py`` for the performance rationale.  Everything
-about the matplotlib draw path is identical; only the slider / layout
-widgets change.
+See ``ui/triplanar_tab.py`` for the performance rationale. The matplotlib
+draw path is identical; only the slider / layout widgets change.
 """
 
 from __future__ import annotations
@@ -17,7 +16,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..config import (
-    ACCENT, BG, BORDER, ERR, PANEL2, SLIDER_DEBOUNCE_MS, TEXT, TEXT_DIM,
+    ACCENT, AXIS_COLOR, BG, BORDER, ERR, PANEL2, SLIDER_DEBOUNCE_MS, TEXT,
+    TEXT_DIM,
 )
 from ..core.windowing import apply_window, auto_window
 from ..deps import HAS_MPL, np
@@ -60,7 +60,7 @@ class TriplanarMixin:
         self._tri_vline:   dict = {}
         self._tri_compass: dict = {}
 
-        self._tri_fig.tight_layout(pad=0.4)
+        self._tri_fig.set_tight_layout({'pad': 0.4, 'w_pad': 1.8})
         self._tri_canvas = FigureCanvasTkAgg(self._tri_fig)
         root.addWidget(self._tri_canvas, 1)
         self._tri_canvas.mpl_connect('button_press_event', self._on_tri_click)
@@ -72,7 +72,7 @@ class TriplanarMixin:
         tb_lay.addStretch(1)
         root.addWidget(tb_frame)
 
-        # ── slider bar ──
+        # slider bar
         slider_bar = QFrame(parent)
         slider_bar.setStyleSheet(f"background-color: {PANEL2};")
         sb_grid = QGridLayout(slider_bar)
@@ -88,6 +88,7 @@ class TriplanarMixin:
             ('Z', "Axial    (Z)"),
         ]
         for col, (ax, label) in enumerate(axis_info):
+            ax_col = AXIS_COLOR[ax]
             col_frame = QWidget(slider_bar)
             col_lay = QVBoxLayout(col_frame)
             col_lay.setContentsMargins(0, 0, 0, 0)
@@ -96,7 +97,7 @@ class TriplanarMixin:
             title_lbl = QLabel(label, col_frame)
             title_lbl.setFont(QFont("Segoe UI", 9))
             title_lbl.setStyleSheet(
-                f"color: {ACCENT}; background-color: {PANEL2};"
+                f"color: {ax_col}; background-color: {PANEL2};"
             )
             col_lay.addWidget(title_lbl)
 
@@ -110,7 +111,7 @@ class TriplanarMixin:
             idx_lbl = QLabel("--", row_w)
             idx_lbl.setFont(QFont("Consolas", 10))
             idx_lbl.setStyleSheet(
-                f"color: {ACCENT}; background-color: {PANEL2};"
+                f"color: {ax_col}; background-color: {PANEL2};"
             )
             idx_lbl.setFixedWidth(40)
             row_lay.addWidget(idx_lbl)
@@ -127,7 +128,7 @@ class TriplanarMixin:
 
         root.addWidget(slider_bar)
 
-        # ── export buttons ──
+        # export buttons
         export_bar = QWidget(parent)
         eb_lay = QHBoxLayout(export_bar)
         eb_lay.setContentsMargins(6, 2, 6, 2)
@@ -151,7 +152,7 @@ class TriplanarMixin:
             ax: _QLabelVar(lbl) for ax, lbl in self._tri_idx_widgets.items()
         }
 
-    # ── slider / click handlers ──────────────────────────────────────────────
+    # slider / click handlers
 
     def _on_tri_drag(self, axis, val):
         idx = int(val)
@@ -192,7 +193,7 @@ class TriplanarMixin:
         except Exception:
             pass
 
-    # ── refresh (hot path) ───────────────────────────────────────────────────
+    # refresh (hot path)
 
     def _refresh_triplanar(self):
         self._tri_redraw_pending = None
@@ -230,13 +231,31 @@ class TriplanarMixin:
             'Y': (xi, zi),
             'Z': (xi, yi),
         }
+        # For each panel, which slider drives the H-line and which drives the
+        # V-line? Colors come from AXIS_COLOR so a line's hue always matches
+        # its slider in the bottom bar.
+        crosshair_axes = {
+            'X': ('Z', 'Y'),  # sagittal: horiz = Z-slider, vert = Y-slider
+            'Y': ('Z', 'X'),  # coronal
+            'Z': ('Y', 'X'),  # axial
+        }
 
         for ax_obj, axis, idx, sl_win, title in panels:
             im = self._tri_im[axis]
             if im is None or im.get_array().shape != sl_win.shape:
                 ax_obj.clear()
                 ax_obj.set_facecolor(PANEL2)
-                ax_obj.axis('off')
+                # Subdued voxel-index ticks so the user can read positions.
+                # Set once on creation; hot path never touches tick state.
+                ax_obj.tick_params(
+                    colors=TEXT_DIM, labelsize=5, length=2, width=0.4,
+                    top=False, right=False, direction='out', pad=1,
+                )
+                for side in ('top', 'right'):
+                    ax_obj.spines[side].set_visible(False)
+                for side in ('bottom', 'left'):
+                    ax_obj.spines[side].set_color(BORDER)
+                    ax_obj.spines[side].set_linewidth(0.5)
                 im = ax_obj.imshow(
                     sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1,
                     aspect='equal', interpolation='nearest',
@@ -261,11 +280,14 @@ class TriplanarMixin:
                                      va='top', fontweight='bold'),
                 }
                 h_pos, v_pos = crosshair_pos[axis]
+                h_axis, v_axis = crosshair_axes[axis]
                 self._tri_hline[axis] = ax_obj.axhline(
-                    h_pos, color='#00CFFF', lw=0.9, alpha=0.75, linestyle='--',
+                    h_pos, color=AXIS_COLOR[h_axis], lw=1.0, alpha=0.85,
+                    linestyle='--',
                 )
                 self._tri_vline[axis] = ax_obj.axvline(
-                    v_pos, color='#FFD700', lw=0.9, alpha=0.75, linestyle='--',
+                    v_pos, color=AXIS_COLOR[v_axis], lw=1.0, alpha=0.85,
+                    linestyle='--',
                 )
             else:
                 im.set_data(sl_win)
@@ -305,7 +327,7 @@ class TriplanarMixin:
         self._tri_vline.clear()
         self._tri_compass.clear()
 
-    # ── per-axis PNG export ──────────────────────────────────────────────────
+    # per-axis PNG export
 
     def _export_slice(self, axis):
         if self._gray is None:

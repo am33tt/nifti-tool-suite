@@ -1,4 +1,4 @@
-"""Histogram tab: intensity distribution + per-slice mean curve (PyQt6)."""
+"""Histogram tab: intensity distribution and per-slice mean curve."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ class HistogramTabMixin:
         opts_lay.addStretch(1)
         root.addWidget(opts)
 
-    # ── drawing ──────────────────────────────────────────────────────────────
+    # drawing
 
     def _draw_histogram(self, counts, edges, zidx, means, mn, mx):
         if not HAS_MPL:

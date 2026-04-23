@@ -21,6 +21,15 @@ BTN_BG   = "#EDE6D8"
 BTN_HOV  = "#D4C4A8"
 TEAL     = "#1A7A8A"
 
+# Per-axis slider / crosshair colors. Used consistently by the tri-planar
+# crosshairs and the 3-D cube-axes labels so a line's colour always maps
+# back to the same slider.
+AXIS_COLOR = {
+    'X': "#E5484D",  # sagittal
+    'Y': "#2FA84F",  # coronal
+    'Z': "#3B82F6",  # axial
+}
+
 FONT_MONO  = ("Consolas", 10)
 FONT_UI    = ("Segoe UI", 10)
 FONT_SMALL = ("Segoe UI", 9)

@@ -1,4 +1,4 @@
-"""Log pane + thread-safe logging helpers (PyQt6 port)."""
+"""Log pane + thread-safe logging helpers."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ class LogTabMixin:
         self._log_widget.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         root.addWidget(self._log_widget, 1)
 
-    # ── thread-safe public API ───────────────────────────────────────────────
+    # thread-safe public API
 
     def _clear_log(self):
         self._log_widget.clear()
