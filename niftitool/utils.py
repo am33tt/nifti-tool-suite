@@ -33,6 +33,16 @@ def available_ram_mb() -> float | None:
         return None
 
 
+def total_ram_mb() -> float | None:
+    """Installed system RAM in MiB. ``None`` if psutil is missing."""
+    if not HAS_PSUTIL:
+        return None
+    try:
+        return psutil.virtual_memory().total / (1024 ** 2)
+    except Exception:
+        return None
+
+
 @contextmanager
 def timed(label: str, logger=None):
     """Context manager that records wall-clock duration. If *logger* is a

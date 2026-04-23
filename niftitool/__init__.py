@@ -21,7 +21,9 @@ def main() -> None:
     from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     win = NiftiApp()
-    win.show()
+    # Open maximised by default — the tri-planar + controls layout is
+    # designed for a wide workspace and feels cramped below ~1400 px.
+    win.showMaximized()
     sys.exit(app.exec())
 
 

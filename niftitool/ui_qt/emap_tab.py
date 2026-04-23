@@ -94,6 +94,28 @@ class EmapTabMixin:
             lambda _t: self._refresh_emap_viewer()
         )
 
+        # View selector: show only one anatomical plane at a time so the
+        # main E-map panel stays wide instead of being split into thirds.
+        view_lbl = QLabel("View:", ctrl)
+        view_lbl.setFont(QFont("Segoe UI", 9))
+        view_lbl.setStyleSheet(f"color: {TEXT_DIM}; background-color: {BG};")
+        ctrl_lay.addWidget(view_lbl)
+
+        self._emap_view_widget = QComboBox(ctrl)
+        # Display text → axis letter used everywhere else in this tab.
+        self._emap_view_axis_map = {
+            "Sagittal (X)": 'X',
+            "Coronal (Y)":  'Y',
+            "Axial (Z)":    'Z',
+        }
+        self._emap_view_widget.addItems(list(self._emap_view_axis_map.keys()))
+        self._emap_view_widget.setCurrentText("Axial (Z)")
+        self._emap_view_widget.setFixedWidth(120)
+        ctrl_lay.addWidget(self._emap_view_widget)
+        self._emap_view_widget.currentTextChanged.connect(
+            lambda _t: self._refresh_emap_viewer()
+        )
+
         self._emap_overlay_widget = QCheckBox("Overlay on CT", ctrl)
         self._emap_overlay_widget.setChecked(False)
         self._emap_overlay_widget.setFont(QFont("Segoe UI", 9))
@@ -255,41 +277,44 @@ class EmapTabMixin:
         except Exception:
             alpha = 0.6
 
-        self._emap_fig.clear()
-        axes = self._emap_fig.subplots(1, 3)
+        # Which single plane is the user looking at?
+        axis = self._emap_view_axis_map.get(
+            self._emap_view_widget.currentText(), 'Z',
+        )
 
-        for ax_obj, axis in zip(axes, ('X', 'Y', 'Z')):
-            ax_obj.set_facecolor(PANEL2)
-            ax_obj.axis('off')
-            sl_E = slices_E[axis]
-            if overlay and self._gray is not None:
-                g = self._gray
-                if axis == 'X':
-                    sl_g = g[xi, :, :].T
-                elif axis == 'Y':
-                    sl_g = g[:, yi, :].T
-                else:
-                    sl_g = g[:, :, zi].T
-                ww, wc = auto_window(sl_g)
-                sl_g_w = apply_window(sl_g.astype(np.float32, copy=False), ww, wc)
-                ax_obj.imshow(
-                    sl_g_w, cmap='gray', origin='lower', vmin=0, vmax=1,
-                    aspect='equal', interpolation='nearest',
-                )
-                ax_obj.imshow(
-                    sl_E, cmap=cmap, norm=norm, origin='lower',
-                    aspect='equal', interpolation='nearest', alpha=alpha,
-                )
+        self._emap_fig.clear()
+        ax_obj = self._emap_fig.add_subplot(111)
+        ax_obj.set_facecolor(PANEL2)
+        ax_obj.axis('off')
+        sl_E = slices_E[axis]
+        if overlay and self._gray is not None:
+            g = self._gray
+            if axis == 'X':
+                sl_g = g[xi, :, :].T
+            elif axis == 'Y':
+                sl_g = g[:, yi, :].T
             else:
-                im = ax_obj.imshow(
-                    sl_E, cmap=cmap, norm=norm, origin='lower',
-                    aspect='equal', interpolation='nearest',
-                )
-                self._emap_fig.colorbar(
-                    im, ax=ax_obj, shrink=0.7, label='E [MPa]',
-                    fraction=0.046, pad=0.04,
-                )
-            ax_obj.set_title(titles[axis], color=TEXT_DIM, fontsize=8, pad=3)
+                sl_g = g[:, :, zi].T
+            ww, wc = auto_window(sl_g)
+            sl_g_w = apply_window(sl_g.astype(np.float32, copy=False), ww, wc)
+            ax_obj.imshow(
+                sl_g_w, cmap='gray', origin='lower', vmin=0, vmax=1,
+                aspect='equal', interpolation='nearest',
+            )
+            ax_obj.imshow(
+                sl_E, cmap=cmap, norm=norm, origin='lower',
+                aspect='equal', interpolation='nearest', alpha=alpha,
+            )
+        else:
+            im = ax_obj.imshow(
+                sl_E, cmap=cmap, norm=norm, origin='lower',
+                aspect='equal', interpolation='nearest',
+            )
+            self._emap_fig.colorbar(
+                im, ax=ax_obj, shrink=0.7, label='E [MPa]',
+                fraction=0.046, pad=0.04,
+            )
+        ax_obj.set_title(titles[axis], color=TEXT_DIM, fontsize=9, pad=4)
 
         self._emap_fig.tight_layout(pad=0.4)
         self._emap_canvas.draw_idle()

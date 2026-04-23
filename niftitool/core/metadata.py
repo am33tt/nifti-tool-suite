@@ -24,6 +24,112 @@ def get_axis_labels(affine) -> dict:
         return {'x': ('X', '-'), 'y': ('Y', '-'), 'z': ('Z', '-')}
 
 
+def collect_metadata(img, gray=None, hu_vol=None, labels=None) -> list:
+    """Structured metadata bundle used by the Metadata viewer tab.
+
+    Returns a list of sections, each ``{'title': str, 'rows': [(k, v), ...]}``
+    or ``{'title': str, 'matrix': 2-D list}`` for the affine. The same data
+    is formatted as plain text by :func:`read_metadata` for the log pane,
+    so both outputs stay in sync when new fields are added here.
+    """
+    from nibabel.orientations import aff2axcodes
+    affine  = img.affine
+    header  = img.header
+    orient  = "".join(aff2axcodes(affine))
+    spacing = header.get_zooms()
+    m       = affine[:3, :3]
+    scale   = np.sqrt(np.sum(m ** 2, axis=0))
+
+    vox_mm3 = float(np.prod(scale[:3]))
+    total_vox = int(np.prod(img.shape[:3]))
+    phys_vol_mm3 = vox_mm3 * total_vox
+    phys_vol_cm3 = phys_vol_mm3 / 1000.0
+    phys_size_mm = tuple(
+        round(float(img.shape[i]) * float(scale[i]), 2)
+        for i in range(min(3, len(img.shape)))
+    )
+    rot   = m / scale
+    pitch = np.degrees(np.arctan2(rot[2, 1], rot[2, 2]))
+    roll  = np.degrees(np.arctan2(-rot[2, 0], np.sqrt(rot[2, 1] ** 2 + rot[2, 2] ** 2)))
+    yaw   = np.degrees(np.arctan2(rot[1, 0], rot[0, 0]))
+
+    sections = []
+
+    sections.append({
+        'title': 'Volume Geometry',
+        'rows': [
+            ("Shape",          str(img.shape)),
+            ("Dtype",          str(img.get_data_dtype())),
+            ("Orientation",    orient),
+            ("Voxel spacing",  f"{tuple(round(float(s), 4) for s in spacing)} mm"),
+            ("Scale factors",  str(tuple(round(float(s), 4) for s in scale))),
+            ("Physical size",  f"{phys_size_mm} mm"),
+            ("Voxel volume",   f"{vox_mm3:.4f} mm³"),
+            ("Total volume",   f"{phys_vol_mm3:.2f} mm³   ({phys_vol_cm3:.4f} cm³)"),
+            ("Origin (world)", str(tuple(round(float(v), 3) for v in affine[:3, 3]))),
+            ("Euler angles",   f"Pitch={pitch:.2f}°   Roll={roll:.2f}°   Yaw={yaw:.2f}°"),
+        ],
+    })
+
+    if gray is not None:
+        flat = gray.ravel()
+        rows = [
+            ("Min",      f"{float(flat.min()):.2f}"),
+            ("Max",      f"{float(flat.max()):.2f}"),
+            ("Mean",     f"{float(flat.mean()):.4f}"),
+            ("Std",      f"{float(flat.std()):.4f}"),
+            ("p1 / p99", f"{float(np.percentile(flat, 1)):.2f}  /  "
+                         f"{float(np.percentile(flat, 99)):.2f}"),
+        ]
+        try:
+            cx, cy, cz = [s // 2 for s in gray.shape[:3]]
+            r = max(3, min(20, min(gray.shape[:3]) // 8))
+            roi = gray[cx - r:cx + r, cy - r:cy + r, cz - r:cz + r]
+            snr = float(roi.mean() / (roi.std() + 1e-9))
+            rows.append(("SNR (central ROI)",
+                         f"{snr:.1f}   (higher = less noise)"))
+        except Exception:
+            pass
+        sections.append({'title': 'Intensity Statistics', 'rows': rows})
+
+    if hu_vol is not None:
+        sections.append({
+            'title': 'HU Calibration',
+            'rows': [
+                ("HU range", f"{float(hu_vol.min()):.1f}  to  {float(hu_vol.max()):.1f}"),
+                ("HU mean",  f"{float(hu_vol.mean()):.2f}"),
+            ],
+        })
+
+    if labels is not None:
+        total = labels.size
+        rows = []
+        for pid, name in ((0, "Void/Air"), (1, "Matrix/Paste"), (2, "Aggregate")):
+            count = int((labels == pid).sum())
+            if count:
+                rows.append((name, f"{count:,} vox   ({100 * count / total:.2f}%)"))
+        if rows:
+            sections.append({'title': 'Phase Segmentation', 'rows': rows})
+
+    sections.append({
+        'title': 'Affine Matrix',
+        'matrix': [[float(v) for v in row] for row in affine],
+    })
+
+    hdr_rows = []
+    for k in (
+        'sizeof_hdr', 'dim_info', 'dim', 'pixdim', 'vox_offset',
+        'scl_slope', 'scl_inter', 'xyzt_units', 'qform_code', 'sform_code',
+    ):
+        try:
+            hdr_rows.append((k, str(header[k])))
+        except Exception:
+            pass
+    sections.append({'title': 'NIfTI Header', 'rows': hdr_rows})
+
+    return sections
+
+
 def read_metadata(img, gray=None, hu_vol=None, labels=None) -> str:
     """Multi-section metadata report suitable for the log pane."""
     from nibabel.orientations import aff2axcodes

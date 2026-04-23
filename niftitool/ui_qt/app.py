@@ -26,6 +26,7 @@ from .emap_tab import EmapTabMixin
 from .export_tab import ExportTabMixin
 from .histogram_tab import HistogramTabMixin
 from .log_tab import LogTabMixin
+from .metadata_tab import MetadataTabMixin
 from .triplanar_tab import TriplanarMixin
 from .view3d_tab import View3DMixin
 from .widgets import StageProgressBar, hline, styled_btn
@@ -71,10 +72,28 @@ def _build_qss() -> str:
         background-color: {ENTRY_BG}; color: {TEXT};
         border: 1px solid {BORDER}; padding: 2px 4px;
     }}
+    QComboBox:editable {{
+        background-color: {ENTRY_BG}; color: {TEXT};
+    }}
+    QComboBox:!editable, QComboBox::drop-down:editable {{
+        background-color: {ENTRY_BG}; color: {TEXT};
+    }}
     QComboBox QAbstractItemView {{
         background-color: {ENTRY_BG}; color: {TEXT};
+        border: 1px solid {BORDER};
+        outline: 0;
         selection-background-color: {ACCENT};
         selection-color: #FFFFFF;
+    }}
+    QComboBox QAbstractItemView::item {{
+        background-color: {ENTRY_BG}; color: {TEXT};
+        padding: 3px 6px;
+    }}
+    QComboBox QAbstractItemView::item:selected {{
+        background-color: {ACCENT}; color: #FFFFFF;
+    }}
+    QComboBox QAbstractItemView::item:hover {{
+        background-color: {PANEL2}; color: {TEXT};
     }}
 
     QRadioButton, QCheckBox {{ background-color: transparent; color: {TEXT}; }}
@@ -128,6 +147,7 @@ class NiftiApp(
     View3DMixin,
     HistogramTabMixin,
     EmapTabMixin,
+    MetadataTabMixin,
     ExportTabMixin,
     LogTabMixin,
     ActionsMixin,
@@ -145,6 +165,7 @@ class NiftiApp(
     _post_log_signal = pyqtSignal(str, str)
     _post_status_signal = pyqtSignal(str, bool)
     _post_call_signal = pyqtSignal(object)  # carries a zero-arg callable
+    _post_delayed_signal = pyqtSignal(int, object)  # (ms, callable)
 
     def __init__(self) -> None:
         super().__init__()
@@ -197,18 +218,35 @@ class NiftiApp(
         self._post_log_signal.connect(self._do_append_log)
         self._post_status_signal.connect(self._do_set_status)
         self._post_call_signal.connect(self._do_call)
+        self._post_delayed_signal.connect(self._do_delayed_call)
+        # Tracks whether the window is still alive so cross-thread
+        # schedulers can short-circuit during / after shutdown — without
+        # this, late callbacks from daemon threads re-enter QTimer and
+        # spam "QBasicTimer::start: dispatcher has already been destroyed".
+        self._shutting_down = False
 
     def _do_call(self, fn):
+        if self._shutting_down:
+            return
         try:
             fn()
         except Exception:
             pass
+
+    def _do_delayed_call(self, ms: int, fn):
+        if self._shutting_down:
+            return
+        # Runs on the GUI thread (queued connection), so QTimer can find
+        # a live event dispatcher.
+        QTimer.singleShot(int(ms), lambda: self._do_call(fn))
 
     def after(self, ms: int, fn, *args):
         """Tkinter compatibility shim - schedule ``fn(*args)`` on the GUI
         thread after ``ms`` milliseconds.  All existing ``actions.py``
         call sites continue to work unchanged.
         """
+        if self._shutting_down:
+            return None
         if args:
             call = lambda f=fn, a=args: f(*a)
         else:
@@ -218,7 +256,10 @@ class NiftiApp(
             # a worker thread).
             self._post_call_signal.emit(call)
             return None
-        QTimer.singleShot(int(ms), call)
+        # Route delayed calls through the main thread too; QTimer.singleShot
+        # invoked from a worker thread with no event dispatcher emits the
+        # "dispatcher has already been destroyed" warning during shutdown.
+        self._post_delayed_signal.emit(int(ms), call)
         return None
 
     def after_cancel(self, _token):
@@ -238,6 +279,15 @@ class NiftiApp(
             fn = getattr(self, 'maybe_auto_render_3d', None)
             if callable(fn):
                 fn()
+
+    def _show_tab(self, name: str):
+        """Jump the right-hand tab widget to the named tab. Called by
+        compute actions so e.g. "Compute histogram" lands the user on
+        the Histogram tab without manual clicking."""
+        tab = self._tab_by_name.get(name)
+        if tab is None:
+            return
+        self._nb.setCurrentWidget(tab)
 
     # drag-and-drop
 
@@ -272,6 +322,11 @@ class NiftiApp(
             event.ignore()
             return
 
+        # Tell any in-flight worker threads not to schedule more callbacks.
+        # Their QTimer.singleShots would otherwise land after Qt has torn
+        # down the event dispatcher and trigger QBasicTimer warnings.
+        self._shutting_down = True
+
         # Stop QTimers before the event loop tears down so late signals from
         # daemon threads can't trigger QBasicTimer::start warnings.
         for name in ('_ram_timer', '_tri_debounce_timer', '_emap_debounce_timer'):
@@ -281,6 +336,22 @@ class NiftiApp(
                     t.stop()
                 except Exception:
                     pass
+
+        # Tear down the VTK interactor cleanly. QVTKRenderWindowInteractor
+        # owns its own QTimer for the render loop; without Finalize() that
+        # timer can fire after the Qt event dispatcher is gone and spam
+        # "QBasicTimer::start: ... dispatcher has already been destroyed".
+        vtk_widget = getattr(self, '_vtk_widget', None)
+        if vtk_widget is not None:
+            try:
+                iren = vtk_widget.GetRenderWindow().GetInteractor()
+                if iren is not None:
+                    iren.TerminateApp()
+                vtk_widget.Finalize()
+                vtk_widget.close()
+            except Exception:
+                pass
+
         super().closeEvent(event)
 
     # dependency check
@@ -485,25 +556,38 @@ class NiftiApp(
         self._viewer3d_tab = QWidget()
         self._histogram_tab = QWidget()
         self._emap_tab = QWidget()
+        self._metadata_tab = QWidget()
         self._export_tab = QWidget()
 
         for w in (self._triplanar_tab, self._viewer3d_tab, self._histogram_tab,
-                  self._emap_tab, self._export_tab):
+                  self._emap_tab, self._metadata_tab, self._export_tab):
             w.setStyleSheet(f"background-color: {BG};")
 
         nb.addTab(self._triplanar_tab, "  Tri-Planar  ")
         nb.addTab(self._viewer3d_tab, "  3-D View  ")
         nb.addTab(self._histogram_tab, "  Histogram  ")
         nb.addTab(self._emap_tab, "  E-Map Viewer  ")
+        nb.addTab(self._metadata_tab, "  Metadata  ")
         nb.addTab(self._export_tab, "  Sim Export  ")
 
         self._nb = nb
+        # Named aliases so action handlers can switch tabs by key rather than
+        # importing the widget references. Keep in sync with the addTab order.
+        self._tab_by_name = {
+            'triplanar': self._triplanar_tab,
+            'view3d':    self._viewer3d_tab,
+            'histogram': self._histogram_tab,
+            'emap':      self._emap_tab,
+            'metadata':  self._metadata_tab,
+            'export':    self._export_tab,
+        }
 
         self._build_triplanar(self._triplanar_tab)
         self._build_3d_view(self._viewer3d_tab)
         nb.currentChanged.connect(self._on_tab_changed)
         self._build_histogram_tab(self._histogram_tab)
         self._build_emap_tab(self._emap_tab)
+        self._build_metadata_tab(self._metadata_tab)
         self._build_export_tab(self._export_tab)
 
         h_split.setSizes([380, 1200])

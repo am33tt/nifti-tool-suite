@@ -9,11 +9,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QIntValidator
+from PyQt6.QtGui import QFont, QFontMetrics, QIntValidator
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QRadioButton, QSlider, QVBoxLayout,
-    QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QPushButton, QRadioButton, QSlider,
+    QVBoxLayout, QWidget,
 )
 
 from ..config import (
@@ -57,25 +57,35 @@ class View3DMixin:
         ctrl = QWidget(parent)
         ctrl_lay = QHBoxLayout(ctrl)
         ctrl_lay.setContentsMargins(8, 4, 8, 4)
-        ctrl_lay.setSpacing(6)
+        ctrl_lay.setSpacing(8)
+        ctrl_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        base_font = QFont("Segoe UI", 9)
+        BAR_H = 26  # unified pixel height for every toolbar control
 
         # Mode radios (no heading — the two labels are self-explanatory).
         mode_row = QWidget(ctrl)
         mr_lay = QHBoxLayout(mode_row)
-        mr_lay.setContentsMargins(0, 0, 0, 0); mr_lay.setSpacing(4)
+        mr_lay.setContentsMargins(0, 0, 0, 0); mr_lay.setSpacing(6)
+        mr_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._3d_mode_group = QButtonGroup(mode_row)
         self._3d_mode_radios: dict = {}
         mode_rb_style = (
-            f"QRadioButton {{ color: {TEXT_DIM}; background-color: transparent; "
-            f"padding: 2px 6px; border-radius: 3px; }}"
-            f"QRadioButton:checked {{ color: {ACCENT}; font-weight: bold; "
-            f"background-color: {PANEL2}; }}"
+            f"QRadioButton {{ color: {TEXT_DIM}; background-color: transparent; }}"
+            f"QRadioButton:checked {{ color: {ACCENT}; font-weight: bold; }}"
         )
-        for label, value in (("Volume", "volume"), ("Slice planes", "planes")):
+        bold_font = QFont("Segoe UI", 9)
+        bold_font.setBold(True)
+        for label, value in (("Block", "volume"), ("Sliced", "planes")):
             rb = QRadioButton(label, mode_row)
-            rb.setFont(QFont("Segoe UI", 9))
+            rb.setFont(base_font)
             rb.setStyleSheet(mode_rb_style)
+            rb.setFixedHeight(BAR_H)
+            # Reserve room for the bold-weight label so toggling modes
+            # doesn't reflow the toolbar. +24 accounts for the indicator
+            # circle + its gap on most styles.
+            rb.setMinimumWidth(QFontMetrics(bold_font).horizontalAdvance(label) + 24)
             self._3d_mode_group.addButton(rb)
             self._3d_mode_radios[value] = rb
             mr_lay.addWidget(rb)
@@ -83,55 +93,65 @@ class View3DMixin:
         self._3d_mode = _RadioVar(self._3d_mode_radios, default="volume")
         for rb in self._3d_mode_radios.values():
             rb.toggled.connect(self._on_3d_mode_toggled)
-        ctrl_lay.addWidget(mode_row)
+        ctrl_lay.addWidget(mode_row, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        ctrl_lay.addWidget(
-            styled_btn(ctrl, "▶  Render", self._do_3d_render,
-                       accent=True, small=True)
-        )
-        ctrl_lay.addWidget(
-            styled_btn(ctrl, "Reset View", self._reset_3d_camera, small=True)
-        )
+        render_btn = styled_btn(ctrl, "▶  Render", self._do_3d_render,
+                                accent=True, small=True)
+        render_btn.setFixedHeight(BAR_H)
+        ctrl_lay.addWidget(render_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # Camera presets: click-to-frame the volume from a standard anatomical
-        # angle. Labels follow radiology convention (A=anterior, P=posterior,
-        # L/R=patient left/right, S=superior, I=inferior).
+        reset_btn = styled_btn(ctrl, "Reset View", self._reset_3d_camera, small=True)
+        reset_btn.setFixedHeight(BAR_H)
+        ctrl_lay.addWidget(reset_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # Camera-preset dropdown. Labels follow radiology convention
+        # (A=anterior, P=posterior, L/R=patient left/right, S=superior,
+        # I=inferior). "—" is a no-op placeholder so the combo shows a
+        # neutral state until the user actively picks a view.
         preset_lbl = QLabel("View:", ctrl)
-        preset_lbl.setFont(QFont("Segoe UI", 9))
+        preset_lbl.setFont(base_font)
         preset_lbl.setStyleSheet(f"color: {TEXT_DIM}; background-color: transparent;")
-        ctrl_lay.addWidget(preset_lbl)
-        for label, preset, tip in (
-            ("S",   "superior",  "Superior (top-down, axial view)"),
-            ("I",   "inferior",  "Inferior (bottom-up)"),
-            ("A",   "anterior",  "Anterior (front, coronal view)"),
-            ("P",   "posterior", "Posterior (back)"),
-            ("L",   "left",      "Patient left (sagittal view)"),
-            ("R",   "right",     "Patient right (sagittal view)"),
-            ("Iso", "iso",       "Isometric / angled 3-quarter view"),
-        ):
-            btn = styled_btn(
-                ctrl, label,
-                lambda _=False, p=preset: self._set_3d_view_preset(p),
-                small=True,
-            )
-            btn.setToolTip(tip)
-            ctrl_lay.addWidget(btn)
+        ctrl_lay.addWidget(preset_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        ctrl_lay.addWidget(
-            styled_btn(ctrl, "Sync to Tri-Planar",
-                       self._sync_3d_to_triplanar, small=True)
-        )
+        self._3d_view_combo = QComboBox(ctrl)
+        self._3d_view_combo.setFont(base_font)
+        self._3d_view_combo.setFixedHeight(BAR_H)
+        self._3d_view_combo.setToolTip("Jump the camera to a preset angle.")
+        for label, preset in (
+            ("— Select —", None),
+            ("Superior (top)",      "superior"),
+            ("Inferior (bottom)",   "inferior"),
+            ("Anterior (front)",    "anterior"),
+            ("Posterior (back)",    "posterior"),
+            ("Left (sagittal)",     "left"),
+            ("Right (sagittal)",    "right"),
+            ("Isometric",           "iso"),
+        ):
+            self._3d_view_combo.addItem(label, preset)
+        self._3d_view_combo.currentIndexChanged.connect(self._on_3d_view_preset_picked)
+        ctrl_lay.addWidget(self._3d_view_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        sync_btn = styled_btn(ctrl, "Sync to Tri-Planar",
+                              self._sync_3d_to_triplanar, small=True)
+        sync_btn.setFixedHeight(BAR_H)
+        ctrl_lay.addWidget(sync_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._3d_axes_cb = QCheckBox("Axes", ctrl)
         self._3d_axes_cb.setChecked(False)
-        self._3d_axes_cb.setFont(QFont("Segoe UI", 9))
+        self._3d_axes_cb.setFont(base_font)
+        self._3d_axes_cb.setFixedHeight(BAR_H)
+        self._3d_axes_cb.setToolTip(
+            "Show the labelled bounding-box axes on the volume. "
+            "The small XYZ gizmo in the corner is always visible."
+        )
         self._3d_axes_cb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
         self._3d_axes_cb.toggled.connect(self._on_3d_axes_toggled)
-        ctrl_lay.addWidget(self._3d_axes_cb)
+        ctrl_lay.addWidget(self._3d_axes_cb, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._3d_move_cb = QCheckBox("Move", ctrl)
         self._3d_move_cb.setChecked(False)
-        self._3d_move_cb.setFont(QFont("Segoe UI", 9))
+        self._3d_move_cb.setFont(base_font)
+        self._3d_move_cb.setFixedHeight(BAR_H)
         self._3d_move_cb.setToolTip(
             "When on, click-drag translates the picked volume or STL "
             "instead of rotating the view — useful for aligning an STL "
@@ -139,11 +159,11 @@ class View3DMixin:
         )
         self._3d_move_cb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
         self._3d_move_cb.toggled.connect(self._on_3d_move_toggled)
-        ctrl_lay.addWidget(self._3d_move_cb)
+        ctrl_lay.addWidget(self._3d_move_cb, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        ctrl_lay.addWidget(
-            styled_btn(ctrl, "+ STL", self._load_stl_dialog, small=True)
-        )
+        stl_btn = styled_btn(ctrl, "+ STL", self._load_stl_dialog, small=True)
+        stl_btn.setFixedHeight(BAR_H)
+        ctrl_lay.addWidget(stl_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         ctrl_lay.addStretch(1)
         root.addWidget(ctrl)
@@ -168,15 +188,34 @@ class View3DMixin:
         self._3d_idx: dict = {'X': 0, 'Y': 0, 'Z': 0}
         self._3d_idx_widgets: dict = {}
         self._3d_sliders: dict = {}
+        self._3d_plane_visible: dict = {'X': True, 'Y': True, 'Z': True}
+        self._3d_plane_checkboxes: dict = {}
         labels = {'X': "Sagittal (X)", 'Y': "Coronal (Y)", 'Z': "Axial (Z)"}
         for col, ax in enumerate(('X', 'Y', 'Z')):
             cf = QWidget(sliders)
             cf_lay = QVBoxLayout(cf)
             cf_lay.setContentsMargins(0, 0, 0, 0); cf_lay.setSpacing(2)
-            title_lbl = QLabel(labels[ax], cf)
+
+            title_row = QWidget(cf)
+            title_lay = QHBoxLayout(title_row)
+            title_lay.setContentsMargins(0, 0, 0, 0); title_lay.setSpacing(4)
+            # Per-axis visibility toggle — lets the user hide a plane and
+            # work with just one or two orthogonal slices at a time.
+            vis_cb = QCheckBox(title_row)
+            vis_cb.setChecked(True)
+            vis_cb.setToolTip(f"Show / hide the {labels[ax]} slice plane.")
+            vis_cb.setStyleSheet("background-color: transparent;")
+            vis_cb.toggled.connect(
+                lambda on, a=ax: self._on_3d_plane_visibility_toggled(a, on)
+            )
+            title_lay.addWidget(vis_cb)
+            self._3d_plane_checkboxes[ax] = vis_cb
+
+            title_lbl = QLabel(labels[ax], title_row)
             title_lbl.setFont(QFont("Segoe UI", 9))
             title_lbl.setStyleSheet(f"color: {ACCENT}; background-color: {PANEL2};")
-            cf_lay.addWidget(title_lbl)
+            title_lay.addWidget(title_lbl, 1)
+            cf_lay.addWidget(title_row)
 
             row_w = QWidget(cf)
             row_lay = QHBoxLayout(row_w)
@@ -439,7 +478,10 @@ class View3DMixin:
         widget.SetOrientationMarker(marker)
         widget.SetInteractor(self._vtk_iren)
         widget.SetViewport(0.0, 0.0, 0.18, 0.22)
-        widget.SetEnabled(1 if self._3d_axes_cb.isChecked() else 0)
+        # Corner gizmo is always on — it only indicates orientation and
+        # takes negligible screen space. The "Axes" checkbox governs the
+        # on-volume cube-axes actor, not this marker.
+        widget.SetEnabled(1)
         widget.InteractiveOff()
         self._axes_marker_widget = widget
 
@@ -514,8 +556,8 @@ class View3DMixin:
         self._cube_axes.SetVisibility(self._3d_axes_cb.isChecked())
 
     def _on_3d_axes_toggled(self, checked: bool):
-        if getattr(self, '_axes_marker_widget', None) is not None:
-            self._axes_marker_widget.SetEnabled(1 if checked else 0)
+        # Only toggles the on-volume cube-axes actor. The corner XYZ
+        # gizmo stays visible regardless (wired on in _build_axes_indicators).
         if self._cube_axes is not None:
             self._cube_axes.SetVisibility(bool(checked))
         if hasattr(self, '_vtk_widget'):
@@ -601,6 +643,17 @@ class View3DMixin:
             return
         self._vtk_renderer.ResetCamera()
         self._vtk_widget.GetRenderWindow().Render()
+
+    def _on_3d_view_preset_picked(self, index: int):
+        """Dropdown chose a preset — apply and snap back to the placeholder
+        so the user can re-pick the same view a second time."""
+        preset = self._3d_view_combo.itemData(index)
+        if preset is None:
+            return
+        self._set_3d_view_preset(preset)
+        self._3d_view_combo.blockSignals(True)
+        self._3d_view_combo.setCurrentIndex(0)
+        self._3d_view_combo.blockSignals(False)
 
     def _set_3d_view_preset(self, preset: str):
         """Aim the camera at a canonical anatomical view.
@@ -876,6 +929,24 @@ class View3DMixin:
 
         for axis, actor in zip(('X', 'Y', 'Z'), self._vtk_plane_actors):
             self._update_plane_position(axis, self._3d_idx[axis], render=False)
+            actor.SetVisibility(1 if self._3d_plane_visible.get(axis, True) else 0)
+
+    def _on_3d_plane_visibility_toggled(self, axis: str, visible: bool):
+        """User toggled a slice-plane tick. Hide/show the matching VTK
+        actor — only meaningful in Sliced mode, but we record the state
+        either way so switching modes honors it.
+        """
+        self._3d_plane_visible[axis] = bool(visible)
+        actor = next(
+            (a for a in getattr(self, '_vtk_plane_actors', [])
+             if getattr(a, 'axis_letter', None) == axis),
+            None,
+        )
+        if actor is None:
+            return
+        actor.SetVisibility(1 if visible else 0)
+        if hasattr(self, '_vtk_widget'):
+            self._vtk_widget.GetRenderWindow().Render()
 
     def _update_plane_position(self, axis, idx, render=True):
         if not self._vtk_plane_actors:

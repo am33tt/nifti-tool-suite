@@ -23,10 +23,10 @@ from ..core.geometry import run_angle_rotation, run_cropper, run_reorientation
 from ..core.histogram import compute_histogram
 from ..core.io import LazyGrayVolume, load_nifti, raw_array, run_gunzip, to_gray
 from ..core.mapping import compute_E_map
-from ..core.metadata import get_axis_labels, read_metadata
+from ..core.metadata import collect_metadata, get_axis_labels, read_metadata
 from ..core.segmentation import phase_statistics, segment_phases
 from ..deps import HAS_NIBABEL, nib, np
-from ..utils import available_ram_mb
+from ..utils import available_ram_mb, total_ram_mb
 
 
 class ActionsMixin:
@@ -78,9 +78,157 @@ class ActionsMixin:
         except OSError:
             pass
 
+        # On RAM-constrained machines, offer to pre-crop huge volumes so
+        # the user never has to materialise them fully. If they accept,
+        # we swap `path` for the cropped sidecar and continue.
+        cropped_path = self._maybe_offer_precrop(path)
+        if cropped_path is not None:
+            path = cropped_path
+
         self._status_var.set(f"Opening {Path(path).name}...")
         self._prog.begin_staged()
         threading.Thread(target=self._staged_load, args=(path,), daemon=True).start()
+
+    # Large-file pre-crop
+
+    #: File size above which we start offering the pre-load crop dialog.
+    _PRECROP_FILE_MB = 1500.0
+    #: Only prompt when installed RAM is at or below this (GiB).
+    _PRECROP_RAM_GB_CAP = 16.0
+
+    def _maybe_offer_precrop(self, path: str) -> str | None:
+        """Return a path to a cropped sidecar the user asked us to create,
+        or ``None`` to mean "just load *path* as-is".
+
+        Triggered only when the file is large (>1.5 GiB) *and* the system
+        has ≤16 GiB of RAM. Peeking the NIfTI header via ``nib.load`` does
+        not materialise the volume — nibabel returns a proxy, so the crop
+        reads only the needed bytes through the file mmap.
+        """
+        try:
+            sz_mb = Path(path).stat().st_size / (1024 ** 2)
+        except OSError:
+            return None
+        if sz_mb < self._PRECROP_FILE_MB:
+            return None
+
+        total_mb = total_ram_mb()
+        if total_mb is None or total_mb > self._PRECROP_RAM_GB_CAP * 1024.0:
+            return None
+        total_gb = total_mb / 1024.0
+
+        try:
+            img_hdr = nib.load(str(path))
+            shape = tuple(int(d) for d in img_hdr.shape[:3])
+        except Exception as ex:
+            self._append_log(f"  Header peek failed: {ex}", 'warn')
+            return None
+
+        reply = QMessageBox.question(
+            self,
+            "Large file detected",
+            f"{Path(path).name} is {sz_mb:.0f} MiB and this machine has only "
+            f"{total_gb:.1f} GiB of RAM.\n\n"
+            f"Current shape (X, Y, Z): {shape}\n\n"
+            f"Would you like to crop it to a smaller region before loading? "
+            f"The cropped copy is saved alongside the original and loaded "
+            f"in place of it.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return None
+
+        ranges = self._ask_precrop_ranges(shape)
+        if ranges is None:
+            return None
+        x_range, y_range, z_range = ranges
+
+        try:
+            self._append_log(
+                f"  Pre-load crop: X{x_range} Y{y_range} Z{z_range}", 'info',
+            )
+            self._status_var.set("Cropping large file...")
+            cropped = run_cropper(img_hdr, x_range, y_range, z_range)
+
+            src = Path(path)
+            # Strip both ``.nii`` and ``.nii.gz`` for a clean stem.
+            stem = src.name
+            for ext in (".nii.gz", ".nii"):
+                if stem.lower().endswith(ext):
+                    stem = stem[: -len(ext)]
+                    break
+            out_path = src.with_name(f"{stem}_cropped.nii.gz")
+            n = 2
+            while out_path.exists():
+                out_path = src.with_name(f"{stem}_cropped_{n}.nii.gz")
+                n += 1
+            nib.save(cropped, str(out_path))
+            self._append_log(f"  Saved cropped file: {out_path.name}", 'ok')
+            return str(out_path)
+        except Exception as ex:
+            self._append_log(f"  Pre-crop failed: {ex}", 'err')
+            QMessageBox.warning(
+                self, "Crop failed",
+                f"Could not crop the file:\n{ex}\n\nLoading the original instead.",
+            )
+            return None
+
+    def _ask_precrop_ranges(self, shape):
+        """Modal with three (start, end) spin-box pairs. Returns
+        ``((x0, x1), (y0, y1), (z0, z1))`` or ``None`` on Cancel."""
+        from PyQt6.QtWidgets import (
+            QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
+            QSpinBox, QVBoxLayout, QWidget,
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Pre-load crop ranges")
+        root = QVBoxLayout(dlg)
+        root.addWidget(QLabel(
+            f"Voxel-index ranges (half-open: end is exclusive).\n"
+            f"Full shape: {shape}"
+        ))
+        form = QFormLayout()
+        root.addLayout(form)
+
+        spin_pairs = {}
+        for i, ax in enumerate(('X', 'Y', 'Z')):
+            dim = shape[i]
+            row = QWidget(dlg)
+            rlay = QHBoxLayout(row)
+            rlay.setContentsMargins(0, 0, 0, 0)
+            s0 = QSpinBox(row); s0.setRange(0, dim - 1); s0.setValue(0)
+            s1 = QSpinBox(row); s1.setRange(1, dim);     s1.setValue(dim)
+            rlay.addWidget(s0)
+            rlay.addWidget(QLabel("to", row))
+            rlay.addWidget(s1)
+            form.addRow(f"{ax} (0 – {dim}):", row)
+            spin_pairs[ax] = (s0, s1)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        root.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        out = []
+        for ax in ('X', 'Y', 'Z'):
+            s0, s1 = spin_pairs[ax]
+            a, b = int(s0.value()), int(s1.value())
+            if b <= a:
+                QMessageBox.warning(
+                    self, "Invalid range",
+                    f"{ax}: end ({b}) must be greater than start ({a}).",
+                )
+                return None
+            out.append((a, b))
+        return tuple(out)
 
     def _staged_load(self, path):
         try:
@@ -273,8 +421,15 @@ class ActionsMixin:
                 self._log_sep("Metadata")
                 self._set_status("Reading metadata...", busy=True)
                 gray_full = self._get_gray() if self._gray is not None else None
-                txt = read_metadata(self._img, gray_full, self._hu_vol, self._labels)
+                sections = collect_metadata(
+                    self._img, gray_full, self._hu_vol, self._labels,
+                )
+                txt = read_metadata(
+                    self._img, gray_full, self._hu_vol, self._labels,
+                )
                 self._append_log(txt, 'dim')
+                self.after(0, self.show_metadata_sections, sections)
+                self.after(0, self._show_tab, 'metadata')
                 self._set_status("Metadata read.", busy=False)
             except Exception as ex:
                 self._append_log(f"  {ex}", 'err')
@@ -300,6 +455,7 @@ class ActionsMixin:
                 self._append_log(f"  Mean: {gray.mean():.4f}  Std: {gray.std():.4f}", 'dim')
                 self.after(0, self._draw_histogram, counts, edges, zidx, means, mn, mx)
                 self.after(0, self._update_stats)
+                self.after(0, self._show_tab, 'histogram')
                 self._set_status("Histogram complete.", busy=False)
             except Exception as ex:
                 self._append_log(f"  {ex}", 'err')
@@ -545,6 +701,7 @@ class ActionsMixin:
                 self.after(0, _upd)
                 self.after(0, self._update_emap_sliders)
                 self.after(50, self._refresh_emap_viewer)
+                self.after(50, self._show_tab, 'emap')
                 self._set_status("E-Map complete.", busy=False)
             except Exception as ex:
                 self._append_log(f"  E-Map error: {ex}", 'err')
