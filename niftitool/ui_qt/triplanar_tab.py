@@ -11,8 +11,9 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QIntValidator
 from PyQt6.QtWidgets import (
-    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QSlider, QVBoxLayout, QWidget,
+    QButtonGroup, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSlider,
+    QVBoxLayout, QWidget,
 )
 
 from ..config import (
@@ -63,7 +64,11 @@ class TriplanarMixin:
         self._tri_fig.set_tight_layout({'pad': 0.4, 'w_pad': 1.8})
         self._tri_canvas = FigureCanvasTkAgg(self._tri_fig)
         root.addWidget(self._tri_canvas, 1)
-        self._tri_canvas.mpl_connect('button_press_event', self._on_tri_click)
+        self._tri_canvas.mpl_connect('button_press_event', self._on_tri_press)
+        self._tri_canvas.mpl_connect('motion_notify_event', self._on_tri_motion)
+        self._tri_canvas.mpl_connect('button_release_event', self._on_tri_release)
+
+        self._build_tri_measure_bar(parent, root)
 
         tb_frame = QWidget(parent)
         tb_lay = QHBoxLayout(tb_frame)
@@ -195,13 +200,43 @@ class TriplanarMixin:
             return
         sl.setValue(idx)
 
-    def _on_tri_click(self, event):
+    def _on_tri_press(self, event):
         if self._gray is None or event.inaxes is None:
             return
         ax_map = {self._ax_sag: 'X', self._ax_cor: 'Y', self._ax_axi: 'Z'}
         if event.inaxes not in ax_map:
             return
         axis = ax_map[event.inaxes]
+        tool = getattr(self, '_tri_tool', 'pan')
+        if tool == 'distance':
+            self._on_tri_distance_click(axis, event)
+        elif tool == 'roi':
+            self._on_tri_roi_press(axis, event)
+        else:
+            self._on_tri_probe_click(axis, event)
+
+    def _on_tri_motion(self, event):
+        if getattr(self, '_tri_tool', 'pan') != 'roi':
+            return
+        if self._roi_drag_axis is None or event.inaxes is None:
+            return
+        ax_map = {self._ax_sag: 'X', self._ax_cor: 'Y', self._ax_axi: 'Z'}
+        if ax_map.get(event.inaxes) != self._roi_drag_axis:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self._update_tri_roi_rect(event.xdata, event.ydata, provisional=True)
+
+    def _on_tri_release(self, event):
+        if getattr(self, '_tri_tool', 'pan') != 'roi':
+            return
+        if self._roi_drag_axis is None:
+            return
+        if event.inaxes is not None and event.xdata is not None:
+            self._update_tri_roi_rect(event.xdata, event.ydata, provisional=False)
+        self._finalize_tri_roi()
+
+    def _on_tri_probe_click(self, axis, event):
         ex, ey = int(event.xdata or 0), int(event.ydata or 0)
         g = self._gray
         xi, yi, zi = self._tri_idx['X'], self._tri_idx['Y'], self._tri_idx['Z']
@@ -224,6 +259,306 @@ class TriplanarMixin:
             self._probe_var.set(probe)
         except Exception:
             pass
+
+    # measurement: toolbar + helpers
+
+    def _build_tri_measure_bar(self, parent, root):
+        """Tool selector + status line for distance/ROI measurements."""
+        bar = QFrame(parent)
+        bar.setStyleSheet(f"background-color: {PANEL2};")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 2, 8, 2)
+        lay.setSpacing(10)
+
+        lbl = QLabel("Measure:", bar)
+        lbl.setFont(QFont("Segoe UI", 9))
+        lbl.setStyleSheet(f"color: {TEXT_DIM}; background-color: transparent;")
+        lay.addWidget(lbl)
+
+        self._tri_tool = 'pan'
+        self._tri_tool_group = QButtonGroup(bar)
+        rb_style = (
+            f"QRadioButton {{ color: {TEXT_DIM}; background-color: transparent; }}"
+            f"QRadioButton:checked {{ color: {ACCENT}; font-weight: bold; }}"
+        )
+        self._tri_tool_radios = {}
+        for label, value in (("Pan", 'pan'), ("Distance", 'distance'), ("ROI", 'roi')):
+            rb = QRadioButton(label, bar)
+            rb.setFont(QFont("Segoe UI", 9))
+            rb.setStyleSheet(rb_style)
+            if value == 'pan':
+                rb.setChecked(True)
+            rb.toggled.connect(
+                lambda checked, v=value: checked and self._on_tri_tool_changed(v)
+            )
+            self._tri_tool_group.addButton(rb)
+            self._tri_tool_radios[value] = rb
+            lay.addWidget(rb)
+
+        clear_btn = QPushButton("Clear", bar)
+        clear_btn.setFont(QFont("Segoe UI", 9))
+        clear_btn.setStyleSheet(
+            f"QPushButton {{ color: {TEXT}; background-color: {PANEL2}; "
+            f"border: 1px solid {BORDER}; padding: 2px 10px; }}"
+            f"QPushButton:hover {{ border: 1px solid {ACCENT}; }}"
+        )
+        clear_btn.clicked.connect(self._clear_tri_measurements)
+        lay.addWidget(clear_btn)
+
+        self._tri_measure_status = QLabel("", bar)
+        self._tri_measure_status.setFont(QFont("Consolas", 9))
+        self._tri_measure_status.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;"
+        )
+        self._tri_measure_status.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        lay.addWidget(self._tri_measure_status, 1)
+
+        root.addWidget(bar)
+
+        # per-axis artist caches
+        self._dist_points: dict = {'X': [], 'Y': [], 'Z': []}
+        self._dist_artists: dict = {'X': [], 'Y': [], 'Z': []}
+        self._roi_drag_start = None
+        self._roi_drag_axis = None
+        self._roi_rect_artist: dict = {'X': None, 'Y': None, 'Z': None}
+        self._roi_bounds: dict = {'X': None, 'Y': None, 'Z': None}
+
+    def _on_tri_tool_changed(self, tool):
+        self._tri_tool = tool
+        if tool != 'roi' and self._roi_drag_axis is not None:
+            self._roi_drag_axis = None
+            self._roi_drag_start = None
+        hints = {
+            'pan': "",
+            'distance': "Distance: click two points on any panel.",
+            'roi': "ROI: drag a rectangle on any panel.",
+        }
+        self._tri_measure_status.setText(hints.get(tool, ""))
+
+    def _panel_spacings(self, axis):
+        """Return (h_mm, v_mm) physical spacing of the panel `axis`.
+
+        Panels display transposed slices:
+            'X' (sagittal) → (h, v) = (y, z)
+            'Y' (coronal)  → (h, v) = (x, z)
+            'Z' (axial)    → (h, v) = (x, y)
+        """
+        if self._img is None:
+            return 1.0, 1.0
+        try:
+            dx, dy, dz = self._img.header.get_zooms()[:3]
+        except Exception:
+            return 1.0, 1.0
+        if axis == 'X':
+            return float(dy), float(dz)
+        if axis == 'Y':
+            return float(dx), float(dz)
+        return float(dx), float(dy)
+
+    def _panel_ax_obj(self, axis):
+        return {'X': self._ax_sag, 'Y': self._ax_cor, 'Z': self._ax_axi}[axis]
+
+    # distance tool
+
+    def _on_tri_distance_click(self, axis, event):
+        pts = self._dist_points[axis]
+        if len(pts) >= 2:
+            self._clear_axis_distance(axis)
+            pts = self._dist_points[axis]
+        pts.append((float(event.xdata), float(event.ydata)))
+        ax_obj = self._panel_ax_obj(axis)
+        marker = ax_obj.plot(
+            event.xdata, event.ydata, marker='o', markersize=5,
+            markerfacecolor=ACCENT, markeredgecolor='white', markeredgewidth=0.8,
+        )[0]
+        self._dist_artists[axis].append(marker)
+
+        if len(pts) == 2:
+            (x0, y0), (x1, y1) = pts
+            line = ax_obj.plot(
+                [x0, x1], [y0, y1], color=ACCENT, lw=1.6, alpha=0.95,
+            )[0]
+            self._dist_artists[axis].append(line)
+
+            h_mm, v_mm = self._panel_spacings(axis)
+            dh = (x1 - x0) * h_mm
+            dv = (y1 - y0) * v_mm
+            dist_mm = float(np.hypot(dh, dv))
+            label = f"{dist_mm:.2f} mm"
+            txt = ax_obj.text(
+                (x0 + x1) / 2.0, (y0 + y1) / 2.0 + 2.0, label,
+                color=ACCENT, fontsize=8, fontweight='bold', ha='center',
+                va='bottom',
+                bbox=dict(
+                    facecolor=BG, edgecolor=ACCENT, boxstyle='round,pad=0.2',
+                    alpha=0.85,
+                ),
+            )
+            self._dist_artists[axis].append(txt)
+            panel_name = {'X': 'Sagittal', 'Y': 'Coronal', 'Z': 'Axial'}[axis]
+            self._tri_measure_status.setText(
+                f"{panel_name} distance: {dist_mm:.3f} mm  "
+                f"(Δh={dh:.2f}, Δv={dv:.2f})"
+            )
+        self._tri_canvas.draw_idle()
+
+    def _clear_axis_distance(self, axis):
+        for art in self._dist_artists[axis]:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._dist_artists[axis] = []
+        self._dist_points[axis] = []
+
+    # ROI tool
+
+    def _on_tri_roi_press(self, axis, event):
+        if event.xdata is None or event.ydata is None:
+            return
+        self._clear_axis_roi(axis)
+        self._roi_drag_axis = axis
+        self._roi_drag_start = (float(event.xdata), float(event.ydata))
+        from matplotlib.patches import Rectangle
+        ax_obj = self._panel_ax_obj(axis)
+        rect = Rectangle(
+            (event.xdata, event.ydata), 0, 0,
+            linewidth=1.4, edgecolor=ACCENT, facecolor=ACCENT, alpha=0.15,
+        )
+        ax_obj.add_patch(rect)
+        self._roi_rect_artist[axis] = rect
+        self._tri_canvas.draw_idle()
+
+    def _update_tri_roi_rect(self, xdata, ydata, provisional):
+        axis = self._roi_drag_axis
+        if axis is None or self._roi_drag_start is None:
+            return
+        rect = self._roi_rect_artist[axis]
+        if rect is None:
+            return
+        x0, y0 = self._roi_drag_start
+        x1, y1 = float(xdata), float(ydata)
+        rect.set_xy((min(x0, x1), min(y0, y1)))
+        rect.set_width(abs(x1 - x0))
+        rect.set_height(abs(y1 - y0))
+        self._roi_bounds[axis] = (x0, y0, x1, y1)
+        if provisional:
+            self._tri_canvas.draw_idle()
+
+    def _finalize_tri_roi(self):
+        axis = self._roi_drag_axis
+        self._roi_drag_axis = None
+        self._roi_drag_start = None
+        if axis is None:
+            return
+        bounds = self._roi_bounds.get(axis)
+        if bounds is None:
+            return
+        x0, y0, x1, y1 = bounds
+        if abs(x1 - x0) < 1.0 or abs(y1 - y0) < 1.0:
+            self._clear_axis_roi(axis)
+            self._tri_measure_status.setText("ROI too small — drag a larger rectangle.")
+            self._tri_canvas.draw_idle()
+            return
+
+        g = self._gray
+        if g is None:
+            return
+        h0, h1 = sorted((int(round(x0)), int(round(x1))))
+        v0, v1 = sorted((int(round(y0)), int(round(y1))))
+        h0 = max(0, h0); v0 = max(0, v0)
+
+        xi, yi, zi = self._tri_idx['X'], self._tri_idx['Y'], self._tri_idx['Z']
+        try:
+            if axis == 'Z':
+                h1 = min(h1, g.shape[0] - 1)
+                v1 = min(v1, g.shape[1] - 1)
+                block = np.asarray(g[h0:h1 + 1, v0:v1 + 1, zi], dtype=np.float32)
+            elif axis == 'Y':
+                h1 = min(h1, g.shape[0] - 1)
+                v1 = min(v1, g.shape[2] - 1)
+                block = np.asarray(g[h0:h1 + 1, yi, v0:v1 + 1], dtype=np.float32)
+            else:
+                h1 = min(h1, g.shape[1] - 1)
+                v1 = min(v1, g.shape[2] - 1)
+                block = np.asarray(g[xi, h0:h1 + 1, v0:v1 + 1], dtype=np.float32)
+        except Exception:
+            self._tri_measure_status.setText("ROI sampling failed.")
+            return
+
+        if block.size == 0:
+            self._clear_axis_roi(axis)
+            return
+
+        h_mm, v_mm = self._panel_spacings(axis)
+        area_mm2 = (h1 - h0 + 1) * (v1 - v0 + 1) * h_mm * v_mm
+        mean = float(block.mean())
+        std  = float(block.std())
+        mn   = float(block.min())
+        mx   = float(block.max())
+
+        ax_obj = self._panel_ax_obj(axis)
+        rect = self._roi_rect_artist[axis]
+        lx = rect.get_x() + rect.get_width() / 2.0
+        ly = rect.get_y() + rect.get_height() + 1.5
+        label_txt = ax_obj.text(
+            lx, ly,
+            f"μ={mean:.1f} σ={std:.1f}\n{area_mm2:.1f} mm²",
+            color=ACCENT, fontsize=7, ha='center', va='bottom', fontweight='bold',
+            bbox=dict(
+                facecolor=BG, edgecolor=ACCENT, boxstyle='round,pad=0.2', alpha=0.85,
+            ),
+        )
+        self._roi_rect_artist[axis] = (rect, label_txt)
+
+        panel_name = {'X': 'Sagittal', 'Y': 'Coronal', 'Z': 'Axial'}[axis]
+        extra = ""
+        if self._hu_vol is not None:
+            try:
+                if axis == 'Z':
+                    hu_blk = np.asarray(
+                        self._hu_vol[h0:h1 + 1, v0:v1 + 1, zi], dtype=np.float32
+                    )
+                elif axis == 'Y':
+                    hu_blk = np.asarray(
+                        self._hu_vol[h0:h1 + 1, yi, v0:v1 + 1], dtype=np.float32
+                    )
+                else:
+                    hu_blk = np.asarray(
+                        self._hu_vol[xi, h0:h1 + 1, v0:v1 + 1], dtype=np.float32
+                    )
+                extra = f"  HU μ={float(hu_blk.mean()):.1f}"
+            except Exception:
+                pass
+
+        self._tri_measure_status.setText(
+            f"{panel_name} ROI [{h0}:{h1+1}, {v0}:{v1+1}]  "
+            f"μ={mean:.2f}  σ={std:.2f}  min={mn:.1f}  max={mx:.1f}  "
+            f"area={area_mm2:.2f} mm²{extra}"
+        )
+        self._tri_canvas.draw_idle()
+
+    def _clear_axis_roi(self, axis):
+        art = self._roi_rect_artist.get(axis)
+        if art is None:
+            return
+        items = art if isinstance(art, tuple) else (art,)
+        for a in items:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self._roi_rect_artist[axis] = None
+        self._roi_bounds[axis] = None
+
+    def _clear_tri_measurements(self):
+        for ax in ('X', 'Y', 'Z'):
+            self._clear_axis_distance(ax)
+            self._clear_axis_roi(ax)
+        self._tri_measure_status.setText("")
+        self._tri_canvas.draw_idle()
 
     # refresh (hot path)
 
@@ -358,6 +693,15 @@ class TriplanarMixin:
         self._tri_hline.clear()
         self._tri_vline.clear()
         self._tri_compass.clear()
+        # Measurement artists live on the axes that are about to be cleared;
+        # drop our dict references so we don't hold onto dead objects.
+        for axis in ('X', 'Y', 'Z'):
+            self._dist_artists[axis] = []
+            self._dist_points[axis] = []
+            self._roi_rect_artist[axis] = None
+            self._roi_bounds[axis] = None
+        if hasattr(self, '_tri_measure_status'):
+            self._tri_measure_status.setText("")
 
     # per-axis PNG export
 
