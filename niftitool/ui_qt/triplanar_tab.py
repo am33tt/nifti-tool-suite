@@ -738,9 +738,93 @@ class TriplanarMixin:
         ax = fig.add_subplot(111)
         ax.imshow(sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1)
         ax.axis('off')
+        self._draw_measurements_on(ax, axis)
         fig.tight_layout(pad=0)
         fig.savefig(path, dpi=200, bbox_inches='tight')
         self._append_log(f"  Exported {axis} slice → {Path(path).name}", 'ok')
+
+    def _draw_measurements_on(self, ax, axis):
+        """Re-render any distance / ROI overlays for `axis` onto `ax`.
+
+        The live overlay artists belong to the on-screen canvas; PNG export
+        builds a fresh Figure, so we replay the measurements from stored
+        coordinates.
+        """
+        # Distance overlay
+        pts = getattr(self, '_dist_points', {}).get(axis, [])
+        if len(pts) >= 1:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            ax.plot(
+                xs, ys, marker='o', markersize=5, linestyle='-' if len(pts) == 2 else 'None',
+                color=ACCENT, markerfacecolor=ACCENT, markeredgecolor='white',
+                markeredgewidth=0.8, lw=1.6, alpha=0.95,
+            )
+            if len(pts) == 2:
+                (x0, y0), (x1, y1) = pts
+                h_mm, v_mm = self._panel_spacings(axis)
+                dist_mm = float(np.hypot((x1 - x0) * h_mm, (y1 - y0) * v_mm))
+                ax.text(
+                    (x0 + x1) / 2.0, (y0 + y1) / 2.0 + 2.0, f"{dist_mm:.2f} mm",
+                    color=ACCENT, fontsize=8, fontweight='bold', ha='center',
+                    va='bottom',
+                    bbox=dict(
+                        facecolor=BG, edgecolor=ACCENT,
+                        boxstyle='round,pad=0.2', alpha=0.85,
+                    ),
+                )
+
+        # ROI overlay
+        bounds = getattr(self, '_roi_bounds', {}).get(axis)
+        if bounds is not None:
+            from matplotlib.patches import Rectangle
+            x0, y0, x1, y1 = bounds
+            rx, ry = min(x0, x1), min(y0, y1)
+            rw, rh = abs(x1 - x0), abs(y1 - y0)
+            ax.add_patch(Rectangle(
+                (rx, ry), rw, rh,
+                linewidth=1.4, edgecolor=ACCENT, facecolor=ACCENT, alpha=0.15,
+            ))
+            # Recompute stats so the PNG label matches the live readout
+            g = self._gray
+            h0, h1 = sorted((int(round(x0)), int(round(x1))))
+            v0, v1 = sorted((int(round(y0)), int(round(y1))))
+            h0 = max(0, h0); v0 = max(0, v0)
+            try:
+                if axis == 'Z':
+                    h1 = min(h1, g.shape[0] - 1)
+                    v1 = min(v1, g.shape[1] - 1)
+                    block = np.asarray(
+                        g[h0:h1 + 1, v0:v1 + 1, self._tri_idx['Z']], dtype=np.float32
+                    )
+                elif axis == 'Y':
+                    h1 = min(h1, g.shape[0] - 1)
+                    v1 = min(v1, g.shape[2] - 1)
+                    block = np.asarray(
+                        g[h0:h1 + 1, self._tri_idx['Y'], v0:v1 + 1], dtype=np.float32
+                    )
+                else:
+                    h1 = min(h1, g.shape[1] - 1)
+                    v1 = min(v1, g.shape[2] - 1)
+                    block = np.asarray(
+                        g[self._tri_idx['X'], h0:h1 + 1, v0:v1 + 1], dtype=np.float32
+                    )
+            except Exception:
+                block = None
+            if block is not None and block.size > 0:
+                h_mm, v_mm = self._panel_spacings(axis)
+                area_mm2 = (h1 - h0 + 1) * (v1 - v0 + 1) * h_mm * v_mm
+                ax.text(
+                    rx + rw / 2.0, ry + rh + 1.5,
+                    f"μ={float(block.mean()):.1f} σ={float(block.std()):.1f}\n"
+                    f"{area_mm2:.1f} mm²",
+                    color=ACCENT, fontsize=7, ha='center', va='bottom',
+                    fontweight='bold',
+                    bbox=dict(
+                        facecolor=BG, edgecolor=ACCENT,
+                        boxstyle='round,pad=0.2', alpha=0.85,
+                    ),
+                )
 
 
 class _QLabelVar:
