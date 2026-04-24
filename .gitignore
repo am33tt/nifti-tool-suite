@@ -3,3 +3,5 @@ files/
 .git/
 __pycache__/
 docs/
+niftitool/__pycache__/
+niftitool/ui_qt/__pycache__/
