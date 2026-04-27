@@ -20,16 +20,33 @@ LOGO_PATH = Path(__file__).with_name("assets") / "logo.svg"
 
 
 def _load_app_icon():
-    """Return a QIcon built from the bundled cube-scan logo."""
-    from PyQt6.QtGui import QIcon, QPixmap
+    """Return a QIcon built from the bundled cube-scan logo.
+
+    Windows picks a taskbar pixmap by exact size match, so we rasterise
+    the SVG at the standard icon sizes and add each one. Without this
+    the taskbar often falls back to the generic python.exe icon.
+    """
+    from PyQt6.QtCore import QSize, Qt
+    from PyQt6.QtGui import QIcon, QPainter, QPixmap
+    from PyQt6.QtSvg import QSvgRenderer
+
     if not LOGO_PATH.exists():
         return QIcon()
-    icon = QIcon(str(LOGO_PATH))
-    if icon.isNull():
-        # Fall back to a raster render if the SVG plugin isn't available.
+
+    icon = QIcon()
+    renderer = QSvgRenderer(str(LOGO_PATH))
+    if renderer.isValid():
+        for size in (16, 20, 24, 32, 40, 48, 64, 96, 128, 256):
+            pm = QPixmap(QSize(size, size))
+            pm.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pm)
+            renderer.render(painter)
+            painter.end()
+            icon.addPixmap(pm)
+    else:
         pm = QPixmap(str(LOGO_PATH))
         if not pm.isNull():
-            icon = QIcon(pm)
+            icon.addPixmap(pm)
     return icon
 
 

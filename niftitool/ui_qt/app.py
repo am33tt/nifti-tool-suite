@@ -7,7 +7,7 @@ Each mixin lives in its own file so bugs and edits stay local.
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut, QFont
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont
 from PyQt6.QtWidgets import (
     QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
     QScrollArea, QSplitter, QStackedWidget, QStatusBar, QTabWidget,
@@ -404,24 +404,57 @@ class NiftiApp(
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Top bar
+        # Top bar — logo + title group is centred; action buttons sit on
+        # the right. Left and right containers share the same stretch
+        # factor so the centre group lands at the true window centre.
         top = QFrame(self)
         top.setStyleSheet(f"background-color: {BG};")
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(14, 8, 14, 8)
-        title = QLabel("NIfTI Tool Suite", top)
+
+        top_lay.addStretch(1)
+
+        center = QWidget(top)
+        center.setStyleSheet(f"background-color: {BG};")
+        center_lay = QHBoxLayout(center)
+        center_lay.setContentsMargins(0, 0, 0, 0)
+        center_lay.setSpacing(8)
+        center_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        from .. import LOGO_PATH
+        logo_lbl = QLabel(center)
+        logo_pm = QIcon(str(LOGO_PATH)).pixmap(26, 26)
+        if not logo_pm.isNull():
+            logo_lbl.setPixmap(logo_pm)
+        logo_lbl.setStyleSheet(f"background-color: {BG}; border: none;")
+        center_lay.addWidget(logo_lbl)
+
+        title = QLabel("NIfTI Tool Suite", center)
         title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {TEXT}; background-color: {BG};")
-        top_lay.addWidget(title)
-        sub = QLabel("v6  SimReady  |  Ctrl+O to open", top)
+        center_lay.addWidget(title)
+
+        sub = QLabel("v6  SimReady  |  Ctrl+O to open", center)
         sub.setFont(QFont("Segoe UI", 9))
         sub.setStyleSheet(f"color: {TEXT_DIM}; background-color: {BG};")
-        top_lay.addWidget(sub)
-        top_lay.addStretch(1)
-        open_btn = styled_btn(top, "Open NIfTI...", self._open_file, accent=True)
-        top_lay.addWidget(open_btn)
-        gz_btn = styled_btn(top, "Gunzip .gz...", self._do_gunzip)
-        top_lay.addWidget(gz_btn)
+        center_lay.addWidget(sub)
+
+        top_lay.addWidget(center, 0)
+
+        right = QWidget(top)
+        right.setStyleSheet(f"background-color: {BG};")
+        right_lay = QHBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(6)
+        right_lay.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        open_btn = styled_btn(right, "Open NIfTI...", self._open_file, accent=True)
+        right_lay.addWidget(open_btn)
+        gz_btn = styled_btn(right, "Gunzip .gz...", self._do_gunzip)
+        right_lay.addWidget(gz_btn)
+        top_lay.addWidget(right, 1)
+
         root.addWidget(top)
 
         # Separator

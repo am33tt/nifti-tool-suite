@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..config import (
-    ACCENT, AXIS_COLOR, BG, BORDER, ERR, PANEL2, SLIDER_DEBOUNCE_MS, TEXT,
-    TEXT_DIM,
+    ACCENT, AXIS_COLOR, BG, BORDER, ERR, PANEL2, SLIDER_DEBOUNCE_MS, TEAL,
+    TEXT, TEXT_DIM,
 )
 from ..core.windowing import apply_window, auto_window
 from ..deps import HAS_MPL, np
@@ -53,6 +53,19 @@ class TriplanarMixin:
         for ax in axes:
             ax.set_facecolor(PANEL2)
             ax.axis('off')
+
+        # Welcome banner shown until the first volume is loaded.
+        self._tri_welcome = self._tri_fig.text(
+            0.5, 0.55, "Welcome!",
+            color=ACCENT, fontsize=20, fontweight='bold',
+            ha='center', va='center',
+        )
+        self._tri_welcome_sub = self._tri_fig.text(
+            0.5, 0.46,
+            "Load a NIfTI file to get started\n"
+            "(Ctrl+O, drag and drop, or use \u201cOpen NIfTI\u2026\u201d above).",
+            color=TEXT, fontsize=10, ha='center', va='center',
+        )
 
         # Persistent matplotlib artists (created once, updated each frame).
         self._tri_im:      dict = {'X': None, 'Y': None, 'Z': None}
@@ -144,7 +157,7 @@ class TriplanarMixin:
         export_bar = QWidget(parent)
         eb_lay = QHBoxLayout(export_bar)
         eb_lay.setContentsMargins(6, 2, 6, 2)
-        for axis in ('Z', 'Y', 'X'):
+        for axis in ('X', 'Y', 'Z'):
             name = {'Z': 'Axial', 'Y': 'Coronal', 'X': 'Sagittal'}[axis]
             eb_lay.addWidget(
                 styled_btn(export_bar, f"Export {name} PNG",
@@ -212,6 +225,8 @@ class TriplanarMixin:
             self._on_tri_distance_click(axis, event)
         elif tool == 'roi':
             self._on_tri_roi_press(axis, event)
+        elif tool == 'profile':
+            self._on_tri_profile_click(axis, event)
         else:
             self._on_tri_probe_click(axis, event)
 
@@ -282,7 +297,12 @@ class TriplanarMixin:
             f"QRadioButton:checked {{ color: {ACCENT}; font-weight: bold; }}"
         )
         self._tri_tool_radios = {}
-        for label, value in (("Pan", 'pan'), ("Distance", 'distance'), ("ROI", 'roi')):
+        for label, value in (
+            ("Pan", 'pan'),
+            ("Distance", 'distance'),
+            ("ROI", 'roi'),
+            ("Profile", 'profile'),
+        ):
             rb = QRadioButton(label, bar)
             rb.setFont(QFont("Segoe UI", 9))
             rb.setStyleSheet(rb_style)
@@ -324,6 +344,9 @@ class TriplanarMixin:
         self._roi_drag_axis = None
         self._roi_rect_artist: dict = {'X': None, 'Y': None, 'Z': None}
         self._roi_bounds: dict = {'X': None, 'Y': None, 'Z': None}
+        self._profile_points: dict = {'X': [], 'Y': [], 'Z': []}
+        self._profile_artists: dict = {'X': [], 'Y': [], 'Z': []}
+        self._profile_dialogs: list = []
 
     def _on_tri_tool_changed(self, tool):
         self._tri_tool = tool
@@ -334,6 +357,7 @@ class TriplanarMixin:
             'pan': "",
             'distance': "Distance: click two points on any panel.",
             'roi': "ROI: drag a rectangle on any panel.",
+            'profile': "Profile: click two points — a line plot will open.",
         }
         self._tri_measure_status.setText(hints.get(tool, ""))
 
@@ -412,6 +436,153 @@ class TriplanarMixin:
                 pass
         self._dist_artists[axis] = []
         self._dist_points[axis] = []
+
+    # profile tool
+
+    def _on_tri_profile_click(self, axis, event):
+        pts = self._profile_points[axis]
+        if len(pts) >= 2:
+            self._clear_axis_profile(axis)
+            pts = self._profile_points[axis]
+        pts.append((float(event.xdata), float(event.ydata)))
+
+        ax_obj = self._panel_ax_obj(axis)
+        marker = ax_obj.plot(
+            event.xdata, event.ydata, marker='s', markersize=5,
+            markerfacecolor=TEAL, markeredgecolor='white', markeredgewidth=0.8,
+        )[0]
+        self._profile_artists[axis].append(marker)
+
+        if len(pts) == 2:
+            (x0, y0), (x1, y1) = pts
+            line = ax_obj.plot(
+                [x0, x1], [y0, y1], color=TEAL, lw=1.6, alpha=0.95, linestyle='-',
+            )[0]
+            self._profile_artists[axis].append(line)
+            self._open_profile_plot(axis, pts)
+
+        self._tri_canvas.draw_idle()
+
+    def _clear_axis_profile(self, axis):
+        for art in self._profile_artists[axis]:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._profile_artists[axis] = []
+        self._profile_points[axis] = []
+
+    def _sample_profile(self, axis, pts):
+        """Sample raw (and optionally HU) intensity along a line in panel
+        coordinates. Returns (d_mm, raw, hu_or_None, n_samples)."""
+        g = self._gray
+        (x0, y0), (x1, y1) = pts
+        h_mm, v_mm = self._panel_spacings(axis)
+        dh = (x1 - x0) * h_mm
+        dv = (y1 - y0) * v_mm
+        length_mm = float(np.hypot(dh, dv))
+        n = max(2, int(np.hypot(x1 - x0, y1 - y0)) + 1)
+        n = min(n, 2048)
+        h_t = np.linspace(x0, x1, n).astype(np.float32)
+        v_t = np.linspace(y0, y1, n).astype(np.float32)
+
+        xi, yi, zi = self._tri_idx['X'], self._tri_idx['Y'], self._tri_idx['Z']
+        if axis == 'Z':
+            slice2d = np.asarray(g[:, :, zi], dtype=np.float32)
+        elif axis == 'Y':
+            slice2d = np.asarray(g[:, yi, :], dtype=np.float32)
+        else:
+            slice2d = np.asarray(g[xi, :, :], dtype=np.float32)
+
+        from ..deps import ndimage
+        if ndimage is not None:
+            raw_vals = ndimage.map_coordinates(
+                slice2d, [h_t, v_t], order=1, mode='nearest',
+            )
+        else:
+            hi = np.clip(np.round(h_t).astype(int), 0, slice2d.shape[0] - 1)
+            vi = np.clip(np.round(v_t).astype(int), 0, slice2d.shape[1] - 1)
+            raw_vals = slice2d[hi, vi]
+
+        hu_vals = None
+        if self._hu_vol is not None:
+            try:
+                if axis == 'Z':
+                    hu_slice = np.asarray(self._hu_vol[:, :, zi], dtype=np.float32)
+                elif axis == 'Y':
+                    hu_slice = np.asarray(self._hu_vol[:, yi, :], dtype=np.float32)
+                else:
+                    hu_slice = np.asarray(self._hu_vol[xi, :, :], dtype=np.float32)
+                if ndimage is not None:
+                    hu_vals = ndimage.map_coordinates(
+                        hu_slice, [h_t, v_t], order=1, mode='nearest',
+                    )
+                else:
+                    hu_vals = hu_slice[hi, vi]
+            except Exception:
+                hu_vals = None
+
+        d_mm = np.linspace(0.0, length_mm, n, dtype=np.float32)
+        return d_mm, raw_vals, hu_vals, n
+
+    def _open_profile_plot(self, axis, pts):
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qtagg import (
+            FigureCanvasQTAgg as FigureCanvas,
+        )
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout as _QVBoxLayout
+
+        d_mm, raw, hu, n = self._sample_profile(axis, pts)
+        panel_name = {'X': 'Sagittal', 'Y': 'Coronal', 'Z': 'Axial'}[axis]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Intensity profile — {panel_name}")
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.resize(640, 380)
+        dlg.setStyleSheet(f"background-color: {BG}; color: {TEXT};")
+
+        lay = _QVBoxLayout(dlg)
+        lay.setContentsMargins(8, 8, 8, 8)
+        fig = Figure(figsize=(6, 3.4), facecolor=BG)
+        canvas = FigureCanvas(fig)
+        lay.addWidget(canvas)
+
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(PANEL2)
+        ax.plot(d_mm, raw, color=TEAL, lw=1.4, label='raw')
+        ax.set_xlabel("distance (mm)", color=TEXT_DIM, fontsize=9)
+        ax.set_ylabel("raw intensity", color=TEAL, fontsize=9)
+        ax.tick_params(colors=TEXT_DIM, labelsize=8)
+        for side in ('top', 'right'):
+            ax.spines[side].set_visible(False)
+        for side in ('bottom', 'left'):
+            ax.spines[side].set_color(BORDER)
+
+        if hu is not None:
+            ax2 = ax.twinx()
+            ax2.plot(d_mm, hu, color=ACCENT, lw=1.2, linestyle='--', label='HU')
+            ax2.set_ylabel("HU", color=ACCENT, fontsize=9)
+            ax2.tick_params(colors=TEXT_DIM, labelsize=8)
+            for side in ('top',):
+                ax2.spines[side].set_visible(False)
+            ax2.spines['right'].set_color(BORDER)
+
+        length_mm = float(d_mm[-1]) if len(d_mm) else 0.0
+        ax.set_title(
+            f"{panel_name}   length = {length_mm:.2f} mm   samples = {n}",
+            color=TEXT, fontsize=10, pad=4,
+        )
+        fig.tight_layout(pad=0.6)
+        canvas.draw_idle()
+
+        self._profile_dialogs.append(dlg)
+        dlg.finished.connect(lambda _r, d=dlg: self._profile_dialogs.remove(d)
+                             if d in self._profile_dialogs else None)
+        dlg.show()
+
+        self._tri_measure_status.setText(
+            f"{panel_name} profile: length={length_mm:.2f} mm  samples={n}"
+        )
 
     # ROI tool
 
@@ -557,6 +728,7 @@ class TriplanarMixin:
         for ax in ('X', 'Y', 'Z'):
             self._clear_axis_distance(ax)
             self._clear_axis_roi(ax)
+            self._clear_axis_profile(ax)
         self._tri_measure_status.setText("")
         self._tri_canvas.draw_idle()
 
@@ -566,6 +738,11 @@ class TriplanarMixin:
         self._tri_redraw_pending = None
         if not HAS_MPL or self._gray is None:
             return
+
+        # First volume loaded — retire the welcome banner.
+        if getattr(self, '_tri_welcome', None) is not None:
+            self._tri_welcome.set_visible(False)
+            self._tri_welcome_sub.set_visible(False)
 
         g = self._gray
         cmap = self._cmap_var.get()
@@ -700,6 +877,8 @@ class TriplanarMixin:
             self._dist_points[axis] = []
             self._roi_rect_artist[axis] = None
             self._roi_bounds[axis] = None
+            self._profile_artists[axis] = []
+            self._profile_points[axis] = []
         if hasattr(self, '_tri_measure_status'):
             self._tri_measure_status.setText("")
 
@@ -773,6 +952,17 @@ class TriplanarMixin:
                         boxstyle='round,pad=0.2', alpha=0.85,
                     ),
                 )
+
+        # Profile line overlay
+        p_pts = getattr(self, '_profile_points', {}).get(axis, [])
+        if len(p_pts) >= 1:
+            ax.plot(
+                [p[0] for p in p_pts], [p[1] for p in p_pts],
+                marker='s', markersize=5,
+                linestyle='-' if len(p_pts) == 2 else 'None',
+                color=TEAL, markerfacecolor=TEAL, markeredgecolor='white',
+                markeredgewidth=0.8, lw=1.6, alpha=0.95,
+            )
 
         # ROI overlay
         bounds = getattr(self, '_roi_bounds', {}).get(axis)
