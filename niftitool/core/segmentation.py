@@ -22,6 +22,52 @@ from ..deps import np
 PHASE_NAMES = {0: "Void/Air", 1: "Matrix/Paste", 2: "Aggregate/Solid"}
 
 
+def otsu_threshold(values, nbins: int = 512) -> float:
+    """Classic Otsu threshold on a flat sample of intensities.
+
+    Maximises between-class variance over a histogram — a good automatic
+    void/solid split for bimodal CT data (air peak vs material peak).
+    Works on raw intensities or HU alike; no calibration required.
+    """
+    v = np.asarray(values, dtype=np.float64).ravel()
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0
+    hist, edges = np.histogram(v, bins=nbins)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    p = hist.astype(np.float64)
+    total = p.sum()
+    if total == 0:
+        return float(centers[nbins // 2])
+    p /= total
+    omega = np.cumsum(p)                    # class-0 probability
+    mu = np.cumsum(p * centers)             # class-0 cumulative mean
+    mu_t = mu[-1]
+    denom = omega * (1.0 - omega)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sigma_b = (mu_t * omega - mu) ** 2 / denom
+    sigma_b[~np.isfinite(sigma_b)] = -1.0
+    t = float(centers[int(np.argmax(sigma_b))])
+
+    # Refine to the midpoint between the class means (isodata /
+    # Ridler–Calvard).  With well-separated peaks the raw Otsu optimum is
+    # flat across the whole empty valley and argmax lands at its very
+    # edge — e.g. "threshold 25" on data whose material peak sits in the
+    # thousands.  The midpoint lands mid-valley, which also captures
+    # partial-volume voxels around small pores.
+    for _ in range(20):
+        lo = v[v < t]
+        hi = v[v >= t]
+        if lo.size == 0 or hi.size == 0:
+            break
+        t_new = 0.5 * (float(lo.mean()) + float(hi.mean()))
+        if abs(t_new - t) <= 1e-6 * max(1.0, abs(t)):
+            t = t_new
+            break
+        t = t_new
+    return float(t)
+
+
 def segment_phases(hu_vol, void_thresh, solid_thresh=None):
     """Return a ``uint8`` label volume using the two thresholds above."""
     labels = np.zeros(hu_vol.shape, dtype=np.uint8)

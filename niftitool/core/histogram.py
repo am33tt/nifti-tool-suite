@@ -20,10 +20,14 @@ def compute_histogram(gray, n_bins: int = 256):
       that produces at most ~80 points (so the slice-mean curve is legible
       even on 1000-slice volumes).
     """
-    flat = gray.ravel()
-    if flat.size > MAX_HIST_VOXELS:
-        step = flat.size // MAX_HIST_VOXELS
-        flat = flat[::step]
+    if hasattr(gray, "subsample_flat"):
+        # Lazy volume: sample without materialising the full array.
+        flat = gray.subsample_flat(MAX_HIST_VOXELS)
+    else:
+        flat = gray.ravel()
+        if flat.size > MAX_HIST_VOXELS:
+            step = flat.size // MAX_HIST_VOXELS
+            flat = flat[::step]
     mn, mx = float(flat.min()), float(flat.max())
     counts, edges = np.histogram(flat, bins=n_bins, range=(mn, mx))
     nz   = gray.shape[2]

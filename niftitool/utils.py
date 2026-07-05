@@ -7,6 +7,10 @@ from contextlib import contextmanager
 from .deps import HAS_PSUTIL, psutil
 
 
+class OperationCancelled(Exception):
+    """Raised inside progress callbacks when the user hits Stop."""
+
+
 def process_rss_mb() -> float | None:
     """Resident set size of the current process, in MiB. ``None`` if psutil is
     not installed or an unexpected error occurs."""

@@ -169,21 +169,53 @@ class LazyGrayVolume:
         return a.astype(dtype, copy=False) if dtype is not None else a
 
     def subsample_flat(self, max_voxels: int):
-        """Cheap flat float32 sample for the live stats panel.
+        """Cheap flat float32 sample, representative of the WHOLE volume.
 
-        Reads a single contiguous middle Z-slab and strides through it,
-        avoiding a full materialisation.  Returned array is 1-D float32.
+        Reads a handful of Z slices spread evenly across the stack (not
+        just the middle — for stacked-specimen scans the middle can be an
+        air gap, which would poison any threshold computed from the
+        sample).  Returned array is 1-D float32.
         """
         sx, sy, sz = self.shape
-        # Slab thickness — 1 slice for huge volumes is enough for stats.
-        slab = max(1, min(sz, max(1, max_voxels // max(1, sx * sy))))
-        z0 = max(0, (sz - slab) // 2)
-        z1 = z0 + slab
-        block = self[:, :, z0:z1].ravel()
-        if block.size > max_voxels:
-            step = block.size // max_voxels
-            block = block[::step]
-        return block
+        n_slices = int(min(sz, 9))
+        zs = sorted({int(round(z)) for z in np.linspace(0, sz - 1, n_slices)})
+        per_slice = max(1, max_voxels // max(1, len(zs)))
+        parts = []
+        for z in zs:
+            sl = self[:, :, z].ravel()
+            if sl.size > per_slice:
+                sl = sl[:: max(1, sl.size // per_slice)]
+            parts.append(sl)
+        return np.concatenate(parts)
+
+
+def preview_volume(volume, max_voxels: int = 150_000_000, progress=None):
+    """Strided float32 copy of *volume* small enough to plot / report.
+
+    Works on ndarrays and :class:`LazyGrayVolume` alike, reading one Z
+    slice at a time so the full-resolution volume is never materialised.
+    Returns ``(preview, stride)`` — ``stride == 1`` means the input was
+    already small enough (and, for ndarrays, is returned as-is).
+    """
+    sx, sy, sz = volume.shape[:3]
+    total = sx * sy * sz
+    stride = 1
+    while total / stride**3 > max_voxels:
+        stride += 1
+    if stride == 1 and isinstance(volume, np.ndarray):
+        return volume, 1
+
+    zids = range(0, sz, stride)
+    out = np.empty(
+        (len(range(0, sx, stride)), len(range(0, sy, stride)), len(zids)),
+        dtype=np.float32,
+    )
+    for i, z in enumerate(zids):
+        sl = np.asarray(volume[:, :, z])
+        out[:, :, i] = sl[::stride, ::stride]
+        if progress is not None and i % 50 == 0:
+            progress(i + 1, len(zids))
+    return out, stride
 
 
 def run_gunzip(gz_path: str | Path) -> Path:

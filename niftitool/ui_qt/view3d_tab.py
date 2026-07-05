@@ -840,6 +840,15 @@ class View3DMixin:
             ww, wc = auto_window(arr)
         lo = wc - ww / 2.0
         hi = wc + ww / 2.0
+        # Safety net: if the window misses the data range (stale W/C from
+        # another file, or a preset that doesn't match this scan), every
+        # voxel gets opacity 0 and the volume "disappears". Fall back to
+        # an automatic window computed from the actual array.
+        amin, amax = float(arr.min()), float(arr.max())
+        if hi <= amin or lo >= amax:
+            ww, wc = auto_window(arr)
+            lo = wc - ww / 2.0
+            hi = wc + ww / 2.0
         if hi <= lo:
             hi = lo + 1.0
         return lo, hi

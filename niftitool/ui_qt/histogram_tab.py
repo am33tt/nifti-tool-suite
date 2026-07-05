@@ -83,15 +83,6 @@ class HistogramTabMixin:
         opts_lay.addWidget(self._hist_bins_widget)
         self._hist_bins_var = _WidgetVar(self._hist_bins_widget)
 
-        self._hist_show_hu_widget = QCheckBox("Show HU axis", opts)
-        self._hist_show_hu_widget.setChecked(True)
-        self._hist_show_hu_widget.setFont(QFont("Segoe UI", 9))
-        self._hist_show_hu_widget.setStyleSheet(
-            f"color: {TEXT}; background-color: transparent;"
-        )
-        opts_lay.addWidget(self._hist_show_hu_widget)
-        self._hist_show_hu = _WidgetVar(self._hist_show_hu_widget)
-
         self._hist_shade_phases_widget = QCheckBox("Shade phases", opts)
         self._hist_shade_phases_widget.setChecked(True)
         self._hist_shade_phases_widget.setFont(QFont("Segoe UI", 9))
@@ -137,22 +128,9 @@ class HistogramTabMixin:
             except Exception:
                 pass
 
-        ax1.set_xlabel("Intensity (raw)", color=TEXT_DIM, fontsize=8)
+        ax1.set_xlabel("Intensity", color=TEXT_DIM, fontsize=8)
         ax1.set_ylabel("Voxel count", color=TEXT_DIM, fontsize=8)
         ax1.set_title("Intensity Histogram", color=TEXT, fontsize=9)
-
-        if self._hist_show_hu.get() and self._hu_cal:
-            m_ = self._hu_cal.get('m', 1.0)
-            c_ = self._hu_cal.get('c', 0.0)
-            ax1_top = ax1.twiny()
-            ax1_top.set_xlim(ax1.get_xlim())
-            raw_ticks = ax1.get_xticks()
-            hu_ticks = [m_ * r + c_ for r in raw_ticks]
-            ax1_top.set_xticks(raw_ticks)
-            ax1_top.set_xticklabels(
-                [f"{h:.0f}" for h in hu_ticks], fontsize=7, color=TEAL,
-            )
-            ax1_top.set_xlabel("HU (calibrated)", color=TEAL, fontsize=8)
 
         ax2.plot(zidx, means, color=ACCENT, lw=1.5)
         ax2.fill_between(zidx, means, alpha=0.2, color=ACCENT)

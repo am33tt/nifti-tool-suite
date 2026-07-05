@@ -10,18 +10,17 @@ marshal results back onto the Qt main thread via :meth:`NiftiApp.after`
 from __future__ import annotations
 
 import gc
-import json
 import threading
 from pathlib import Path
 
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from ..config import STATS_SUBSAMPLE_VOXELS
-from ..core.calibration import calibrate_to_hu
-from ..core.cpp_export import generate_ct_hpp_snippet
 from ..core.geometry import run_angle_rotation, run_cropper, run_reorientation
 from ..core.histogram import compute_histogram
-from ..core.io import LazyGrayVolume, load_nifti, raw_array, run_gunzip, to_gray
+from ..core.io import (
+    LazyGrayVolume, load_nifti, preview_volume, raw_array, run_gunzip, to_gray,
+)
 from ..core.mapping import compute_E_map
 from ..core.metadata import collect_metadata, get_axis_labels, read_metadata
 from ..core.segmentation import phase_statistics, segment_phases
@@ -59,7 +58,15 @@ class ActionsMixin:
         self._slice_cache.set_volume(None)
         self._reset_tri_artists()
         self._hu_cal = {}
-        self._cal_result_var.set("Not calibrated")
+        # New file → new intensity distribution: re-arm the auto threshold
+        # and reset the display window. A stale Window W/C from the
+        # previous file can map the new data entirely transparent in the
+        # 3-D view ("volume disappears").
+        try:
+            self._void_thresh_var.set("auto")
+            self._reset_window()
+        except Exception:
+            pass
         self._log_sep(f"Loading: {Path(path).name}")
 
         # nibabel can mmap plain .nii but has to decompress .nii.gz entirely
@@ -334,6 +341,144 @@ class ActionsMixin:
             return self._gray.to_array()
         return self._gray
 
+    def _get_gray_lazy(self):
+        """Like :meth:`_get_gray` but never materialises the volume.
+
+        Returns whatever ``self._gray`` is (ndarray or LazyGrayVolume) —
+        both support ``shape`` and per-slice ``[:, :, z]`` access, which
+        is all the streaming code paths need.  Use this from anything
+        that must work on volumes larger than RAM.
+        """
+        if self._gray is None and self._img is not None:
+            self._gray = LazyGrayVolume(self._img.dataobj)
+            self._slice_cache.set_volume(self._gray)
+            self.after(0, self._update_tri_sliders)
+        return self._gray
+
+    def _ram_guard(self, bytes_per_voxel: float, what: str) -> bool:
+        """Return True if a full-resolution *what* fits in RAM, else warn.
+
+        Estimates ``voxels × bytes_per_voxel`` against available memory
+        and pops an actionable message instead of letting numpy die with
+        an opaque MemoryError.
+        """
+        if self._img is None:
+            return False
+        vox = 1
+        for s in self._img.shape[:3]:
+            vox *= int(s)
+        needed_mb = vox * bytes_per_voxel / 1024 ** 2
+        avail_mb = available_ram_mb()
+        if avail_mb is not None and needed_mb > avail_mb * 0.85:
+            msg = (
+                f"{what} needs ~{needed_mb / 1024:.1f} GiB at full "
+                f"resolution, but only {avail_mb / 1024:.1f} GiB RAM is "
+                f"free.\n\n"
+                f"Options:\n"
+                f"  •  Crop the volume first (Crop tool) — a region of "
+                f"interest is usually enough.\n"
+                f"  •  Use the Porosity tab / histogram / report — those "
+                f"work at any size (they stream and downsample "
+                f"automatically)."
+            )
+            self.after(0, lambda: QMessageBox.warning(
+                self, "Not enough RAM", msg,
+            ))
+            self._append_log(
+                f"  {what}: needs ~{needed_mb / 1024:.1f} GiB, "
+                f"{avail_mb / 1024:.1f} GiB free — aborted. "
+                f"Crop first or use the streaming tools.", 'warn',
+            )
+            return False
+        return True
+
+    def _resolve_void_thresh(self):
+        """Current void threshold as a float; ``'auto'`` → Otsu.
+
+        The computed value is written back into the field (so the user
+        sees what was used and can tweak it) and logged.  Returns None
+        when no file is loaded and the field is on auto.
+        """
+        txt = str(self._void_thresh_var.get()).strip().lower()
+        if txt not in ("", "auto"):
+            try:
+                return float(txt)
+            except ValueError:
+                pass                      # unparseable → fall back to auto
+        if self._img is None:
+            return None
+        from ..core.segmentation import otsu_threshold
+
+        vol = self._hu_vol if self._hu_vol is not None \
+            else self._get_gray_lazy()
+        if hasattr(vol, "subsample_flat"):
+            flat = vol.subsample_flat(2_000_000)
+        else:
+            flat = vol.ravel()
+            if flat.size > 2_000_000:
+                flat = flat[:: flat.size // 2_000_000]
+        t = float(otsu_threshold(flat))
+        self._void_thresh_var.set(f"{t:.1f}")
+        self._append_log(
+            f"  Void threshold: auto (Otsu) → {t:.1f}  "
+            f"(sampled range {float(flat.min()):.0f} … {float(flat.max()):.0f})",
+            'teal',
+        )
+        return t
+
+    def _sane_void_thresh(self, thresh: float) -> float:
+        """Sanity-check *thresh* against the actual intensity distribution.
+
+        The classic trap: the HU-style default (−500) applied to an
+        uncalibrated scan whose raw intensities start at 0 — the void
+        mask is empty and porosity reads 0.000 %.  If the threshold
+        selects (almost) nothing or (almost) everything, offer the Otsu
+        split instead.  Runs on the GUI thread (shows a dialog).
+        Returns the threshold to use.
+        """
+        try:
+            vol = self._hu_vol if self._hu_vol is not None \
+                else self._get_gray_lazy()
+            if vol is None:
+                return thresh
+            if hasattr(vol, "subsample_flat"):
+                flat = vol.subsample_flat(2_000_000)
+            else:
+                flat = vol.ravel()
+                if flat.size > 2_000_000:
+                    flat = flat[:: flat.size // 2_000_000]
+            frac = float((flat < thresh).mean())
+            if 1e-4 < frac < 0.999:
+                return thresh
+
+            from ..core.segmentation import otsu_threshold
+            t_auto = otsu_threshold(flat)
+            mn, mx = float(flat.min()), float(flat.max())
+            what = "almost nothing" if frac <= 1e-4 else "almost everything"
+            reply = QMessageBox.question(
+                self, "Threshold looks wrong",
+                f"The void threshold {thresh:g} selects {what} "
+                f"({frac * 100:.3f} % of sampled voxels).\n\n"
+                f"Your volume's intensity range is about "
+                f"{mn:.0f} … {mx:.0f}, so this threshold probably "
+                f"doesn't match the data.\n\n"
+                f"Use the automatic (Otsu) threshold  {t_auto:.1f}  "
+                f"instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._void_thresh_var.set(f"{t_auto:.1f}")
+                self._append_log(
+                    f"  Void threshold auto-corrected: {thresh:g} → "
+                    f"{t_auto:.1f}  (Otsu; volume range {mn:.0f}–{mx:.0f})",
+                    'teal',
+                )
+                return float(t_auto)
+            return thresh
+        except Exception:
+            return thresh
+
     def _require_img(self) -> bool:
         if self._img is None:
             QMessageBox.warning(self, "No file", "Please open a NIfTI file first.")
@@ -420,12 +565,12 @@ class ActionsMixin:
             try:
                 self._log_sep("Metadata")
                 self._set_status("Reading metadata...", busy=True)
-                gray_full = self._get_gray() if self._gray is not None else None
+                gray_lazy = self._get_gray_lazy() if self._gray is not None else None
                 sections = collect_metadata(
-                    self._img, gray_full, self._hu_vol, self._labels,
+                    self._img, gray_lazy, self._hu_vol, self._labels,
                 )
                 txt = read_metadata(
-                    self._img, gray_full, self._hu_vol, self._labels,
+                    self._img, gray_lazy, self._hu_vol, self._labels,
                 )
                 self._append_log(txt, 'dim')
                 self.after(0, self.show_metadata_sections, sections)
@@ -445,14 +590,17 @@ class ActionsMixin:
             try:
                 self._log_sep("Histogram & Brightness Analysis")
                 self._set_status("Computing histogram...", busy=True)
-                gray = self._get_gray()
+                gray = self._get_gray_lazy()
                 try:
                     n_bins = int(self._hist_bins_var.get())
                 except Exception:
                     n_bins = 256
                 zidx, means, counts, edges, mn, mx = compute_histogram(gray, n_bins)
                 self._append_log(f"  Shape: {gray.shape}  range: {mn:.2f}–{mx:.2f}", 'dim')
-                self._append_log(f"  Mean: {gray.mean():.4f}  Std: {gray.std():.4f}", 'dim')
+                self._append_log(
+                    f"  Mean: {float(gray.mean()):.4f}  "
+                    f"Std: {float(gray.std()):.4f}", 'dim',
+                )
                 self.after(0, self._draw_histogram, counts, edges, zidx, means, mn, mx)
                 self.after(0, self._update_stats)
                 self.after(0, self._show_tab, 'histogram')
@@ -596,67 +744,33 @@ class ActionsMixin:
 
     # Material mapping actions
 
-    def _do_calibrate(self):
-        if not self._require_img():
-            return
-        try:
-            air_int = float(self._cal_air_int.get())
-            ref_int = float(self._cal_ref_int.get())
-            air_hu = float(self._cal_air_hu.get())
-            ref_hu = float(self._cal_ref_hu.get())
-        except ValueError:
-            QMessageBox.critical(self, "Bad input",
-                                 "All calibration fields must be numbers.")
-            return
-
-        def _run():
-            try:
-                self._log_sep("HU Calibration")
-                self._set_status("Calibrating to HU...", busy=True)
-                gray = self._get_gray()
-                hu_vol, m, c = calibrate_to_hu(gray, air_int, ref_int, air_hu, ref_hu)
-                self._hu_vol = hu_vol
-                self._hu_cal = {
-                    'm': m, 'c': c,
-                    'air_int': air_int, 'ref_int': ref_int,
-                }
-                result_text = f"HU = {m:.4f}·raw + {c:.2f}"
-                self.after(0, lambda: self._cal_result_var.set(result_text))
-                self._append_log(f"  Calibration: {result_text}", 'teal')
-                self._append_log(
-                    f"  HU range: {float(hu_vol.min()):.1f}  to  {float(hu_vol.max()):.1f}",
-                    'dim',
-                )
-                self._set_status("HU calibration complete.", busy=False)
-            except Exception as ex:
-                self._append_log(f"  Calibration error: {ex}", 'err')
-                self._set_status("Calibration error.", busy=False)
-
-        threading.Thread(target=_run, daemon=True).start()
-
     def _do_compute_emap(self):
         if not self._require_img():
             return
-        if self._hu_vol is None:
-            reply = QMessageBox.question(
-                self, "No HU calibration",
-                "HU calibration has not been applied.\n"
-                "The raw intensity will be used directly as HU.\n\n"
-                "Continue anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
+        # Resolve 'auto' before reading model params — simple mode derives
+        # its bilinear split from this same field.
+        void_thresh = self._resolve_void_thresh()
+        if void_thresh is None:
+            QMessageBox.critical(self, "Bad parameters",
+                                 "Could not determine a void threshold.")
+            return
         try:
             model = self._model_var.get()
             params = self._get_model_params()
-            void_thresh = float(self._void_thresh_var.get())
             agg_str = self._agg_thresh_var.get().strip()
             agg_thresh = float(agg_str) if agg_str else None
         except Exception as ex:
             QMessageBox.critical(self, "Bad parameters", str(ex))
             return
+        # gray + E_map float32 + labels uint8 + working copy ≈ 13 B/voxel.
+        if not self._ram_guard(13.0, "Computing a full-resolution E-Map"):
+            return
+        void_thresh = self._sane_void_thresh(void_thresh)
+        # Simple mode ties the bilinear split to the void threshold, so
+        # keep them consistent if the threshold was just auto-corrected.
+        if params.get("hu_thresh") is not None \
+                and not self._mat_advanced_check.isChecked():
+            params["hu_thresh"] = void_thresh
 
         def _run():
             try:
@@ -710,72 +824,6 @@ class ActionsMixin:
         threading.Thread(target=_run, daemon=True).start()
 
     # Exports
-
-    def _export_emap_nifti(self):
-        if not self._require_emap():
-            return
-        stem = self._path.name.replace('.nii.gz', '').replace('.nii', '')
-        out = self._ask_save_path(f"{stem}_Emap.nii.gz")
-        if not out:
-            return
-
-        def _run():
-            try:
-                self._log_sep("Export E-Map NIfTI")
-                self._set_status("Saving E-Map NIfTI...", busy=True)
-                hdr = self._img.header.copy()
-                hdr.set_data_dtype(np.float32)
-                emap_img = nib.Nifti1Image(self._E_map, self._img.affine, hdr)
-                nib.save(emap_img, str(out))
-                self._append_log(f"  Saved → {Path(out).name}", 'ok')
-                self._set_status("E-Map NIfTI saved.", busy=False)
-            except Exception as ex:
-                self._append_log(f"  {ex}", 'err')
-                self._set_status("Export error.", busy=False)
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _export_emap_raw(self):
-        if not self._require_emap():
-            return
-        stem = self._path.name.replace('.nii.gz', '').replace('.nii', '')
-        out = self._ask_save_path(
-            f"{stem}_Emap.raw",
-            ext=".raw",
-            ftypes=[("Raw binary", "*.raw"), ("All", "*.*")],
-        )
-        if not out:
-            return
-
-        def _run():
-            try:
-                self._log_sep("Export E-Map raw float32")
-                self._set_status("Saving raw binary...", busy=True)
-                E_c = np.ascontiguousarray(self._E_map, dtype=np.float32)
-                with open(out, 'wb') as f:
-                    f.write(E_c.tobytes())
-                spacing = self._img.header.get_zooms()
-                meta = {
-                    "shape": list(self._E_map.shape),
-                    "dtype": "float32",
-                    "order": "C",
-                    "voxel_spacing_mm": [float(s) for s in spacing[:3]],
-                    "E_min_MPa": float(self._E_map.min()),
-                    "E_max_MPa": float(self._E_map.max()),
-                    "hu_calibration": self._hu_cal,
-                    "source_file": str(self._path),
-                }
-                json_out = str(out).replace('.raw', '_header.json')
-                with open(json_out, 'w') as f:
-                    json.dump(meta, f, indent=2)
-                self._append_log(f"  Binary  → {Path(out).name}", 'ok')
-                self._append_log(f"  Header  → {Path(json_out).name}", 'ok')
-                self._set_status("Raw export saved.", busy=False)
-            except Exception as ex:
-                self._append_log(f"  {ex}", 'err')
-                self._set_status("Export error.", busy=False)
-
-        threading.Thread(target=_run, daemon=True).start()
 
     def _export_labels_nifti(self):
         if self._labels is None:
@@ -835,51 +883,178 @@ class ActionsMixin:
         except Exception as ex:
             self._append_log(f"  {ex}", 'err')
 
-    def _export_ct_hpp(self):
-        if not self._require_emap():
-            return
-        try:
-            params = self._get_model_params()
-            model = self._model_var.get()
-            void_thresh = float(self._void_thresh_var.get())
-        except Exception as ex:
-            QMessageBox.critical(self, "Parameter error", str(ex))
-            return
+    # Background removal
 
-        snippet = generate_ct_hpp_snippet(
-            self._get_gray(),
-            self._hu_cal if self._hu_cal else {'m': 1.0, 'c': 0.0},
-            self._E_map, self._img, model, params, void_thresh,
-            self._hu_cal.get('air_int', 0),
-            self._hu_cal.get('ref_int', 199),
-        )
-        self._cpp_text.config(state='normal')
-        self._cpp_text.delete('1.0', 'end')
-        self._cpp_text.insert('end', snippet)
-        self._cpp_text.config(state='disabled')
-        # Switch to the Sim Export tab.
+    def _do_remove_background(self):
+        """Detect the specimen, strip the exterior background, save NIfTI."""
+        if not self._require_img():
+            return
+        thresh = self._resolve_void_thresh()
+        if thresh is None:
+            QMessageBox.critical(self, "No threshold",
+                                 "Could not determine a threshold.")
+            return
+        # raw copy + masks + labels ≈ dtype size + 8 B/voxel.
+        itemsize = 2
         try:
-            idx = self._nb.indexOf(self._export_tab)
-            if idx >= 0:
-                self._nb.setCurrentIndex(idx)
+            itemsize = np.dtype(self._img.get_data_dtype()).itemsize
         except Exception:
             pass
-        self._append_log("  ct.hpp snippet generated - see Sim Export tab.", 'teal')
+        if not self._ram_guard(float(itemsize * 2 + 8),
+                               "Background removal (full resolution)"):
+            return
+        try:
+            margin = max(0, int(float(self._bg_margin_widget.text())))
+        except Exception:
+            margin = 10
+        crop = self._bg_crop_widget.isChecked()
 
-    def _copy_cpp(self):
-        txt = self._cpp_text.get('1.0', 'end')
-        self.clipboard_clear()
-        self.clipboard_append(txt)
-        self._append_log("  Copied ct.hpp snippet to clipboard.", 'ok')
+        stem = self._path.name.replace('.nii.gz', '').replace('.nii', '') \
+            if self._path else "volume"
+        out = self._ask_save_path(f"{stem}_nobg.nii.gz")
+        if not out:
+            return
 
-    def _save_cpp(self):
+        def _run():
+            try:
+                from ..core.background import remove_background
+
+                self._log_sep("Background Removal")
+                self._set_status("Detecting specimen...", busy=True)
+                new_img, info = remove_background(
+                    self._img, thresh, margin=margin, crop=crop,
+                    progress=lambda st: self._set_status(
+                        f"Background: {st}...", busy=True,
+                    ),
+                )
+                self._set_status("Saving NIfTI...", busy=True)
+                nib.save(new_img, str(out))
+
+                self._append_log(
+                    f"  Threshold          : {info['threshold']:.1f}", 'dim')
+                self._append_log(
+                    f"  Solid components   : {info['solid_components']} "
+                    f"(largest kept)", 'dim')
+                self._append_log(
+                    f"  Background removed : {info['background_pct']:.1f}% "
+                    f"of voxels  (fill = {info['fill_value']:.0f})", 'teal')
+                if info['bbox'] is not None:
+                    self._append_log(
+                        f"  Cropped to         : {info['out_shape']}", 'teal')
+                self._append_log(f"  Saved → {Path(out).name}", 'ok')
+                self._set_status("Background removed.", busy=False)
+                self.after(0, self._ask_load_after_save,
+                           "Background removed and saved to:", Path(out))
+            except Exception as ex:
+                self._append_log(f"  Background removal error: {ex}", 'err')
+                self._set_status("Background removal error.", busy=False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # PDF report
+
+    def _do_generate_report(self):
+        """Bundle everything computed so far into a multi-page PDF.
+
+        Only the loaded volume is mandatory — sections for phases, voids
+        and the E-map are included when their data exists.
+        """
+        if not self._require_img():
+            return
+        stem = self._path.name.replace('.nii.gz', '').replace('.nii', '') \
+            if self._path else "volume"
         out = self._ask_save_path(
-            "ct_snippet.hpp", ext=".hpp",
-            ftypes=[("C++ header", "*.hpp *.h"), ("All", "*.*")],
+            f"{stem}_report.pdf", ext=".pdf",
+            ftypes=[("PDF", "*.pdf"), ("All", "*.*")],
         )
         if not out:
             return
-        txt = self._cpp_text.get('1.0', 'end')
-        with open(out, 'w') as f:
-            f.write(txt)
-        self._append_log(f"  Saved → {Path(out).name}", 'ok')
+
+        # Snapshot GUI-owned state on the main thread.
+        model_name, model_params, void_thresh = "", {}, None
+        try:
+            model_name = self._model_var.get()
+            model_params = self._get_model_params()
+        except Exception:
+            pass
+        try:
+            void_thresh = float(self._void_thresh_var.get())
+        except Exception:
+            pass
+
+        def _run():
+            try:
+                from ..core.report import generate_pdf_report
+                from ..utils import OperationCancelled
+
+                self._begin_cancellable()
+                self._log_sep("PDF Report")
+                self._set_status("Generating PDF report...", busy=True)
+
+                def _stage(st):
+                    if self.cancel_requested():
+                        raise OperationCancelled()
+                    self._set_status(f"Report: {st}...", busy=True)
+                # Figures never need full resolution — stream a strided
+                # preview so huge volumes work on small machines too.
+                max_prev = 150_000_000
+                avail = available_ram_mb()
+                if avail is not None:
+                    max_prev = min(max_prev,
+                                   int(avail * 0.15 * 1024 ** 2 / 4))
+                gray, pstride = preview_volume(
+                    self._get_gray_lazy(), max_voxels=max(max_prev, 1_000_000),
+                )
+                if pstride > 1:
+                    self._append_log(
+                        f"  Volume read at stride ×{pstride} for the "
+                        f"report figures.", 'dim',
+                    )
+
+                skipped = []
+                if self._labels is None:
+                    skipped.append("phases")
+                if getattr(self, '_void_result', None) is None:
+                    skipped.append("voids")
+                if self._E_map is None:
+                    skipped.append("E-map")
+                if skipped:
+                    self._append_log(
+                        f"  Not computed, skipping section(s): "
+                        f"{', '.join(skipped)}", 'warn',
+                    )
+
+                n_pages = generate_pdf_report(
+                    out,
+                    file_name=self._path.name if self._path else "volume",
+                    shape=self._img.shape[:3],
+                    spacing=self._img.header.get_zooms()[:3],
+                    dtype=str(self._img.get_data_dtype()),
+                    gray=gray,
+                    ww=self._ww, wc=self._wc,
+                    hu_cal=self._hu_cal or None,
+                    hu_vol=self._hu_vol,
+                    labels=self._labels,
+                    phase_stats=self._E_stats or None,
+                    porosity=self._porosity if self._E_stats else None,
+                    void_result=getattr(self, '_void_result', None),
+                    E_map=self._E_map,
+                    model_name=model_name,
+                    model_params=model_params,
+                    void_thresh=void_thresh,
+                    progress=_stage,
+                )
+                self._append_log(
+                    f"  {n_pages} pages → {Path(out).name}", 'ok',
+                )
+                self._set_status("PDF report saved.", busy=False)
+            except Exception as ex:
+                from ..utils import OperationCancelled
+                if isinstance(ex, OperationCancelled):
+                    self._append_log("  Report stopped by user.", 'warn')
+                    self._set_status("Stopped.", busy=False)
+                else:
+                    self._append_log(f"  Report error: {ex}", 'err')
+                    self._set_status("Report error.", busy=False)
+
+        threading.Thread(target=_run, daemon=True).start()

@@ -96,6 +96,9 @@ class LogTabMixin:
 
     def _do_set_status(self, msg: str, busy: bool):
         self._status_var.set(msg)
+        stop_btn = getattr(self, '_stop_btn', None)
+        if stop_btn is not None:
+            stop_btn.setVisible(bool(busy))
         if busy:
             self._prog.start()
         else:

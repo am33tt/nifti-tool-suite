@@ -1,7 +1,7 @@
 """Left-hand controls panel.
 
 Everything the user adjusts before running an action lives here:
-viewer settings, intensity stats, HU calibration, material model,
+viewer settings, intensity stats, material model,
 reorientation, angle rotation, crop ROI.
 
 Each tool is built into its own :class:`_ToolPanel` and stored in
@@ -12,6 +12,7 @@ a time via the top navigation bar.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
@@ -203,135 +204,50 @@ class ControlsMixin:
             sec.content_layout.addWidget(row)
             self._stat_labels[key] = _LabelVar(lv)
 
-        # HU calibration
-        sec = _ToolPanel("🔬 HU Calibration")
-        self._tool_panels["hu"] = sec
-        sec.content_layout.addWidget(
-            _small_label("Two-point linear: HU = m·raw + c", sec.content)
-        )
-
-        def _cal_row(lbl_text, attr_name, default, tip=""):
-            r = QWidget(sec.content); rl = QHBoxLayout(r)
-            rl.setContentsMargins(0, 2, 0, 2); rl.setSpacing(4)
-            rl.addWidget(_small_label(lbl_text, r, width=110))
-            e = styled_entry(r, width=9); e.setText(str(default))
-            rl.addWidget(e)
-            if tip:
-                rl.addWidget(_small_label(tip, r))
-            rl.addStretch(1)
-            sec.content_layout.addWidget(r)
-            setattr(self, attr_name, e)
-
-        _cal_row("Air intensity", "_cal_air_int_widget", "0", "raw px = air")
-        _cal_row("Ref intensity", "_cal_ref_int_widget", "199", "raw px = ref material")
-        _cal_row("Air HU", "_cal_air_hu_widget", "-1000", "HU of air")
-        _cal_row("Ref HU", "_cal_ref_hu_widget", "0", "HU of ref (water=0)")
-
-        self._cal_air_int = _WidgetVar(self._cal_air_int_widget)
-        self._cal_ref_int = _WidgetVar(self._cal_ref_int_widget)
-        self._cal_air_hu = _WidgetVar(self._cal_air_hu_widget)
-        self._cal_ref_hu = _WidgetVar(self._cal_ref_hu_widget)
-
-        tip_lbl = _small_label(
-            "(Use histogram peak for air; known material for ref)",
-            sec.content,
-        )
-        tip_lbl.setWordWrap(True)
-        sec.content_layout.addWidget(tip_lbl)
-
-        self._cal_result_label = QLabel("Not calibrated", sec.content)
-        self._cal_result_label.setFont(QFont("Consolas", 10))
-        self._cal_result_label.setStyleSheet(
-            f"color: {TEAL}; background-color: transparent;"
-        )
-        sec.content_layout.addWidget(self._cal_result_label)
-        self._cal_result_var = _LabelVar(self._cal_result_label)
-
-        sec.content_layout.addWidget(
-            styled_btn(sec.content, "Apply Calibration",
-                       self._do_calibrate, teal=True, small=True),
-            alignment=Qt.AlignmentFlag.AlignLeft,
-        )
-
-        # Material mapping
-        sec = _ToolPanel("⚙️  Material Mapping  →  E [MPa]")
+        # Material mapping — simple by default, everything scientific
+        # (models, presets, HU calibration) lives behind one Advanced
+        # toggle so the common no-phantom workflow is a single panel.
+        sec = _ToolPanel("⚙️  Material / Stiffness  →  E [MPa]")
         self._tool_panels["material"] = sec
 
-        pr_row = QWidget(sec.content); prl = QHBoxLayout(pr_row)
-        prl.setContentsMargins(0, 2, 0, 2); prl.setSpacing(4)
-        prl.addWidget(_small_label("Preset", pr_row, width=70))
-        self._mat_preset_widget = QComboBox(pr_row)
-        self._mat_preset_widget.addItems(list(MATERIAL_PRESETS.keys()))
-        self._mat_preset_widget.setCurrentText("AM Concrete (default)")
-        self._mat_preset_widget.setFixedWidth(210)
-        prl.addWidget(self._mat_preset_widget); prl.addStretch(1)
-        sec.content_layout.addWidget(pr_row)
-        self._mat_preset_var = _WidgetVar(self._mat_preset_widget)
-        self._mat_preset_widget.currentTextChanged.connect(
-            lambda _t: self._apply_material_preset()
+        intro = _small_label(
+            "Below the threshold = void/pores, above = solid with one "
+            "stiffness. Works directly on the scanner intensities. Leave "
+            "the threshold on 'auto' and it is found automatically (Otsu).",
+            sec.content,
         )
+        intro.setWordWrap(True)
+        sec.content_layout.addWidget(intro)
 
-        mod_row = QWidget(sec.content); mrl = QHBoxLayout(mod_row)
-        mrl.setContentsMargins(0, 2, 0, 2); mrl.setSpacing(4)
-        mrl.addWidget(_small_label("Model", mod_row, width=70))
-        self._model_group = QButtonGroup(mod_row)
-        self._model_radios: dict = {}
-        for m in ("linear", "power", "bilinear", "table"):
-            rb = QRadioButton(m, mod_row)
-            rb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
-            rb.setFont(QFont("Segoe UI", 9))
-            self._model_group.addButton(rb)
-            self._model_radios[m] = rb
-            mrl.addWidget(rb)
-        self._model_radios["bilinear"].setChecked(True)
-        mrl.addStretch(1)
-        sec.content_layout.addWidget(mod_row)
-
-        # ``_model_var`` is a tk-compat shim reading from the radio group.
-        self._model_var = _RadioVar(self._model_radios, default="bilinear")
-        for rb in self._model_radios.values():
-            rb.toggled.connect(self._on_model_toggled)
-
-        self._model_params_frame = QWidget(sec.content)
-        self._model_params_layout = QVBoxLayout(self._model_params_frame)
-        self._model_params_layout.setContentsMargins(0, 2, 0, 2)
-        self._model_params_layout.setSpacing(2)
-        self._model_params_frame.setStyleSheet(
-            f"background-color: {PANEL};"
-        )
-        sec.content_layout.addWidget(self._model_params_frame)
-        self._model_param_vars: dict = {}
-        self._model_param_widgets: dict = {}
-
-        # Void thresh / agg thresh
+        # Void/solid threshold (+ automatic Otsu pick)
         vt_row = QWidget(sec.content); vrl = QHBoxLayout(vt_row)
         vrl.setContentsMargins(0, 2, 0, 2); vrl.setSpacing(4)
         vrl.addWidget(_small_label("Void thresh", vt_row, width=90))
         self._void_thresh_widget = styled_entry(vt_row, width=8)
-        self._void_thresh_widget.setText("-500")
+        self._void_thresh_widget.setText("auto")
+        self._void_thresh_widget.setToolTip(
+            "'auto' = find the void/solid split automatically (Otsu).\n"
+            "Or type an intensity value."
+        )
         vrl.addWidget(self._void_thresh_widget)
-        vrl.addWidget(_small_label("HU", vt_row)); vrl.addStretch(1)
+        vrl.addWidget(_small_label("intensity", vt_row))
+        vrl.addWidget(styled_btn(vt_row, "Auto (Otsu)",
+                                 self._auto_void_thresh, small=True))
+        vrl.addStretch(1)
         sec.content_layout.addWidget(vt_row)
         self._void_thresh_var = _WidgetVar(self._void_thresh_widget)
 
-        ag_row = QWidget(sec.content); arl = QHBoxLayout(ag_row)
-        arl.setContentsMargins(0, 2, 0, 2); arl.setSpacing(4)
-        arl.addWidget(_small_label("Aggreg. thresh", ag_row, width=90))
-        self._agg_thresh_widget = styled_entry(ag_row, width=8)
-        arl.addWidget(self._agg_thresh_widget)
-        arl.addWidget(_small_label("HU  (blank = 2-phase)", ag_row))
-        arl.addStretch(1)
-        sec.content_layout.addWidget(ag_row)
-        self._agg_thresh_var = _WidgetVar(self._agg_thresh_widget)
-
-        self._mat_note_label = QLabel("", sec.content)
-        self._mat_note_label.setWordWrap(True)
-        self._mat_note_label.setFont(QFont("Segoe UI", 9))
-        self._mat_note_label.setStyleSheet(
-            f"color: {TEXT_DIM}; background-color: transparent;"
-        )
-        sec.content_layout.addWidget(self._mat_note_label)
-        self._mat_note_var = _LabelVar(self._mat_note_label)
+        # Solid stiffness
+        es_row = QWidget(sec.content); esl = QHBoxLayout(es_row)
+        esl.setContentsMargins(0, 2, 0, 2); esl.setSpacing(4)
+        esl.addWidget(_small_label("E solid", es_row, width=90))
+        self._simple_E_widget = styled_entry(es_row, width=10)
+        self._simple_E_widget.setText("30000.0")
+        esl.addWidget(self._simple_E_widget)
+        esl.addWidget(_small_label("MPa   (concrete paste ≈ 30 GPa)", es_row))
+        esl.addStretch(1)
+        sec.content_layout.addWidget(es_row)
+        self._simple_E_var = _WidgetVar(self._simple_E_widget)
 
         sec.content_layout.addWidget(
             styled_btn(sec.content, "▶  Compute E-Map",
@@ -353,14 +269,146 @@ class ControlsMixin:
             sec.content_layout.addWidget(row)
             self._e_stat_labels[key] = _LabelVar(lv)
 
-        sec.content_layout.addWidget(
-            styled_btn(sec.content, "Load Preset JSON...",
+        # ── Advanced (collapsed by default) ──────────────────────────
+        self._mat_advanced_check = QCheckBox(
+            "Advanced  (material models, presets)",
+            sec.content,
+        )
+        self._mat_advanced_check.setFont(QFont("Segoe UI", 9))
+        self._mat_advanced_check.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;"
+        )
+        sec.content_layout.addWidget(self._mat_advanced_check)
+
+        adv = QWidget(sec.content)
+        adv_lay = QVBoxLayout(adv)
+        adv_lay.setContentsMargins(0, 4, 0, 0)
+        adv_lay.setSpacing(3)
+        adv.setVisible(False)
+        sec.content_layout.addWidget(adv)
+        self._mat_advanced_frame = adv
+
+        pr_row = QWidget(adv); prl = QHBoxLayout(pr_row)
+        prl.setContentsMargins(0, 2, 0, 2); prl.setSpacing(4)
+        prl.addWidget(_small_label("Preset", pr_row, width=70))
+        self._mat_preset_widget = QComboBox(pr_row)
+        self._mat_preset_widget.addItems(list(MATERIAL_PRESETS.keys()))
+        self._mat_preset_widget.setCurrentText("AM Concrete (default)")
+        self._mat_preset_widget.setFixedWidth(210)
+        prl.addWidget(self._mat_preset_widget); prl.addStretch(1)
+        adv_lay.addWidget(pr_row)
+        self._mat_preset_var = _WidgetVar(self._mat_preset_widget)
+        self._mat_preset_widget.currentTextChanged.connect(
+            lambda _t: self._apply_material_preset()
+        )
+
+        mod_row = QWidget(adv); mrl = QHBoxLayout(mod_row)
+        mrl.setContentsMargins(0, 2, 0, 2); mrl.setSpacing(4)
+        mrl.addWidget(_small_label("Model", mod_row, width=70))
+        self._model_group = QButtonGroup(mod_row)
+        self._model_radios: dict = {}
+        for m in ("linear", "power", "bilinear", "table"):
+            rb = QRadioButton(m, mod_row)
+            rb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
+            rb.setFont(QFont("Segoe UI", 9))
+            self._model_group.addButton(rb)
+            self._model_radios[m] = rb
+            mrl.addWidget(rb)
+        self._model_radios["bilinear"].setChecked(True)
+        mrl.addStretch(1)
+        adv_lay.addWidget(mod_row)
+
+        # ``_model_var`` is a tk-compat shim reading from the radio group.
+        self._model_var = _RadioVar(self._model_radios, default="bilinear")
+        for rb in self._model_radios.values():
+            rb.toggled.connect(self._on_model_toggled)
+
+        adv_note = _small_label(
+            "linear / power / table map the voxel intensity to a "
+            "spatially varying stiffness E.", adv,
+        )
+        adv_note.setWordWrap(True)
+        adv_lay.addWidget(adv_note)
+
+        self._model_params_frame = QWidget(adv)
+        self._model_params_layout = QVBoxLayout(self._model_params_frame)
+        self._model_params_layout.setContentsMargins(0, 2, 0, 2)
+        self._model_params_layout.setSpacing(2)
+        self._model_params_frame.setStyleSheet(
+            f"background-color: {PANEL};"
+        )
+        adv_lay.addWidget(self._model_params_frame)
+        self._model_param_vars: dict = {}
+        self._model_param_widgets: dict = {}
+
+        ag_row = QWidget(adv); arl = QHBoxLayout(ag_row)
+        arl.setContentsMargins(0, 2, 0, 2); arl.setSpacing(4)
+        arl.addWidget(_small_label("Aggreg. thresh", ag_row, width=90))
+        self._agg_thresh_widget = styled_entry(ag_row, width=8)
+        arl.addWidget(self._agg_thresh_widget)
+        arl.addWidget(_small_label("intensity  (blank = 2-phase)", ag_row))
+        arl.addStretch(1)
+        adv_lay.addWidget(ag_row)
+        self._agg_thresh_var = _WidgetVar(self._agg_thresh_widget)
+
+        self._mat_note_label = QLabel("", adv)
+        self._mat_note_label.setWordWrap(True)
+        self._mat_note_label.setFont(QFont("Segoe UI", 9))
+        self._mat_note_label.setStyleSheet(
+            f"color: {TEXT_DIM}; background-color: transparent;"
+        )
+        adv_lay.addWidget(self._mat_note_label)
+        self._mat_note_var = _LabelVar(self._mat_note_label)
+
+        adv_lay.addWidget(
+            styled_btn(adv, "Load Preset JSON...",
                        self._load_preset_json, small=True),
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
+        self._mat_advanced_check.toggled.connect(self._on_advanced_toggled)
+
         self._update_model_panel()
         self._apply_material_preset()
+
+        # Background removal
+        sec = _ToolPanel("🧹 Background Removal")
+        self._tool_panels["background"] = sec
+
+        bg_info = _small_label(
+            "Detects the specimen automatically (largest connected solid "
+            "region — internal pores are kept), removes everything outside "
+            "it, and saves a clean new NIfTI file. Uses the same automatic "
+            "threshold as the Material panel.", sec.content,
+        )
+        bg_info.setWordWrap(True)
+        sec.content_layout.addWidget(bg_info)
+
+        bm_row = QWidget(sec.content); bml = QHBoxLayout(bm_row)
+        bml.setContentsMargins(0, 2, 0, 2); bml.setSpacing(4)
+        bml.addWidget(_small_label("Margin", bm_row, width=90))
+        self._bg_margin_widget = styled_entry(bm_row, width=6)
+        self._bg_margin_widget.setText("10")
+        bml.addWidget(self._bg_margin_widget)
+        bml.addWidget(_small_label("voxels kept around the specimen", bm_row))
+        bml.addStretch(1)
+        sec.content_layout.addWidget(bm_row)
+
+        self._bg_crop_widget = QCheckBox(
+            "Crop to specimen bounding box", sec.content,
+        )
+        self._bg_crop_widget.setChecked(True)
+        self._bg_crop_widget.setFont(QFont("Segoe UI", 9))
+        self._bg_crop_widget.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;"
+        )
+        sec.content_layout.addWidget(self._bg_crop_widget)
+
+        sec.content_layout.addWidget(
+            styled_btn(sec.content, "▶  Remove Background && Save...",
+                       self._do_remove_background, accent=True, small=True),
+            alignment=Qt.AlignmentFlag.AlignLeft,
+        )
 
         # Reorientation
         sec = _ToolPanel("🔄 Reorientation  (no resample)")
@@ -479,6 +527,63 @@ class ControlsMixin:
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
+    # Advanced toggle
+
+    def _on_advanced_toggled(self, checked: bool):
+        self._mat_advanced_frame.setVisible(bool(checked))
+        if checked:
+            # Carry the simple-mode values into the bilinear params so
+            # the user starts from what they already had.
+            if self._model_var.get() == "bilinear":
+                if "hu_thresh" in self._model_param_vars:
+                    self._model_param_vars["hu_thresh"].set(
+                        self._void_thresh_var.get()
+                    )
+                if "E_solid" in self._model_param_vars:
+                    self._model_param_vars["E_solid"].set(
+                        self._simple_E_var.get()
+                    )
+        else:
+            # Back to simple mode: bilinear is the only model there.
+            self._model_var.set("bilinear")
+
+    # Automatic void/solid threshold
+
+    def _auto_void_thresh(self):
+        """Pick the void/solid split automatically (Otsu on a subsample)."""
+        if self._img is None:
+            QMessageBox.warning(self, "No file",
+                                "Please open a NIfTI file first.")
+            return
+
+        def _run():
+            try:
+                from ..core.segmentation import otsu_threshold
+
+                self._set_status("Finding threshold (Otsu)...", busy=True)
+                vol = self._hu_vol if self._hu_vol is not None \
+                    else self._get_gray_lazy()
+                if hasattr(vol, "subsample_flat"):
+                    # Lazy volume — sample without materialising it.
+                    flat = vol.subsample_flat(2_000_000)
+                else:
+                    flat = vol.ravel()
+                    if flat.size > 2_000_000:
+                        flat = flat[:: flat.size // 2_000_000]
+                t = otsu_threshold(flat)
+                domain = "HU" if self._hu_vol is not None else "raw intensity"
+                self.after(0, self._void_thresh_var.set, f"{t:.1f}")
+                self._append_log(
+                    f"  Auto void threshold (Otsu): {t:.1f}  [{domain}]",
+                    'teal',
+                )
+                self._set_status("Auto threshold set.", busy=False)
+            except Exception as ex:
+                self._append_log(f"  Auto threshold error: {ex}", 'err')
+                self._set_status("Auto threshold error.", busy=False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     # Model params panel
 
     def _on_model_toggled(self, checked: bool):
@@ -515,26 +620,26 @@ class ControlsMixin:
             self._model_param_vars[key] = _WidgetVar(e)
 
         if model == "linear":
-            lay.addWidget(_small_label("E = a·HU + b  [MPa]", f))
-            param_row("a  (slope)", "a", "20.0", "MPa/HU")
+            lay.addWidget(_small_label("E = a·I + b  [MPa]   (I = intensity)", f))
+            param_row("a  (slope)", "a", "20.0", "MPa per unit")
             param_row("b  (intercept)", "b", "0.0", "MPa")
             param_row("E_void", "E_void", "0.001", "MPa")
 
         elif model == "power":
-            lay.addWidget(_small_label("E = a · HU^b  [MPa]", f))
+            lay.addWidget(_small_label("E = a · I^b  [MPa]   (I = intensity)", f))
             param_row("a  (scale)", "a", "0.09", "MPa")
             param_row("b  (exponent)", "b", "1.92")
-            param_row("HU min clamp", "hu_min_clamp", "1.0", "HU")
+            param_row("Min I clamp", "hu_min_clamp", "1.0")
             param_row("E_void", "E_void", "0.001", "MPa")
 
         elif model == "bilinear":
             lay.addWidget(_small_label("Piecewise: void | solid", f))
-            param_row("HU threshold", "hu_thresh", "-200", "HU")
+            param_row("Intensity thresh", "hu_thresh", "-200")
             param_row("E_void", "E_void", "0.001", "MPa")
             param_row("E_solid", "E_solid", "30000.0", "MPa")
 
         elif model == "table":
-            lay.addWidget(_small_label("Piecewise-linear table\nEnter HU values:", f))
+            lay.addWidget(_small_label("Piecewise-linear table\nEnter intensity values:", f))
             self._table_text_widget = QPlainTextEdit(f)
             self._table_text_widget.setStyleSheet(
                 f"QPlainTextEdit {{ background-color: {ENTRY_BG}; "
@@ -543,7 +648,7 @@ class ControlsMixin:
             self._table_text_widget.setFont(QFont("Consolas", 9))
             self._table_text_widget.setFixedHeight(110)
             self._table_text_widget.setPlainText(
-                "# HU_value  E_MPa\n"
+                "# intensity  E_MPa\n"
                 "-1000       0.001\n"
                 " -500       0.001\n"
                 "    0    5000.0\n"
@@ -558,6 +663,16 @@ class ControlsMixin:
             self._table_text = _PlainTextShim(self._table_text_widget)
 
     def _get_model_params(self):
+        # Simple mode: one threshold + one solid stiffness → bilinear.
+        if not self._mat_advanced_check.isChecked():
+            try:
+                return {
+                    "hu_thresh": float(self._void_thresh_var.get()),
+                    "E_void": 0.001,
+                    "E_solid": float(self._simple_E_var.get()),
+                }
+            except Exception as ex:
+                raise ValueError(f"Bad parameter input: {ex}")
         model = self._model_var.get()
         vars_ = self._model_param_vars
         try:
@@ -601,15 +716,17 @@ class ControlsMixin:
         if not preset:
             return
         self._model_var.set(preset.get("model", "linear"))
-        self._void_thresh_var.set(str(preset.get("void_thresh", "-500")))
+        # Only let presets overwrite the threshold in advanced mode — the
+        # simple-mode default is 'auto' and should stay that way.
+        if getattr(self, "_mat_advanced_check", None) is not None \
+                and self._mat_advanced_check.isChecked():
+            self._void_thresh_var.set(str(preset.get("void_thresh", "auto")))
         self._mat_note_var.set(preset.get("notes", ""))
         self._update_model_panel()
         params = preset.get("params", {})
         for k, v in params.items():
             if k in self._model_param_vars:
                 self._model_param_vars[k].set(str(v))
-        self._cal_air_int.set(str(preset.get("hu_air", "0")))
-        self._cal_ref_int.set(str(preset.get("hu_ref", "199")))
 
     def _load_preset_json(self):
         path, _ = QFileDialog.getOpenFileName(

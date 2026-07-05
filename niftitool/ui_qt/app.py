@@ -6,6 +6,8 @@ Each mixin lives in its own file so bugs and edits stay local.
 
 from __future__ import annotations
 
+import threading
+
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont
 from PyQt6.QtWidgets import (
@@ -27,6 +29,7 @@ from .export_tab import ExportTabMixin
 from .histogram_tab import HistogramTabMixin
 from .log_tab import LogTabMixin
 from .metadata_tab import MetadataTabMixin
+from .porosity_tab import PorosityTabMixin
 from .triplanar_tab import TriplanarMixin
 from .view3d_tab import View3DMixin
 from .widgets import StageProgressBar, hline, styled_btn
@@ -147,6 +150,7 @@ class NiftiApp(
     View3DMixin,
     HistogramTabMixin,
     EmapTabMixin,
+    PorosityTabMixin,
     MetadataTabMixin,
     ExportTabMixin,
     LogTabMixin,
@@ -201,6 +205,10 @@ class NiftiApp(
 
         # perf aids
         self._slice_cache = SliceCache()
+
+        # cooperative cancellation for long-running worker threads —
+        # the status-bar Stop button sets this, loops poll it.
+        self._cancel_event = threading.Event()
 
         # build
         self._build_ui()
@@ -269,16 +277,58 @@ class NiftiApp(
 
     # tab switching
 
+    # Which left tool panel belongs to which visualisation tab — switching
+    # a tab opens its controls so the user never hunts for the right panel.
+    _TAB_TOOL_LINKS = {
+        'triplanar': 'viewer',
+        'view3d':    'viewer',
+        'histogram': 'stats',
+        'emap':      'material',
+        'porosity':  'material',
+        'metadata':  'metadata',
+    }
+
+    def _select_tool(self, key: str):
+        """Open the named tool panel (and highlight its nav button)."""
+        btn = self._tool_nav_buttons.get(key)
+        idx = self._tool_stack_index.get(key)
+        if btn is None or idx is None:
+            return
+        btn.setChecked(True)
+        self._tool_stack.setCurrentIndex(idx)
+
     def _on_tab_changed(self, index: int):
         """Fire deferred work when the user switches tabs."""
         try:
             current = self._nb.widget(index)
         except Exception:
             return
+        # Auto-open the linked tool panel.
+        for name, widget in self._tab_by_name.items():
+            if widget is current:
+                key = self._TAB_TOOL_LINKS.get(name)
+                if key:
+                    self._select_tool(key)
+                break
         if current is self._viewer3d_tab:
             fn = getattr(self, 'maybe_auto_render_3d', None)
             if callable(fn):
                 fn()
+
+    # cooperative cancellation
+
+    def _begin_cancellable(self):
+        """Arm a fresh cancellation token at the start of a long task."""
+        self._cancel_event.clear()
+
+    def cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def _request_stop(self):
+        self._cancel_event.set()
+        self._append_log(
+            "  Stop requested — finishing the current step...", 'warn',
+        )
 
     def _show_tab(self, name: str):
         """Jump the right-hand tab widget to the named tab. Called by
@@ -380,7 +430,7 @@ class NiftiApp(
         else:
             self._ram_label.setText("RAM  - (pip install psutil)")
 
-    # clipboard helper (used by actions._copy_cpp)
+    # clipboard helpers
 
     def clipboard_clear(self):
         from PyQt6.QtWidgets import QApplication
@@ -485,10 +535,10 @@ class NiftiApp(
         tool_order = [
             ("viewer",   "Viewer"),
             ("metadata", "Metadata"),
-            ("stats",    "Stats"),
-            ("hu",       "HU Calibration"),
-            ("material", "Material"),
-            ("reorient", "Reorient"),
+            ("stats",      "Stats"),
+            ("material",   "Material"),
+            ("background", "Background"),
+            ("reorient",   "Reorient"),
             ("rotate",   "Rotate"),
             ("crop",     "Crop"),
         ]
@@ -589,19 +639,22 @@ class NiftiApp(
         self._viewer3d_tab = QWidget()
         self._histogram_tab = QWidget()
         self._emap_tab = QWidget()
+        self._porosity_tab = QWidget()
         self._metadata_tab = QWidget()
         self._export_tab = QWidget()
 
         for w in (self._triplanar_tab, self._viewer3d_tab, self._histogram_tab,
-                  self._emap_tab, self._metadata_tab, self._export_tab):
+                  self._emap_tab, self._porosity_tab, self._metadata_tab,
+                  self._export_tab):
             w.setStyleSheet(f"background-color: {BG};")
 
         nb.addTab(self._triplanar_tab, "  Tri-Planar  ")
         nb.addTab(self._viewer3d_tab, "  3-D View  ")
         nb.addTab(self._histogram_tab, "  Histogram  ")
         nb.addTab(self._emap_tab, "  E-Map Viewer  ")
+        nb.addTab(self._porosity_tab, "  Porosity  ")
         nb.addTab(self._metadata_tab, "  Metadata  ")
-        nb.addTab(self._export_tab, "  Sim Export  ")
+        nb.addTab(self._export_tab, "  Export  ")
 
         self._nb = nb
         # Named aliases so action handlers can switch tabs by key rather than
@@ -611,6 +664,7 @@ class NiftiApp(
             'view3d':    self._viewer3d_tab,
             'histogram': self._histogram_tab,
             'emap':      self._emap_tab,
+            'porosity':  self._porosity_tab,
             'metadata':  self._metadata_tab,
             'export':    self._export_tab,
         }
@@ -620,6 +674,7 @@ class NiftiApp(
         nb.currentChanged.connect(self._on_tab_changed)
         self._build_histogram_tab(self._histogram_tab)
         self._build_emap_tab(self._emap_tab)
+        self._build_porosity_tab(self._porosity_tab)
         self._build_metadata_tab(self._metadata_tab)
         self._build_export_tab(self._export_tab)
 
@@ -663,6 +718,14 @@ class NiftiApp(
         sb_lay.addWidget(self._probe_label)
 
         sb_lay.addStretch(1)
+
+        # Stop button — visible only while a background task is running.
+        self._stop_btn = styled_btn(status_bar, "■  Stop",
+                                    self._request_stop, danger=True,
+                                    small=True)
+        self._stop_btn.setVisible(False)
+        sb_lay.addWidget(self._stop_btn)
+        sb_lay.addSpacing(8)
 
         self._prog = StageProgressBar(status_bar)
         sb_lay.addWidget(self._prog)

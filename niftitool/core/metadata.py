@@ -5,6 +5,16 @@ from __future__ import annotations
 from ..deps import np, nio
 
 
+def _flat_sample(gray, max_voxels: int = 2_000_000):
+    """Flat intensity sample that never materialises a lazy volume."""
+    if hasattr(gray, "subsample_flat"):
+        return gray.subsample_flat(max_voxels)
+    flat = gray.ravel()
+    if flat.size > max_voxels:
+        flat = flat[:: flat.size // max_voxels]
+    return flat
+
+
 def get_axis_labels(affine) -> dict:
     """Return compass labels for every slice-plane axis.
 
@@ -72,7 +82,7 @@ def collect_metadata(img, gray=None, hu_vol=None, labels=None) -> list:
     })
 
     if gray is not None:
-        flat = gray.ravel()
+        flat = _flat_sample(gray)
         rows = [
             ("Min",      f"{float(flat.min()):.2f}"),
             ("Max",      f"{float(flat.max()):.2f}"),
@@ -172,7 +182,7 @@ def read_metadata(img, gray=None, hu_vol=None, labels=None) -> str:
     ]
 
     if gray is not None:
-        flat = gray.ravel()
+        flat = _flat_sample(gray)
         lines += [
             f"  Min              : {float(flat.min()):.2f}",
             f"  Max              : {float(flat.max()):.2f}",
