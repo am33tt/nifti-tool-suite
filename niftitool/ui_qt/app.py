@@ -194,6 +194,7 @@ class NiftiApp(
         self._axis_labels = {'x': ('X', '-'), 'y': ('Y', '-'), 'z': ('Z', '-')}
         self._ww = None
         self._wc = None
+        self._auto_wwwc = None   # cached auto window, one per volume
 
         # material state
         self._hu_vol = None
@@ -379,7 +380,8 @@ class NiftiApp(
 
         # Stop QTimers before the event loop tears down so late signals from
         # daemon threads can't trigger QBasicTimer::start warnings.
-        for name in ('_ram_timer', '_tri_debounce_timer', '_emap_debounce_timer'):
+        for name in ('_ram_timer', '_tri_debounce_timer', '_tri_sync_timer',
+                     '_emap_debounce_timer'):
             t = getattr(self, name, None)
             if t is not None:
                 try:

@@ -22,6 +22,7 @@ volume itself changes (new file loaded, crop applied, reorient, …).
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 
 from ..deps import np
@@ -38,45 +39,57 @@ class SliceCache:
         array; 48 on a 2000² volume is ~750 MiB at worst. Tune to taste.
     """
 
-    __slots__ = ("_vol", "_entries", "_max")
+    __slots__ = ("_vol", "_entries", "_max", "_lock")
 
     def __init__(self, max_entries: int = 48) -> None:
         self._vol = None
         self._entries: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._max = max_entries
+        # get() may be called from the GUI thread and the prefetch worker
+        # concurrently; OrderedDict mutation needs a lock.
+        self._lock = threading.Lock()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def set_volume(self, gray) -> None:
         """Bind a new volume and clear the cache."""
-        self._vol = gray
-        self._entries.clear()
+        with self._lock:
+            self._vol = gray
+            self._entries.clear()
 
     def invalidate(self) -> None:
         """Drop all cached slices (but keep the bound volume)."""
-        self._entries.clear()
+        with self._lock:
+            self._entries.clear()
 
     # ── queries ──────────────────────────────────────────────────────────────
 
-    def get(self, axis: str, idx: int, ww: float, wc: float):
+    def get(self, axis: str, idx: int, ww: float, wc: float,
+            max_px: int | None = None):
         """Return a windowed slice along *axis* at index *idx*.
 
         ``axis`` is one of ``'X'``, ``'Y'``, ``'Z'``. The returned array
         is already transposed into the same orientation the viewer uses
         (``.T``) and in ``[0, 1]`` float32. Do *not* mutate it — it is
         the actual cache entry.
+
+        ``max_px`` decimates the slice so its longest side is at most
+        that many pixels — a screen panel is only a few hundred pixels
+        wide, so windowing and drawing a 2000² slice per frame is pure
+        waste. The viewer keeps data coordinates intact by drawing the
+        decimated image with the original extent.
         """
         if self._vol is None:
             raise RuntimeError("SliceCache has no volume bound")
 
-        key = (axis, int(idx), float(ww), float(wc))
-        entry = self._entries.get(key)
-        if entry is not None:
-            # Mark as recently used
-            self._entries.move_to_end(key)
-            return entry
+        key = (axis, int(idx), float(ww), float(wc), max_px)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._entries.move_to_end(key)   # mark recently used
+                return entry
+            g = self._vol
 
-        g = self._vol
         if axis == 'X':
             raw = g[idx, :, :].T
         elif axis == 'Y':
@@ -84,10 +97,16 @@ class SliceCache:
         else:
             raw = g[:, :, idx].T
 
+        if max_px:
+            step = int(np.ceil(max(raw.shape) / max_px))
+            if step > 1:
+                raw = raw[::step, ::step]
+
         windowed = apply_window(raw.astype(np.float32, copy=False), ww, wc)
-        self._entries[key] = windowed
-        if len(self._entries) > self._max:
-            self._entries.popitem(last=False)  # evict oldest
+        with self._lock:
+            self._entries[key] = windowed
+            if len(self._entries) > self._max:
+                self._entries.popitem(last=False)  # evict oldest
         return windowed
 
     # ── diagnostics ──────────────────────────────────────────────────────────

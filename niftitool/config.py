@@ -60,6 +60,11 @@ MAX_HIST_VOXELS = 10_000_000
 STATS_SUBSAMPLE_VOXELS = 5_000_000
 # Triplanar slider debounce in milliseconds (caps matplotlib redraws).
 SLIDER_DEBOUNCE_MS = 16
+# Longest displayed side of a triplanar slice, in pixels. Panels are only
+# a few hundred px on screen; windowing + drawing a full 2000² slice per
+# frame is wasted work. Coordinates stay in voxel units via imshow extent.
+# 640 ≈ 15-20 ms per blit tick → fluid dragging; PNG export stays full-res.
+MAX_TRI_DISPLAY_PX = 640
 
 # ── Material presets  — HU-to-Young's-modulus mappings ───────────────────────
 # params for 'linear':   {'a': slope,  'b': intercept}     E [MPa] = a*HU + b

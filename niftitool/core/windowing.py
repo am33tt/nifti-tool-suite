@@ -50,7 +50,20 @@ def apply_window(gray, ww: float, wc: float, out=None):
 
 
 def auto_window(gray) -> tuple[float, float]:
-    """Sensible fallback window covering the full data range."""
-    mn = float(gray.min())
-    mx = float(gray.max())
+    """Sensible fallback window covering the data range.
+
+    Sampled, never a full scan: on a multi-GB ndarray ``.min()`` /
+    ``.max()`` touch every voxel (seconds per call) and this function
+    used to sit directly on the slider hot path. A ~1M-voxel sample
+    yields the same display window at a fraction of the cost.
+    """
+    if hasattr(gray, "subsample_flat"):          # LazyGrayVolume
+        s = gray.subsample_flat(1_000_000)
+        mn, mx = float(s.min()), float(s.max())
+    elif getattr(gray, "size", 0) > 4_000_000:   # big ndarray → sample
+        flat = gray.reshape(-1)
+        s = flat[:: max(1, flat.size // 1_000_000)]
+        mn, mx = float(s.min()), float(s.max())
+    else:
+        mn, mx = float(gray.min()), float(gray.max())
     return (mx - mn), (mn + mx) / 2.0

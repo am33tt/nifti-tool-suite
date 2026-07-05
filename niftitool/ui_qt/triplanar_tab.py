@@ -6,6 +6,7 @@ draw path is identical; only the slider / layout widgets change.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
@@ -17,12 +18,26 @@ from PyQt6.QtWidgets import (
 )
 
 from ..config import (
-    ACCENT, AXIS_COLOR, BG, BORDER, ERR, PANEL2, SLIDER_DEBOUNCE_MS, TEAL,
-    TEXT, TEXT_DIM,
+    ACCENT, AXIS_COLOR, BG, BORDER, ERR, MAX_TRI_DISPLAY_PX, PANEL2,
+    SLIDER_DEBOUNCE_MS, TEAL, TEXT, TEXT_DIM,
 )
 from ..core.windowing import apply_window, auto_window
 from ..deps import HAS_MPL, np
 from .widgets import styled_btn
+
+
+def _set_layout(fig, tight: bool):
+    """Enable/disable the tight-layout engine (it re-runs on EVERY draw,
+    which costs ~10-30 ms; only needed when artists are rebuilt)."""
+    try:
+        fig.set_layout_engine('tight' if tight else 'none')
+    except Exception:
+        try:
+            fig.set_tight_layout(
+                {'pad': 0.4, 'w_pad': 1.8} if tight else False
+            )
+        except Exception:
+            pass
 
 
 class TriplanarMixin:
@@ -74,7 +89,7 @@ class TriplanarMixin:
         self._tri_vline:   dict = {}
         self._tri_compass: dict = {}
 
-        self._tri_fig.set_tight_layout({'pad': 0.4, 'w_pad': 1.8})
+        _set_layout(self._tri_fig, True)
         self._tri_canvas = FigureCanvasTkAgg(self._tri_fig)
         root.addWidget(self._tri_canvas, 1)
         self._tri_canvas.mpl_connect('button_press_event', self._on_tri_press)
@@ -166,11 +181,28 @@ class TriplanarMixin:
         eb_lay.addStretch(1)
         root.addWidget(export_bar)
 
-        # Debounce state
+        # Debounce state — slider drags go through the blit fast path;
+        # everything else (cmap, window, load) uses the full refresh.
         self._tri_redraw_pending = None
         self._tri_debounce_timer = QTimer(self)
         self._tri_debounce_timer.setSingleShot(True)
-        self._tri_debounce_timer.timeout.connect(self._refresh_triplanar)
+        self._tri_debounce_timer.timeout.connect(self._tri_fast_refresh)
+
+        # Blit state: per-axes rendered backgrounds. bg0 = panel without
+        # image/crosshairs (ticks, spines, compass, title, measurements);
+        # bg1 = bg0 + current slice image. Per drag tick we restore bg1
+        # for unchanged panels, redraw one image, and redraw six lines —
+        # instead of re-rendering the entire figure through Agg.
+        self._tri_bg0: dict = {}
+        self._tri_bg1: dict = {}
+        self._tri_bg_valid = False
+        self._tri_canvas.mpl_connect('draw_event', self._on_tri_full_draw)
+
+        # After the drag settles, run one normal draw so panel titles and
+        # any measurement overlays get refreshed at full fidelity.
+        self._tri_sync_timer = QTimer(self)
+        self._tri_sync_timer.setSingleShot(True)
+        self._tri_sync_timer.timeout.connect(self._tri_canvas.draw_idle)
 
         # Tk-compat shim for ``_tri_idx_vars['X'].set(...)`` usage elsewhere.
         self._tri_idx_vars = {
@@ -190,6 +222,8 @@ class TriplanarMixin:
             return
         # Debounce
         self._tri_debounce_timer.start(SLIDER_DEBOUNCE_MS)
+        # Warm the cache around the new position for smooth dragging.
+        self._prefetch_tri_neighbors(axis, idx)
 
     def _on_tri_idx_entered(self, axis, edit):
         """User typed a slice number and committed (Enter / focus out).
@@ -734,6 +768,51 @@ class TriplanarMixin:
 
     # refresh (hot path)
 
+    def _effective_window(self):
+        """Current (ww, wc) — the auto window is computed once per volume
+        and cached; recomputing it per slider tick used to scan the whole
+        array every frame."""
+        if self._gray is None:
+            return None
+        ww, wc = self._ww, self._wc
+        if ww is None or wc is None:
+            aw = getattr(self, '_auto_wwwc', None)
+            if aw is None:
+                aw = auto_window(self._gray)
+                self._auto_wwwc = aw
+            ww, wc = aw
+        return ww, wc
+
+    def _prefetch_tri_neighbors(self, axis, idx):
+        """Warm the slice cache around *idx* in the background so continued
+        dragging hits pre-windowed slices instead of recomputing."""
+        if getattr(self, '_tri_prefetch_busy', False):
+            return
+        g = self._gray
+        if g is None:
+            return
+        win = self._effective_window()
+        if win is None:
+            return
+        ww, wc = win
+        dim = {'X': g.shape[0], 'Y': g.shape[1], 'Z': g.shape[2]}[axis]
+        self._tri_prefetch_busy = True
+
+        def _run():
+            try:
+                for d in (1, -1, 2, -2, 3, -3):
+                    j = idx + d
+                    if 0 <= j < dim:
+                        self._slice_cache.get(
+                            axis, j, ww, wc, max_px=MAX_TRI_DISPLAY_PX,
+                        )
+            except Exception:
+                pass
+            finally:
+                self._tri_prefetch_busy = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _refresh_triplanar(self):
         self._tri_redraw_pending = None
         if not HAS_MPL or self._gray is None:
@@ -750,14 +829,22 @@ class TriplanarMixin:
         yi = max(0, min(self._tri_idx['Y'], g.shape[1] - 1))
         zi = max(0, min(self._tri_idx['Z'], g.shape[2] - 1))
 
-        ww, wc = self._ww, self._wc
-        if ww is None or wc is None:
-            ww, wc = auto_window(g)
+        ww, wc = self._effective_window()
 
         cache = self._slice_cache
-        sl_X = cache.get('X', xi, ww, wc)
-        sl_Y = cache.get('Y', yi, ww, wc)
-        sl_Z = cache.get('Z', zi, ww, wc)
+        sl_X = cache.get('X', xi, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
+        sl_Y = cache.get('Y', yi, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
+        sl_Z = cache.get('Z', zi, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
+
+        # Decimated arrays are drawn with the ORIGINAL extent so every
+        # data coordinate (crosshairs, probe clicks, measurements) stays
+        # in true voxel units.
+        nx, ny, nz = g.shape[0], g.shape[1], g.shape[2]
+        extents = {
+            'X': (-0.5, ny - 0.5, -0.5, nz - 0.5),
+            'Y': (-0.5, nx - 0.5, -0.5, nz - 0.5),
+            'Z': (-0.5, nx - 0.5, -0.5, ny - 0.5),
+        }
 
         panels = [
             (self._ax_sag, 'X', xi, sl_X, f"Sagittal  X={xi}"),
@@ -784,9 +871,11 @@ class TriplanarMixin:
             'Z': ('Y', 'X'),  # axial
         }
 
+        rebuilt = False
         for ax_obj, axis, idx, sl_win, title in panels:
             im = self._tri_im[axis]
             if im is None or im.get_array().shape != sl_win.shape:
+                rebuilt = True
                 ax_obj.clear()
                 ax_obj.set_facecolor(PANEL2)
                 # Subdued voxel-index ticks so the user can read positions.
@@ -803,7 +892,11 @@ class TriplanarMixin:
                 im = ax_obj.imshow(
                     sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1,
                     aspect='equal', interpolation='nearest',
+                    extent=extents[axis],
                 )
+                # Animated → excluded from normal draws; the blit fast
+                # path (and _on_tri_full_draw) paints them explicitly.
+                im.set_animated(True)
                 self._tri_im[axis] = im
                 self._tri_title[axis] = ax_obj.set_title(
                     title, color=TEXT_DIM, fontsize=8, pad=3,
@@ -833,6 +926,8 @@ class TriplanarMixin:
                     v_pos, color=AXIS_COLOR[v_axis], lw=1.8, alpha=1.0,
                     linestyle='--',
                 )
+                self._tri_hline[axis].set_animated(True)
+                self._tri_vline[axis].set_animated(True)
             else:
                 im.set_data(sl_win)
                 im.set_cmap(cmap)
@@ -845,7 +940,104 @@ class TriplanarMixin:
                 c['L'].set_text(lft); c['R'].set_text(rgt)
                 c['B'].set_text(bot); c['T'].set_text(top_)
 
+        # tight-layout is expensive and only needed when axes were rebuilt;
+        # freeze the layout for pure slice updates.
+        _set_layout(self._tri_fig, rebuilt)
         self._tri_canvas.draw_idle()
+
+    # blit fast path (slider drags)
+
+    def _on_tri_full_draw(self, _event):
+        """After every full canvas draw: recapture the clean backgrounds
+        and paint the animated artists (images + crosshairs) on top."""
+        if self._tri_im.get('X') is None:
+            self._tri_bg_valid = False
+            return
+        canvas = self._tri_canvas
+        try:
+            for axis in ('X', 'Y', 'Z'):
+                ax = self._panel_ax_obj(axis)
+                self._tri_bg0[axis] = canvas.copy_from_bbox(ax.bbox)
+            self._tri_bg1 = {}
+            self._tri_bg_valid = True
+            self._blit_panels({'X', 'Y', 'Z'})
+        except Exception:
+            self._tri_bg_valid = False
+
+    def _blit_panels(self, changed):
+        """Composite the animated artists over cached backgrounds.
+
+        Panels whose image is unchanged reuse the pre-rendered image
+        background (bg1) — only their two crosshair lines are redrawn.
+        """
+        canvas = self._tri_canvas
+        for axis in ('X', 'Y', 'Z'):
+            ax = self._panel_ax_obj(axis)
+            im = self._tri_im.get(axis)
+            if im is None or axis not in self._tri_bg0:
+                continue
+            if axis in changed or axis not in self._tri_bg1:
+                canvas.restore_region(self._tri_bg0[axis])
+                ax.draw_artist(im)
+                self._tri_bg1[axis] = canvas.copy_from_bbox(ax.bbox)
+            else:
+                canvas.restore_region(self._tri_bg1[axis])
+            hl = self._tri_hline.get(axis)
+            vl = self._tri_vline.get(axis)
+            if hl is not None:
+                ax.draw_artist(hl)
+            if vl is not None:
+                ax.draw_artist(vl)
+            canvas.blit(ax.bbox)
+
+    def _tri_fast_refresh(self):
+        """Slider-drag refresh: update one slice image + six crosshair
+        lines by blitting instead of re-rendering the whole figure."""
+        if not HAS_MPL or self._gray is None:
+            return
+        if not self._tri_bg_valid or self._tri_im.get('X') is None:
+            # No cached backgrounds yet (first draw, resize, reload) —
+            # take the full path once; its draw recaptures them.
+            self._refresh_triplanar()
+            return
+
+        g = self._gray
+        xi = max(0, min(self._tri_idx['X'], g.shape[0] - 1))
+        yi = max(0, min(self._tri_idx['Y'], g.shape[1] - 1))
+        zi = max(0, min(self._tri_idx['Z'], g.shape[2] - 1))
+        ww, wc = self._effective_window()
+
+        cache = self._slice_cache
+        changed = set()
+        for axis, idx in (('X', xi), ('Y', yi), ('Z', zi)):
+            sl = cache.get(axis, idx, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
+            im = self._tri_im[axis]
+            if im.get_array() is not sl:
+                im.set_data(sl)
+                changed.add(axis)
+            # Titles are non-animated (rendered only on full draws); the
+            # sync timer below refreshes them after the drag settles.
+            self._tri_title[axis].set_text(
+                {'X': f"Sagittal  X={xi}", 'Y': f"Coronal   Y={yi}",
+                 'Z': f"Axial     Z={zi}"}[axis]
+            )
+
+        # crosshairs track all three indices on every panel
+        self._tri_hline['X'].set_ydata([zi, zi])
+        self._tri_vline['X'].set_xdata([yi, yi])
+        self._tri_hline['Y'].set_ydata([zi, zi])
+        self._tri_vline['Y'].set_xdata([xi, xi])
+        self._tri_hline['Z'].set_ydata([yi, yi])
+        self._tri_vline['Z'].set_xdata([xi, xi])
+
+        try:
+            self._blit_panels(changed)
+        except Exception:
+            self._tri_bg_valid = False
+            self._refresh_triplanar()
+            return
+        # Full-fidelity draw (titles, measurements) once dragging pauses.
+        self._tri_sync_timer.start(300)
 
     def _update_tri_sliders(self):
         if self._gray is None:
@@ -865,6 +1057,9 @@ class TriplanarMixin:
 
     def _reset_tri_artists(self):
         """Drop cached matplotlib artists. Call after the volume shape changes."""
+        self._tri_bg0 = {}
+        self._tri_bg1 = {}
+        self._tri_bg_valid = False
         self._tri_im = {'X': None, 'Y': None, 'Z': None}
         self._tri_title.clear()
         self._tri_hline.clear()

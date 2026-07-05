@@ -57,6 +57,7 @@ class ActionsMixin:
         gc.collect()
         self._slice_cache.set_volume(None)
         self._reset_tri_artists()
+        self._auto_wwwc = None      # new volume → new auto window
         self._hu_cal = {}
         # New file → new intensity distribution: re-arm the auto threshold
         # and reset the display window. A stale Window W/C from the
