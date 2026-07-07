@@ -940,6 +940,11 @@ class TriplanarMixin:
                 c['L'].set_text(lft); c['R'].set_text(rgt)
                 c['B'].set_text(bot); c['T'].set_text(top_)
 
+        # Remember what each panel currently shows so the blit fast path
+        # can skip unchanged panels.
+        self._tri_drawn_key = {
+            'X': (xi, ww, wc), 'Y': (yi, ww, wc), 'Z': (zi, ww, wc),
+        }
         # tight-layout is expensive and only needed when axes were rebuilt;
         # freeze the layout for pure slice updates.
         _set_layout(self._tri_fig, rebuilt)
@@ -949,7 +954,13 @@ class TriplanarMixin:
 
     def _on_tri_full_draw(self, _event):
         """After every full canvas draw: recapture the clean backgrounds
-        and paint the animated artists (images + crosshairs) on top."""
+        and paint the animated artists (images + crosshairs) on top.
+
+        IMPORTANT: no ``canvas.blit()`` in here — this callback runs
+        inside the canvas's own paint cycle, and blitting would request
+        another repaint while painting ("Recursive repaint detected").
+        Drawing into the renderer is enough; the ongoing paint shows it.
+        """
         if self._tri_im.get('X') is None:
             self._tri_bg_valid = False
             return
@@ -960,15 +971,17 @@ class TriplanarMixin:
                 self._tri_bg0[axis] = canvas.copy_from_bbox(ax.bbox)
             self._tri_bg1 = {}
             self._tri_bg_valid = True
-            self._blit_panels({'X', 'Y', 'Z'})
+            self._blit_panels({'X', 'Y', 'Z'}, do_blit=False)
         except Exception:
             self._tri_bg_valid = False
 
-    def _blit_panels(self, changed):
+    def _blit_panels(self, changed, do_blit=True):
         """Composite the animated artists over cached backgrounds.
 
         Panels whose image is unchanged reuse the pre-rendered image
         background (bg1) — only their two crosshair lines are redrawn.
+        ``do_blit=False`` is used from within the draw-event callback,
+        where the surrounding paint pass will flush the buffer itself.
         """
         canvas = self._tri_canvas
         for axis in ('X', 'Y', 'Z'):
@@ -988,7 +1001,8 @@ class TriplanarMixin:
                 ax.draw_artist(hl)
             if vl is not None:
                 ax.draw_artist(vl)
-            canvas.blit(ax.bbox)
+            if do_blit:
+                canvas.blit(ax.bbox)
 
     def _tri_fast_refresh(self):
         """Slider-drag refresh: update one slice image + six crosshair
@@ -1009,12 +1023,16 @@ class TriplanarMixin:
 
         cache = self._slice_cache
         changed = set()
+        drawn = getattr(self, '_tri_drawn_key', None)
+        if drawn is None:
+            drawn = self._tri_drawn_key = {}
         for axis, idx in (('X', xi), ('Y', yi), ('Z', zi)):
-            sl = cache.get(axis, idx, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
-            im = self._tri_im[axis]
-            if im.get_array() is not sl:
-                im.set_data(sl)
+            key = (idx, ww, wc)
+            if drawn.get(axis) != key:
+                sl = cache.get(axis, idx, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
+                self._tri_im[axis].set_data(sl)
                 changed.add(axis)
+                drawn[axis] = key
             # Titles are non-animated (rendered only on full draws); the
             # sync timer below refreshes them after the drag settles.
             self._tri_title[axis].set_text(
@@ -1060,6 +1078,7 @@ class TriplanarMixin:
         self._tri_bg0 = {}
         self._tri_bg1 = {}
         self._tri_bg_valid = False
+        self._tri_drawn_key = {}
         self._tri_im = {'X': None, 'Y': None, 'Z': None}
         self._tri_title.clear()
         self._tri_hline.clear()

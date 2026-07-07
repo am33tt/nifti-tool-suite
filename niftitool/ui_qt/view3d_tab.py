@@ -269,15 +269,9 @@ class View3DMixin:
         self._vtk_iren = rw.GetInteractor()
         self._vtk_iren.Initialize()
         # Do NOT call ``Start()`` - the Qt event loop drives the interactor.
-
-        # Level-of-detail while interacting (Slicer does the same): ask for
-        # ~12 fps during rotation/zoom so vtkSmartVolumeMapper coarsens its
-        # sampling, then re-render at full quality once the mouse stops.
-        # The VTK default DesiredUpdateRate is ~0.0001 fps, i.e. full
-        # quality on every interactive frame — that is why rotation felt
-        # sluggish on big volumes.
-        self._vtk_iren.SetDesiredUpdateRate(12.0)
-        self._vtk_iren.SetStillUpdateRate(0.01)
+        # NOTE: do not raise the interactor's DesiredUpdateRate here — it
+        # makes vtkSmartVolumeMapper drop to very coarse sampling and the
+        # volume renders as a washed-out box.
 
         # Two interactor styles: camera (rotate the scene) and actor (drag the
         # grabbed prop). Default is camera. ``MotionFactor`` slows both down
