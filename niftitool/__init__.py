@@ -1,30 +1,42 @@
-"""NIfTI Tool Suite — SimReady.
+"""NIfTI tool suite.
 
-A preprocessing and inspection toolkit for industrial/research CT NIfTI
-volumes (concrete, ceramics, metals, additively-manufactured parts).
+Preprocessing and inspection toolkit for industrial and research CT NIfTI
+volumes (concrete, ceramics, metals, additively manufactured parts).
 
-The package is organised so that each file covers one concept:
+Package layout:
 
-    config / deps / utils   — shared settings, optional-import flags, sysinfo
-    core/                   — pure scientific functions (no GUI)
-    ui/                     — tkinter front-end, one file per tab
+    config, deps, utils   shared settings, optional-import flags, sysinfo
+    core/                 scientific functions, no GUI
+    ui_qt/                PyQt6 front-end, one file per tab
 
 Entry point: :func:`niftitool.main`.
 """
 
 from pathlib import Path
 
-from .ui_qt.app import NiftiApp
-
 LOGO_PATH = Path(__file__).with_name("assets") / "logo.svg"
 
 
-def _load_app_icon():
-    """Return a QIcon built from the bundled cube-scan logo.
+def __getattr__(name):
+    """Import the Qt window only when it is actually asked for.
 
-    Windows picks a taskbar pixmap by exact size match, so we rasterise
-    the SVG at the standard icon sizes and add each one. Without this
-    the taskbar often falls back to the generic python.exe icon.
+    ``niftitool.core`` is pure NumPy and SciPy and is usable on its own in
+    batch scripts, cluster jobs and notebooks. Importing the GUI at package
+    level would make those fail on a missing PyQt6 or OpenGL library, so the
+    window is resolved lazily (PEP 562).
+    """
+    if name == "NiftiApp":
+        from .ui_qt.app import NiftiApp as _NiftiApp
+        return _NiftiApp
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _load_app_icon():
+    """Return a QIcon built from the bundled logo SVG.
+
+    The SVG is rasterised at each standard icon size, because Windows
+    selects a taskbar pixmap by exact size match and otherwise falls back to
+    the generic python.exe icon.
     """
     from PyQt6.QtCore import QSize, Qt
     from PyQt6.QtGui import QIcon, QPainter, QPixmap
@@ -51,7 +63,11 @@ def _load_app_icon():
 
 
 def _set_windows_app_id():
-    """Ensure Windows uses our icon (not python.exe's) in the taskbar."""
+    """Set an explicit AppUserModelID so Windows shows the application icon.
+
+    No-op off Windows. Without it the taskbar groups the process under
+    python.exe.
+    """
     import sys
     if not sys.platform.startswith("win"):
         return
@@ -68,14 +84,14 @@ def main() -> None:
     """Launch the GUI."""
     import sys
     from PyQt6.QtWidgets import QApplication
+    from .ui_qt.app import NiftiApp
     _set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("NIfTI Tool Suite")
     app.setWindowIcon(_load_app_icon())
     win = NiftiApp()
     win.setWindowIcon(_load_app_icon())
-    # Open maximised by default — the tri-planar + controls layout is
-    # designed for a wide workspace and feels cramped below ~1400 px.
+    # The tri-planar and controls layout assumes a wide workspace.
     win.showMaximized()
     sys.exit(app.exec())
 

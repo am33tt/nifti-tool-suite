@@ -1,11 +1,11 @@
 """Optional-dependency probes.
 
-Imports the heavy scientific stack once and exposes :data:`HAS_*` flags so
-the rest of the codebase can degrade gracefully when a package is missing.
-The GUI uses these flags to show an inline warning instead of crashing.
+Imports the scientific stack once and exposes :data:`HAS_*` flags so callers
+can degrade when a package is missing. The GUI reads the flags to warn
+inline instead of failing at import time.
 """
 
-# ── numpy + nibabel + scipy ───────────────────────────────────────────────────
+# numpy + nibabel + scipy
 try:
     import numpy as np
     import nibabel as nib
@@ -19,12 +19,12 @@ except ImportError:
     ndimage = None     # type: ignore
     HAS_NIBABEL = False
 
-# ── matplotlib ────────────────────────────────────────────────────────────────
+# matplotlib
 try:
     import matplotlib
-    # Headless default: each UI picks its own backend when it builds a
-    # canvas (QtAgg for ui_qt, TkAgg for the legacy tk UI). Forcing TkAgg
-    # globally spawns a hidden Tk root that eventually pops to the front.
+    # Headless default. The UI selects QtAgg when it builds a canvas;
+    # selecting TkAgg globally spawns a hidden Tk root that can surface as a
+    # stray window.
     matplotlib.use("Agg")
     from matplotlib.figure import Figure
     import matplotlib.cm as mcm
@@ -37,7 +37,7 @@ except ImportError:
     mcolors = None               # type: ignore
     HAS_MPL = False
 
-# ── matplotlib 3-D ────────────────────────────────────────────────────────────
+# matplotlib 3-D
 try:
     from mpl_toolkits.mplot3d import Axes3D                 # noqa: F401
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -46,7 +46,7 @@ except ImportError:
     Poly3DCollection = None  # type: ignore
     HAS_3D = False
 
-# ── scikit-image (marching cubes for 3-D surface view) ────────────────────────
+# scikit-image: marching cubes for the 3-D surface view
 try:
     from skimage.measure import marching_cubes
     HAS_SKIMAGE = True
@@ -54,14 +54,12 @@ except ImportError:
     marching_cubes = None  # type: ignore
     HAS_SKIMAGE = False
 
-# ── VTK (GPU 3-D rendering, Slicer-style) ─────────────────────────────────────
+# VTK: GPU 3-D rendering
 try:
     import vtk  # noqa: F401
     from vtkmodules.util import numpy_support as vtk_numpy_support  # noqa: F401
-    # VTK's default output window on Windows is a native Win32 pop-up that
-    # steals focus whenever anything in the pipeline emits a warning.
-    # Redirect to a string sink so warnings stay reachable via
-    # ``GetOutput()`` for debugging but never surface as a blank window.
+    # On Windows VTK routes pipeline warnings to a native pop-up that steals
+    # focus. Redirect them to a string sink, readable via GetOutput().
     try:
         _vtk_log = vtk.vtkStringOutputWindow()
         vtk.vtkOutputWindow.SetInstance(_vtk_log)
@@ -73,7 +71,7 @@ except Exception:
     vtk_numpy_support = None   # type: ignore
     HAS_VTK = False
 
-# ── psutil (optional RAM monitor) ─────────────────────────────────────────────
+# psutil: optional RAM monitor
 try:
     import psutil
     HAS_PSUTIL = True
@@ -89,6 +87,6 @@ def missing_report() -> list[str]:
     if not HAS_MPL:     missing.append("matplotlib")
     if not HAS_PSUTIL:  missing.append("psutil  (optional)")
     if not HAS_3D:      missing.append("mpl_toolkits  (optional)")
-    if not HAS_SKIMAGE: missing.append("scikit-image  (optional — for 3-D surface)")
-    if not HAS_VTK:     missing.append("vtk  (recommended — GPU 3-D viewer)")
+    if not HAS_SKIMAGE: missing.append("scikit-image  (optional, for 3-D surface)")
+    if not HAS_VTK:     missing.append("vtk  (recommended, GPU 3-D viewer)")
     return missing

@@ -18,8 +18,8 @@ def _flat_sample(gray, max_voxels: int = 2_000_000):
 def get_axis_labels(affine) -> dict:
     """Return compass labels for every slice-plane axis.
 
-    Each entry is a ``(positive_code, negative_code)`` tuple — e.g.
-    ``('R', 'L')`` — used by the triplanar viewer to draw orientation
+    Each entry is a ``(positive_code, negative_code)`` tuple such as
+    ``('R', 'L')``, used by the triplanar viewer to draw orientation
     compasses.
     """
     try:
@@ -34,13 +34,12 @@ def get_axis_labels(affine) -> dict:
         return {'x': ('X', '-'), 'y': ('Y', '-'), 'z': ('Z', '-')}
 
 
-def collect_metadata(img, gray=None, hu_vol=None, labels=None) -> list:
+def collect_metadata(img, gray=None) -> list:
     """Structured metadata bundle used by the Metadata viewer tab.
 
     Returns a list of sections, each ``{'title': str, 'rows': [(k, v), ...]}``
-    or ``{'title': str, 'matrix': 2-D list}`` for the affine. The same data
-    is formatted as plain text by :func:`read_metadata` for the log pane,
-    so both outputs stay in sync when new fields are added here.
+    or ``{'title': str, 'matrix': 2-D list}`` for the affine.
+    :func:`read_metadata` renders the same data as plain text.
     """
     from nibabel.orientations import aff2axcodes
     affine  = img.affine
@@ -102,45 +101,10 @@ def collect_metadata(img, gray=None, hu_vol=None, labels=None) -> list:
             pass
         sections.append({'title': 'Intensity Statistics', 'rows': rows})
 
-    if hu_vol is not None:
-        sections.append({
-            'title': 'HU Calibration',
-            'rows': [
-                ("HU range", f"{float(hu_vol.min()):.1f}  to  {float(hu_vol.max()):.1f}"),
-                ("HU mean",  f"{float(hu_vol.mean()):.2f}"),
-            ],
-        })
-
-    if labels is not None:
-        total = labels.size
-        rows = []
-        for pid, name in ((0, "Void/Air"), (1, "Matrix/Paste"), (2, "Aggregate")):
-            count = int((labels == pid).sum())
-            if count:
-                rows.append((name, f"{count:,} vox   ({100 * count / total:.2f}%)"))
-        if rows:
-            sections.append({'title': 'Phase Segmentation', 'rows': rows})
-
-    sections.append({
-        'title': 'Affine Matrix',
-        'matrix': [[float(v) for v in row] for row in affine],
-    })
-
-    hdr_rows = []
-    for k in (
-        'sizeof_hdr', 'dim_info', 'dim', 'pixdim', 'vox_offset',
-        'scl_slope', 'scl_inter', 'xyzt_units', 'qform_code', 'sform_code',
-    ):
-        try:
-            hdr_rows.append((k, str(header[k])))
-        except Exception:
-            pass
-    sections.append({'title': 'NIfTI Header', 'rows': hdr_rows})
-
     return sections
 
 
-def read_metadata(img, gray=None, hu_vol=None, labels=None) -> str:
+def read_metadata(img, gray=None) -> str:
     """Multi-section metadata report suitable for the log pane."""
     from nibabel.orientations import aff2axcodes
     affine  = img.affine
@@ -190,51 +154,13 @@ def read_metadata(img, gray=None, hu_vol=None, labels=None) -> str:
             f"  Std              : {float(flat.std()):.4f}",
             f"  p1 / p99         : {float(np.percentile(flat, 1)):.2f} / {float(np.percentile(flat, 99)):.2f}",
         ]
-        # Central-ROI SNR estimate — indicative only.
+        # Central-ROI SNR estimate, indicative only.
         try:
             cx, cy, cz = [s // 2 for s in gray.shape[:3]]
             r = max(3, min(20, min(gray.shape[:3]) // 8))
             roi = gray[cx - r:cx + r, cy - r:cy + r, cz - r:cz + r]
             snr = float(roi.mean() / (roi.std() + 1e-9))
             lines.append(f"  SNR (central ROI): {snr:.1f}  (higher = less noise)")
-        except Exception:
-            pass
-
-    if hu_vol is not None:
-        lines += [
-            "",
-            "══ HU CALIBRATION ══════════════════════════════════",
-            f"  HU range         : {float(hu_vol.min()):.1f}  to  {float(hu_vol.max()):.1f}",
-            f"  HU mean          : {float(hu_vol.mean()):.2f}",
-        ]
-
-    if labels is not None:
-        lines += [
-            "",
-            "══ PHASE SEGMENTATION ══════════════════════════════",
-        ]
-        total = labels.size
-        for pid, name in [(0, "Void/Air"), (1, "Matrix/Paste"), (2, "Aggregate")]:
-            count = int((labels == pid).sum())
-            if count:
-                lines.append(f"  {name:18s}: {count:>9d} vox  ({100 * count / total:.2f}%)")
-
-    lines += [
-        "",
-        "══ AFFINE MATRIX ═══════════════════════════════════",
-    ]
-    for row in affine:
-        lines.append("  " + "  ".join(f"{v:10.4f}" for v in row))
-    lines += [
-        "",
-        "══ NIFTI HEADER ════════════════════════════════════",
-    ]
-    for k in (
-        'sizeof_hdr', 'dim_info', 'dim', 'pixdim', 'vox_offset',
-        'scl_slope', 'scl_inter', 'xyzt_units', 'qform_code', 'sform_code',
-    ):
-        try:
-            lines.append(f"  {k:20s}: {header[k]}")
         except Exception:
             pass
 

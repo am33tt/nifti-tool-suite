@@ -1,19 +1,22 @@
 """One-click PDF analysis report.
 
-Bundles everything the GUI has computed for the loaded volume into a
-multi-page, print-friendly PDF (white background, A4 landscape):
+Collects what the GUI has computed for the loaded volume into a
+print-friendly PDF (white background, A4 landscape):
 
-1. Title page — file info, calibration, material model, key results.
+1. Title page with file info and key results.
 2. Orthogonal mid-slices with the current window applied.
-3. Intensity histogram + per-slice mean curve.
-4. Phase segmentation overlay + per-phase statistics table.
-5. Void analytics (size distribution, cumulative volume, top-10 table)
-   — included when a :class:`~.porosity.PorosityResult` is supplied.
-6. E-Map mid-slice + statistics — included when an E-map is supplied.
+3. Intensity histogram and per-slice mean curve.
+4. Void analytics: size distribution, cumulative volume, largest voids.
+5. Pore threshold and the sensitivity of the porosity to it.
+6. Beam-hardening cupping profile, fit and correction.
+7. Binarisation histogram with the cut, and the indicator field.
 
-The function is GUI-free: it takes numpy arrays and plain dicts, builds
-matplotlib ``Figure`` objects directly on the Agg backend (safe from a
-worker thread — no Qt canvas involved), and writes with ``PdfPages``.
+Every section after the first is included only when the corresponding
+analysis has been run.
+
+Takes numpy arrays and dicts, builds matplotlib ``Figure`` objects on the
+Agg backend so it can be called from a worker thread, and writes with
+``PdfPages``.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import datetime
 
 from ..deps import np, HAS_MPL
 
-# Print palette (independent of the app theme — reports must print well).
+# Print palette, independent of the app theme.
 _INK      = "#1A1A1A"
 _DIM      = "#666666"
 _ACCENT   = "#E07B2A"
@@ -47,11 +50,11 @@ def _style_ax(ax):
     ax.grid(True, color=_GRID, lw=0.5, alpha=0.6)
 
 def _footer(fig, page_no):
-    fig.text(0.985, 0.015, f"NIfTI Tool Suite — page {page_no}",
+    fig.text(0.985, 0.015, f"NIfTI Tool Suite, page {page_no}",
              ha="right", va="bottom", fontsize=7, color=_DIM)
 
 def _window(img2d, ww, wc):
-    """Apply CT windowing; fall back to p1–p99 stretch."""
+    """Apply CT windowing; fall back to p1-p99 stretch."""
     a = np.asarray(img2d, dtype=np.float32)
     if ww and wc is not None:
         lo, hi = wc - ww / 2.0, wc + ww / 2.0
@@ -80,17 +83,13 @@ def generate_pdf_report(
     dtype: str = "",
     gray=None,
     ww=None, wc=None,
-    hu_cal: dict | None = None,
-    hu_vol=None,
-    labels=None,
-    phase_stats: dict | None = None,
-    porosity: float | None = None,
     void_result=None,
-    E_map=None,
-    model_name: str = "",
-    model_params: dict | None = None,
     void_thresh=None,
-    progress=None,           # fn(str) — stage callback for the UI log
+    bin_result=None,          # niftitool.core.binarize.BinarizeResult
+    bh_fit=None,             # niftitool.core.beam_hardening.CuppingFit
+    pore_threshold=None,     # niftitool.core.pore_threshold.ThresholdResult
+    pore_sensitivity: dict | None = None,
+    progress=None,           # fn(str), stage callback for the UI log
 ) -> int:
     """Write the PDF; returns the number of pages."""
     if not HAS_MPL:
@@ -106,7 +105,7 @@ def generate_pdf_report(
 
     with PdfPages(str(out_path)) as pdf:
 
-        # ── page 1 : title ────────────────────────────────────────────
+        # Page 1: title
         _stage("title page")
         page += 1
         fig = _new_page()
@@ -127,16 +126,8 @@ def generate_pdf_report(
                 rows.append(("Physical size", "  ×  ".join(f"{d:.2f}" for d in dims) + "  mm"))
         if dtype:
             rows.append(("Data type", dtype))
-        if hu_cal and "m" in hu_cal:
-            rows.append(("HU calibration", f"HU = {hu_cal['m']:.6g} · I  +  {hu_cal['c']:.6g}"))
-        else:
-            rows.append(("HU calibration", "not applied (raw intensities)"))
-        if model_name:
-            p = ", ".join(f"{k}={v:g}" if isinstance(v, (int, float)) else f"{k}={v}"
-                          for k, v in (model_params or {}).items())
-            rows.append(("Material model", f"{model_name}   ({p})" if p else model_name))
         if void_thresh is not None:
-            rows.append(("Void threshold", f"{float(void_thresh):g}  HU"))
+            rows.append(("Void threshold", f"{float(void_thresh):g}  grey value"))
 
         y = 0.66
         import textwrap
@@ -149,18 +140,25 @@ def generate_pdf_report(
                 y -= 0.038
             y -= 0.007
 
-        # key results box
         key = []
-        if porosity is not None:
-            key.append(f"Porosity (voxel fraction) : {porosity * 100:.3f} %")
-        if void_result is not None and void_result.voids:
-            key.append(f"Closed voids detected     : {void_result.n_voids}")
-            key.append(f"Median void eq. diameter  : {void_result.d_median_mm:.4f} mm")
-        if E_map is not None:
-            key.append(f"E-map range               : "
-                       f"{float(E_map.min()):.1f} – {float(E_map.max()):.1f} MPa")
-            key.append(f"E-map mean ± std          : "
-                       f"{float(E_map.mean()):.1f} ± {float(E_map.std()):.1f} MPa")
+        if void_result is not None:
+            basis = "of specimen" if void_result.specimen_voxels else "of array"
+            key.append(f"Porosity {basis:<16}: "
+                       f"{void_result.porosity_pct:.3f} %")
+            if void_result.voids:
+                key.append(f"Closed voids detected     : {void_result.n_voids}")
+                key.append(f"Median void eq. diameter  : "
+                           f"{void_result.d_median_mm:.4f} mm")
+        if pore_threshold is not None:
+            key.append(f"Pore threshold            : "
+                       f"{pore_threshold.T:.1f} ({pore_threshold.method_used})")
+        if bh_fit is not None:
+            key.append(f"Cupping index             : "
+                       f"{bh_fit.cupping_index_before_pct:+.2f} % → "
+                       f"{bh_fit.cupping_index_after_pct:+.2f} %")
+        if bin_result is not None:
+            key.append(f"Material fraction of box  : "
+                       f"{bin_result.material_fraction_of_box * 100:.2f} %")
         if key:
             fig.text(0.60, 0.66, "Key results", fontsize=12,
                      fontweight="bold", color=_INK)
@@ -172,7 +170,7 @@ def generate_pdf_report(
         _footer(fig, page)
         pdf.savefig(fig)
 
-        # ── page 2 : orthogonal slices ────────────────────────────────
+        # Page 2: orthogonal slices
         if gray is not None:
             _stage("slice snapshots")
             page += 1
@@ -190,7 +188,7 @@ def generate_pdf_report(
             _footer(fig, page)
             pdf.savefig(fig)
 
-        # ── page 3 : histogram ────────────────────────────────────────
+        # Page 3: histogram
         if gray is not None:
             _stage("histogram")
             page += 1
@@ -207,9 +205,11 @@ def generate_pdf_report(
             centers = (edges[:-1] + edges[1:]) / 2
             ax1.bar(centers, counts, width=edges[1] - edges[0],
                     color=_ACCENT, alpha=0.85, linewidth=0)
-            if void_thresh is not None and hu_vol is not None:
-                pass  # threshold is in HU domain; raw histogram shown as-is
-            ax1.set_xlabel("Intensity (raw)", fontsize=9, color=_DIM)
+            if void_thresh is not None:
+                ax1.axvline(float(void_thresh), color="#C0392B", lw=1.6,
+                            label=f"threshold {float(void_thresh):.0f}")
+                ax1.legend(fontsize=8)
+            ax1.set_xlabel("Grey value", fontsize=9, color=_DIM)
             ax1.set_ylabel("Voxel count", fontsize=9, color=_DIM)
 
             means = [float(gray[:, :, z].mean())
@@ -218,60 +218,11 @@ def generate_pdf_report(
             ax2.plot(np.linspace(0, gray.shape[2] - 1, len(means)), means,
                      color=_TEAL, lw=1.5)
             ax2.set_xlabel("Z slice index", fontsize=9, color=_DIM)
-            ax2.set_ylabel("Mean intensity", fontsize=9, color=_DIM)
+            ax2.set_ylabel("Mean grey value", fontsize=9, color=_DIM)
             _footer(fig, page)
             pdf.savefig(fig)
 
-        # ── page 4 : phases ───────────────────────────────────────────
-        if labels is not None and phase_stats:
-            _stage("phase statistics")
-            page += 1
-            fig = _new_page()
-            fig.suptitle("Phase Segmentation", fontsize=14,
-                         fontweight="bold", color=_INK)
-            gs = fig.add_gridspec(1, 2, width_ratios=[1.1, 1],
-                                  left=0.05, right=0.96, top=0.86, bottom=0.10)
-
-            ax = fig.add_subplot(gs[0])
-            z = labels.shape[2] // 2
-            from matplotlib.colors import ListedColormap
-            ax.imshow(np.rot90(labels[:, :, z]),
-                      cmap=ListedColormap(_PHASE_COLORS),
-                      vmin=0, vmax=2, interpolation="nearest", aspect="equal")
-            ax.set_title(f"Axial mid-slice  z={z}   "
-                         f"(blue=void, green=matrix, orange=aggregate)",
-                         fontsize=8, color=_DIM)
-            ax.axis("off")
-
-            axt = fig.add_subplot(gs[1])
-            axt.axis("off")
-            cols = ["Phase", "Voxels", "Vol %", "HU mean±std", "E mean [MPa]"]
-            cell_rows = []
-            for name, s in phase_stats.items():
-                cell_rows.append([
-                    name, f"{s['voxels']:,}",
-                    f"{s['vol_frac'] * 100:.2f}",
-                    f"{s['HU_mean']:.0f} ± {s['HU_std']:.0f}",
-                    f"{s['E_mean_MPa']:.1f}",
-                ])
-            tbl = axt.table(cellText=cell_rows, colLabels=cols,
-                            loc="upper center", cellLoc="center")
-            tbl.auto_set_font_size(False)
-            tbl.set_fontsize(8.5)
-            tbl.scale(1, 1.6)
-            for (r, _c), cell in tbl.get_celld().items():
-                cell.set_edgecolor(_GRID)
-                if r == 0:
-                    cell.set_text_props(fontweight="bold", color="white")
-                    cell.set_facecolor(_ACCENT)
-            if porosity is not None:
-                axt.text(0.5, 0.35, f"Porosity: {porosity * 100:.3f} %",
-                         ha="center", fontsize=13, color=_TEAL,
-                         fontweight="bold", transform=axt.transAxes)
-            _footer(fig, page)
-            pdf.savefig(fig)
-
-        # ── page 5 : void analytics ───────────────────────────────────
+        # Page 4: void analytics
         if void_result is not None and void_result.voids:
             _stage("void analytics")
             page += 1
@@ -302,19 +253,17 @@ def generate_pdf_report(
             ax2.set_title("Cumulative volume vs size", fontsize=9, color=_INK)
             ax2.set_ylim(0, 105)
 
-            # summary text
             ax3 = fig.add_subplot(gs[1, 0]); ax3.axis("off")
             from .porosity import summary_lines
             ax3.text(0.0, 0.95, "\n".join(summary_lines(r)),
                      fontsize=9, color=_INK, family="monospace",
                      va="top", transform=ax3.transAxes)
 
-            # top-10 table
             ax4 = fig.add_subplot(gs[1, 1]); ax4.axis("off")
             cols = ["#", "Voxels", "Vol mm³", "Eq.d mm", "Sph.", "Elong."]
             cell_rows = []
             for i, void in enumerate(r.voids[:10]):
-                sph = "—" if np.isnan(void.sphericity) else f"{void.sphericity:.3f}"
+                sph = "n/a" if np.isnan(void.sphericity) else f"{void.sphericity:.3f}"
                 cell_rows.append([
                     str(i + 1), f"{void.voxels:,}", f"{void.volume_mm3:.4g}",
                     f"{void.eq_diam_mm:.4f}", sph, f"{void.elongation:.2f}",
@@ -333,36 +282,170 @@ def generate_pdf_report(
             _footer(fig, page)
             pdf.savefig(fig)
 
-        # ── page 6 : E-map ────────────────────────────────────────────
-        if E_map is not None:
-            _stage("E-map")
+        # Page: automatic pore threshold and its sensitivity
+        if pore_threshold is not None:
+            _stage("pore threshold")
             page += 1
             fig = _new_page()
-            fig.suptitle("Young's Modulus Map", fontsize=14,
+            fig.suptitle("Pore Threshold and Its Sensitivity", fontsize=14,
                          fontweight="bold", color=_INK)
-            axes = fig.subplots(1, 3)
-            ims = None
-            for ax, (title, sl) in zip(axes, _mid_slices(E_map)):
-                ims = ax.imshow(sl, cmap="viridis", aspect="equal")
-                ax.set_title(title, fontsize=9, color=_DIM, family="monospace")
-                ax.axis("off")
-            if ims is not None:
-                cb = fig.colorbar(ims, ax=list(axes), shrink=0.7,
-                                  pad=0.02, aspect=30)
-                cb.set_label("E  (MPa)", fontsize=9, color=_DIM)
-                cb.ax.tick_params(labelsize=8, colors=_DIM)
-            fig.text(0.5, 0.06,
-                     f"E: min {float(E_map.min()):.1f}   "
-                     f"mean {float(E_map.mean()):.1f}   "
-                     f"max {float(E_map.max()):.1f}   "
-                     f"std {float(E_map.std()):.1f}   MPa",
-                     ha="center", fontsize=9, color=_TEAL,
-                     family="monospace")
+            axes = fig.subplots(1, 2)
+            ax0, ax1 = axes
+            _style_ax(ax0); _style_ax(ax1)
+
+            t = pore_threshold
+            xs = np.linspace(t.solid_mode - 6 * t.solid_sigma,
+                             t.solid_mode + 4 * t.solid_sigma, 500)
+            sig = max(t.solid_sigma, 1e-9)
+            ax0.plot(xs, np.exp(-0.5 * ((xs - t.solid_mode) / sig) ** 2),
+                     color=_DIM, lw=1.2, ls="-.",
+                     label=f"solid peak {t.solid_mode:.0f} +/- {sig:.0f}")
+            ax0.axvline(t.t_sigma, color=_ACCENT, ls="--", lw=1.3,
+                        label=f"{t.k_sigma:g}-sigma = {t.t_sigma:.0f}")
+            ax0.axvline(t.t_otsu, color=_INK, ls=":", lw=1.3,
+                        label=f"Otsu = {t.t_otsu:.0f}")
+            if t.t_valley is not None:
+                ax0.axvline(t.t_valley, color=_TEAL, ls="--", lw=1.3,
+                            label=f"valley = {t.t_valley:.0f}")
+            ax0.axvline(t.T, color="#C0392B", lw=2.2,
+                        label=f"chosen = {t.T:.0f} ({t.method_used})")
+            ax0.set_xlabel("Grey value", fontsize=9, color=_DIM)
+            ax0.set_ylabel("Solid-peak model", fontsize=9, color=_DIM)
+            ax0.set_title("Threshold candidates", fontsize=9, color=_INK)
+            ax0.legend(fontsize=7)
+
+            if pore_sensitivity:
+                keys = [k for k in pore_sensitivity if k != "chosen"]
+                vals = [pore_sensitivity[k] for k in keys]
+                ax1.bar(range(len(keys)), vals, color=_TEAL)
+                ax1.set_xticks(range(len(keys)))
+                ax1.set_xticklabels(keys, rotation=45, ha="right", fontsize=7)
+                ax1.set_ylabel("Pore fraction of the interior sample (%)",
+                               fontsize=9, color=_DIM)
+                ax1.set_title("How much the answer depends on the threshold",
+                              fontsize=9, color=_INK)
+                for i, v in enumerate(vals):
+                    ax1.text(i, v, f"{v:.2f}", ha="center", va="bottom",
+                             fontsize=7, color=_INK)
+            else:
+                ax1.text(0.5, 0.5, "no sensitivity sweep recorded",
+                         transform=ax1.transAxes, ha="center", color=_DIM,
+                         fontsize=9)
+
+            fig.text(0.06, 0.06,
+                     "A porosity figure is only meaningful together with the "
+                     "threshold it was measured at. The bars show what the "
+                     "same volume would report under each candidate "
+                     "threshold.",
+                     fontsize=8, color=_DIM, wrap=True)
+            _footer(fig, page)
+            pdf.savefig(fig)
+
+        # Page: beam-hardening correction
+        if bh_fit is not None and getattr(bh_fit, "depth_mm", None) is not None:
+            _stage("beam hardening")
+            page += 1
+            fig = _new_page()
+            fig.suptitle("Beam-Hardening (Cupping) Correction", fontsize=14,
+                         fontweight="bold", color=_INK)
+            ax = fig.add_axes([0.10, 0.42, 0.82, 0.42])
+            _style_ax(ax)
+            d = bh_fit.depth_mm
+            ax.plot(d, bh_fit.profile, color=_ACCENT, lw=1.8,
+                    label="measured profile")
+            ax.plot(d, bh_fit.fitted, color=_INK, lw=1.2, ls="--",
+                    label=f"polynomial fit (degree {bh_fit.poly_degree})")
+            ax.plot(d, bh_fit.corrected, color=_TEAL, lw=1.8,
+                    label="after correction")
+            ax.set_xlabel("Depth below the specimen surface (mm)",
+                          fontsize=9, color=_DIM)
+            ax.set_ylabel("Mean solid grey value", fontsize=9, color=_DIM)
+            ax.legend(fontsize=8)
+
+            lines = [
+                f"cupping index      {bh_fit.cupping_index_before_pct:+.2f} %"
+                f"  ->  {bh_fit.cupping_index_after_pct:+.2f} %",
+                f"depth fitted       {bh_fit.fit_depth_mm[0]:.4f} - "
+                f"{bh_fit.fit_depth_mm[1]:.4f} mm",
+                f"interior reference {bh_fit.i_ref:.2f}",
+                f"solid samples      {bh_fit.n_solid_samples:,} voxels "
+                f"(analysis stride x{bh_fit.stride})",
+                f"depth reference    "
+                + ("the array border counts as specimen surface"
+                   if bh_fit.border_is_surface
+                   else "only real material/air interfaces"),
+            ]
+            fig.text(0.10, 0.30, "\n".join(lines), fontsize=9, color=_INK,
+                     family="monospace", va="top")
+            fig.text(0.10, 0.12,
+                     "Depth is the shortest distance from each voxel to the "
+                     "specimen surface, computed with a Euclidean distance\n"
+                     "transform at the true voxel spacing. It is therefore "
+                     "valid for any specimen shape and any anisotropic grid,\n"
+                     "not only for a block cropped flush to the field of view.",
+                     fontsize=8, color=_DIM, va="top")
+            _footer(fig, page)
+            pdf.savefig(fig)
+
+        # Page: binarisation for the finite cell method
+        if bin_result is not None:
+            _stage("binarisation")
+            page += 1
+            fig = _new_page()
+            fig.suptitle("Binarisation \u2014 FCM Indicator Field",
+                         fontsize=14, fontweight="bold", color=_INK)
+            ax0, ax1 = fig.subplots(1, 2)
+            _style_ax(ax0)
+
+            sample = getattr(bin_result, "sample", None)
+            if sample is not None and np.size(sample):
+                values = np.asarray(sample).ravel()
+                values = values[np.isfinite(values)]
+                ax0.hist(values, bins=400, color=_DIM, log=True)
+                ax0.axvline(bin_result.threshold, color="#C0392B", lw=1.8,
+                            label=f"{bin_result.method} = "
+                                  f"{bin_result.threshold:.1f}")
+                ax0.legend(loc="upper left", fontsize=8)
+            ax0.set_xlabel("Grey value", fontsize=9, color=_DIM)
+            ax0.set_ylabel("Voxel count (log)", fontsize=9, color=_DIM)
+            ax0.set_title("Histogram and the cut", fontsize=9, color=_INK)
+
+            preview = getattr(bin_result, "preview_mask", None)
+            if preview is not None:
+                ax1.imshow(np.rot90(preview), cmap="gray",
+                           interpolation="nearest", aspect="equal")
+                ax1.set_title("Indicator field (white = material)",
+                              fontsize=9, color=_INK)
+            ax1.set_xticks([]); ax1.set_yticks([])
+
+            lines = [
+                f"method              {bin_result.method}",
+                f"threshold           {bin_result.threshold:.2f}",
+                f"material fraction   "
+                f"{bin_result.material_fraction_of_box * 100:.2f} % of the box",
+            ]
+            if bin_result.porosity_inside_specimen is not None:
+                lines.append(
+                    f"porosity            "
+                    f"{bin_result.porosity_inside_specimen * 100:.2f} % "
+                    f"inside the specimen envelope")
+            if bin_result.material_components:
+                lines.append(
+                    f"material bodies     {bin_result.material_components}"
+                    + (f" (kept the largest, removed "
+                       f"{bin_result.removed_voxels:,} island voxels)"
+                       if bin_result.removed_voxels else ""))
+            fig.text(0.06, 0.10, "\n".join(lines), fontsize=9, color=_INK,
+                     family="monospace", va="bottom")
+            if bin_result.separability_warning:
+                fig.text(0.06, 0.03,
+                         "WARNING: " + bin_result.separability_warning,
+                         fontsize=8, color="#C0392B", va="bottom", wrap=True)
             _footer(fig, page)
             pdf.savefig(fig)
 
         info = pdf.infodict()
-        info["Title"] = f"CT Analysis Report — {file_name}"
+        info["Title"] = f"CT Analysis Report: {file_name}"
         info["Creator"] = "NIfTI Tool Suite"
 
     return page

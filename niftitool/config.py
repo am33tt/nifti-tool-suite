@@ -1,11 +1,10 @@
 """Application-wide constants: theme, fonts, presets, limits.
 
-Keep this file free of runtime logic. Anything numeric or stylistic that
-the rest of the codebase needs should live here so it can be tuned in one
-place.
+No runtime logic. Numeric and stylistic settings are collected here so
+they can be tuned in one place.
 """
 
-# ── THEME ─────────────────────────────────────────────────────────────────────
+# Theme
 BG       = "#FDFAF6"
 PANEL    = "#F5F0E8"
 PANEL2   = "#EDE6D8"
@@ -21,9 +20,8 @@ BTN_BG   = "#EDE6D8"
 BTN_HOV  = "#D4C4A8"
 TEAL     = "#1A7A8A"
 
-# Per-axis slider / crosshair colors. Used consistently by the tri-planar
-# crosshairs and the 3-D cube-axes labels so a line's colour always maps
-# back to the same slider.
+# Per-axis colours, shared by the tri-planar crosshairs, the sliders and the
+# 3-D cube-axes labels so a colour always denotes the same axis.
 AXIS_COLOR = {
     'X': "#E5484D",  # sagittal
     'Y': "#2FA84F",  # coronal
@@ -37,11 +35,10 @@ FONT_HEAD  = ("Segoe UI Semibold", 11)
 FONT_TITLE = ("Segoe UI", 13, "bold")
 FONT_CODE  = ("Consolas", 9)
 
-# ── COLORMAPS ─────────────────────────────────────────────────────────────────
-CMAPS   = ["gray", "hot", "jet", "viridis", "bone", "plasma", "inferno", "turbo"]
-E_CMAPS = ["viridis", "plasma", "inferno", "hot", "jet", "turbo", "RdYlGn"]
+# Colormaps
+CMAPS = ["gray", "hot", "jet", "viridis", "bone", "plasma", "inferno", "turbo"]
 
-# ── CT windowing presets  (Window Width, Window Center) ───────────────────────
+# CT windowing presets: (window width, window center) in HU
 CT_PRESETS = {
     "-- preset --": None,
     "AM Concrete" : (200,  100),
@@ -51,74 +48,17 @@ CT_PRESETS = {
     "Brain"       : (80,   40),
 }
 
-# ── Performance limits ────────────────────────────────────────────────────────
-# Max voxels plotted in 3-D scatter (legacy — the viewer uses marching cubes).
+# Performance limits
+# Max voxels plotted in 3-D scatter (the viewer uses marching cubes).
 MAX_3D_VOXELS   = 60_000
-# Max voxels fed to np.histogram — anything bigger is subsampled.
+# Max voxels fed to np.histogram, anything bigger is subsampled.
 MAX_HIST_VOXELS = 10_000_000
 # Stats panel subsample threshold (for live Min/Max/Mean/p1/p99 display).
 STATS_SUBSAMPLE_VOXELS = 5_000_000
 # Triplanar slider debounce in milliseconds (caps matplotlib redraws).
 SLIDER_DEBOUNCE_MS = 16
-# Longest displayed side of a triplanar slice, in pixels. Panels are only
-# a few hundred px on screen; windowing + drawing a full 2000² slice per
-# frame is wasted work. Coordinates stay in voxel units via imshow extent.
-# 640 ≈ 15-20 ms per blit tick → fluid dragging; PNG export stays full-res.
+# Longest displayed side of a triplanar slice, in pixels. Slices are
+# downsampled to this before windowing, bounding the per-frame cost at
+# roughly 15-20 ms. Coordinates stay in voxel units via the imshow extent,
+# and PNG export still uses full resolution.
 MAX_TRI_DISPLAY_PX = 640
-
-# ── Material presets  — HU-to-Young's-modulus mappings ───────────────────────
-# params for 'linear':   {'a': slope,  'b': intercept}     E [MPa] = a*HU + b
-# params for 'power':    {'a': scale,  'b': exponent}      E [MPa] = a * HU^b
-# params for 'bilinear': {'hu_thresh', 'E_void', 'E_solid'}
-# params for 'table':    {'hu': [...], 'E': [...]}
-#
-# References:
-#   Concrete (AM):  du Plessis et al. 2016; Garboczi & Berryman 2001
-#   Limestone:      Landis & Keane 2010
-#   Aluminium:      empirical density–E for Al alloys
-#   Steel:          empirical
-MATERIAL_PRESETS = {
-    "AM Concrete (default)": {
-        "hu_air": -1000, "hu_ref": 0,
-        "void_thresh": -500,
-        "model": "bilinear",
-        "params": {"hu_thresh": -200, "E_void": 0.001, "E_solid": 30_000.0},
-        "notes": "Additively manufactured concrete. E_solid ≈ 30 GPa (paste). "
-                 "Refs: Garboczi & Berryman 2001, du Plessis 2016.",
-    },
-    "AM Concrete (power-law)": {
-        "hu_air": -1000, "hu_ref": 0,
-        "void_thresh": -500,
-        "model": "power",
-        "params": {"a": 0.09, "b": 1.92, "hu_min_clamp": 1.0},
-        "notes": "Power-law E = 0.09·HU^1.92  [MPa]. Calibrate a,b to your mix.",
-    },
-    "Limestone / Rock": {
-        "hu_air": -1000, "hu_ref": 0,
-        "void_thresh": -500,
-        "model": "linear",
-        "params": {"a": 20.0, "b": 5_000.0},
-        "notes": "E [MPa] = 20·HU + 5000. Landis & Keane 2010 approximate.",
-    },
-    "Aluminium Alloy": {
-        "hu_air": -1000, "hu_ref": 0,
-        "void_thresh": -500,
-        "model": "linear",
-        "params": {"a": 0.045, "b": 69_000.0},
-        "notes": "E [MPa] ≈ 69 GPa base, small HU correction for porosity.",
-    },
-    "Steel": {
-        "hu_air": -1000, "hu_ref": 0,
-        "void_thresh": -500,
-        "model": "bilinear",
-        "params": {"hu_thresh": -300, "E_void": 0.001, "E_solid": 200_000.0},
-        "notes": "E_solid ≈ 200 GPa. Void ~ air inclusions.",
-    },
-    "Custom / Manual": {
-        "hu_air": -1000, "hu_ref": 0,
-        "void_thresh": -500,
-        "model": "linear",
-        "params": {"a": 1.0, "b": 0.0},
-        "notes": "Edit all parameters manually.",
-    },
-}

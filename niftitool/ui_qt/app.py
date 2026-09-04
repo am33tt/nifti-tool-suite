@@ -1,7 +1,6 @@
 """Main application window.
 
 NiftiApp owns the shared volume state and wires the tab mixins together.
-Each mixin lives in its own file so bugs and edits stay local.
 """
 
 from __future__ import annotations
@@ -23,13 +22,15 @@ from ..core.slice_cache import SliceCache
 from ..deps import missing_report
 from ..utils import process_rss_mb
 from .actions import ActionsMixin
+from .beam_hardening_tab import BeamHardeningTabMixin
+from .binarize_tab import BinarizeTabMixin
 from .controls import ControlsMixin
-from .emap_tab import EmapTabMixin
 from .export_tab import ExportTabMixin
 from .histogram_tab import HistogramTabMixin
 from .log_tab import LogTabMixin
 from .metadata_tab import MetadataTabMixin
 from .porosity_tab import PorosityTabMixin
+from .sim_export_actions import SimExportActionsMixin
 from .triplanar_tab import TriplanarMixin
 from .view3d_tab import View3DMixin
 from .widgets import StageProgressBar, hline, styled_btn
@@ -38,11 +39,9 @@ from .widgets import StageProgressBar, hline, styled_btn
 def _build_qss() -> str:
     """Application-wide stylesheet assembled from config.py theme colours.
 
-    Applied at the ``QApplication`` level so it reaches top-level dialogs
-    (``QMessageBox``, ``QFileDialog``, etc.) which are not descendants of
-    the main window and would otherwise fall back to the OS palette -
-    on Windows 11 that means dark mode, which makes our light-themed
-    dialogs unreadable.
+    Applied at the ``QApplication`` level so it also reaches top-level
+    dialogs (``QMessageBox``, ``QFileDialog``), which are not descendants of
+    the main window and would otherwise use the OS palette.
     """
     return f"""
     QWidget {{
@@ -149,23 +148,26 @@ class NiftiApp(
     TriplanarMixin,
     View3DMixin,
     HistogramTabMixin,
-    EmapTabMixin,
     PorosityTabMixin,
+    BeamHardeningTabMixin,
+    BinarizeTabMixin,
     MetadataTabMixin,
     ExportTabMixin,
     LogTabMixin,
     ActionsMixin,
+    SimExportActionsMixin,
     QMainWindow,
 ):
     """Top-level Qt window.
 
-    All mutable volume state lives on ``self`` so every mixin can reach
-    it directly (load → ``_img`` / ``_gray``; calibrate → ``_hu_vol``;
-    compute E-Map → ``_E_map`` / ``_labels`` / ``_E_stats``; etc.).
+    All mutable volume state lives on ``self`` so every mixin can reach it:
+    load sets ``_img`` and ``_gray``, the porosity analysis sets
+    ``_void_result``, beam hardening sets ``_bh_fit`` and binarisation sets
+    ``_bin_result``.
     """
 
-    # Thread-safe signal used by :meth:`_append_log` / :meth:`_set_status`
-    # to marshal messages from background threads onto the GUI thread.
+    # Thread-safe signal used by :meth:`_append_log` and :meth:`_set_status`
+    # to marshal messages from worker threads onto the GUI thread.
     _post_log_signal = pyqtSignal(str, str)
     _post_status_signal = pyqtSignal(str, bool)
     _post_call_signal = pyqtSignal(object)  # carries a zero-arg callable
@@ -177,8 +179,7 @@ class NiftiApp(
         self.resize(1600, 1000)
         self.setMinimumSize(1200, 750)
 
-        # Apply QSS at application level so top-level dialogs (QMessageBox,
-        # QFileDialog) pick it up too - otherwise Windows dark mode leaks in.
+        # Application-level QSS so top-level dialogs pick it up too.
         from PyQt6.QtWidgets import QApplication
         qapp = QApplication.instance()
         if qapp is not None:
@@ -196,19 +197,24 @@ class NiftiApp(
         self._wc = None
         self._auto_wwwc = None   # cached auto window, one per volume
 
-        # material state
-        self._hu_vol = None
-        self._E_map = None
-        self._labels = None
-        self._hu_cal: dict = {}
-        self._E_stats: dict = {}
+        # measurement state
         self._porosity = 0.0
+
+        # simulation / export state
+        self._rotation_history: list = []
+        self._bc_surface_exports: list = []
+        self._sim_load_direction = "+Y"
+        self._auto_void_threshold_info = None
+        self._pore_threshold_info = None
+        self._pore_threshold_result = None
+        self._bh_fit = None
+        self._bh_fit_info = None
 
         # perf aids
         self._slice_cache = SliceCache()
 
-        # cooperative cancellation for long-running worker threads —
-        # the status-bar Stop button sets this, loops poll it.
+        # Cooperative cancellation for worker threads: the status-bar Stop
+        # button sets this and the loops poll it.
         self._cancel_event = threading.Event()
 
         # build
@@ -228,10 +234,9 @@ class NiftiApp(
         self._post_status_signal.connect(self._do_set_status)
         self._post_call_signal.connect(self._do_call)
         self._post_delayed_signal.connect(self._do_delayed_call)
-        # Tracks whether the window is still alive so cross-thread
-        # schedulers can short-circuit during / after shutdown — without
-        # this, late callbacks from daemon threads re-enter QTimer and
-        # spam "QBasicTimer::start: dispatcher has already been destroyed".
+        # Lets the cross-thread schedulers short-circuit during shutdown.
+        # Late callbacks from daemon threads would otherwise re-enter QTimer
+        # after the event dispatcher is gone.
         self._shutting_down = False
 
     def _do_call(self, fn):
@@ -245,15 +250,12 @@ class NiftiApp(
     def _do_delayed_call(self, ms: int, fn):
         if self._shutting_down:
             return
-        # Runs on the GUI thread (queued connection), so QTimer can find
-        # a live event dispatcher.
+        # Runs on the GUI thread (queued connection) so QTimer finds a live
+        # event dispatcher.
         QTimer.singleShot(int(ms), lambda: self._do_call(fn))
 
     def after(self, ms: int, fn, *args):
-        """Tkinter compatibility shim - schedule ``fn(*args)`` on the GUI
-        thread after ``ms`` milliseconds.  All existing ``actions.py``
-        call sites continue to work unchanged.
-        """
+        """Schedule ``fn(*args)`` on the GUI thread after ``ms`` ms."""
         if self._shutting_down:
             return None
         if args:
@@ -261,31 +263,28 @@ class NiftiApp(
         else:
             call = fn
         if ms <= 0:
-            # Marshal via signal for thread safety (callable may come from
-            # a worker thread).
+            # Marshal via signal; the callable may come from a worker thread.
             self._post_call_signal.emit(call)
             return None
-        # Route delayed calls through the main thread too; QTimer.singleShot
-        # invoked from a worker thread with no event dispatcher emits the
-        # "dispatcher has already been destroyed" warning during shutdown.
+        # Route delayed calls through the main thread as well; singleShot
+        # called from a worker thread has no event dispatcher.
         self._post_delayed_signal.emit(int(ms), call)
         return None
 
     def after_cancel(self, _token):
-        """No-op: we don't rely on cancelling, debounce logic uses fresh
-        timers each time."""
+        """No-op: the debounce logic uses a fresh timer each time."""
         return None
 
     # tab switching
 
-    # Which left tool panel belongs to which visualisation tab — switching
-    # a tab opens its controls so the user never hunts for the right panel.
+    # Left tool panel opened automatically for each visualisation tab.
     _TAB_TOOL_LINKS = {
         'triplanar': 'viewer',
         'view3d':    'viewer',
         'histogram': 'stats',
-        'emap':      'material',
-        'porosity':  'material',
+        'porosity':  'threshold',
+        'beam_hardening': 'beam_hardening',
+        'binarize':  'binarize',
         'metadata':  'metadata',
     }
 
@@ -328,13 +327,11 @@ class NiftiApp(
     def _request_stop(self):
         self._cancel_event.set()
         self._append_log(
-            "  Stop requested — finishing the current step...", 'warn',
+            "  Stop requested, finishing the current step...", 'warn',
         )
 
     def _show_tab(self, name: str):
-        """Jump the right-hand tab widget to the named tab. Called by
-        compute actions so e.g. "Compute histogram" lands the user on
-        the Histogram tab without manual clicking."""
+        """Jump the right-hand tab widget to the named tab."""
         tab = self._tab_by_name.get(name)
         if tab is None:
             return
@@ -373,15 +370,12 @@ class NiftiApp(
             event.ignore()
             return
 
-        # Tell any in-flight worker threads not to schedule more callbacks.
-        # Their QTimer.singleShots would otherwise land after Qt has torn
-        # down the event dispatcher and trigger QBasicTimer warnings.
+        # Stop in-flight worker threads from scheduling further callbacks.
         self._shutting_down = True
 
-        # Stop QTimers before the event loop tears down so late signals from
-        # daemon threads can't trigger QBasicTimer::start warnings.
+        # Stop QTimers before the event loop tears down.
         for name in ('_ram_timer', '_tri_debounce_timer', '_tri_sync_timer',
-                     '_emap_debounce_timer'):
+                     ):
             t = getattr(self, name, None)
             if t is not None:
                 try:
@@ -389,10 +383,9 @@ class NiftiApp(
                 except Exception:
                     pass
 
-        # Tear down the VTK interactor cleanly. QVTKRenderWindowInteractor
-        # owns its own QTimer for the render loop; without Finalize() that
-        # timer can fire after the Qt event dispatcher is gone and spam
-        # "QBasicTimer::start: ... dispatcher has already been destroyed".
+        # QVTKRenderWindowInteractor owns a QTimer for its render loop.
+        # Without Finalize() that timer can fire after the Qt event
+        # dispatcher is gone.
         vtk_widget = getattr(self, '_vtk_widget', None)
         if vtk_widget is not None:
             try:
@@ -456,9 +449,8 @@ class NiftiApp(
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Top bar — logo + title group is centred; action buttons sit on
-        # the right. Left and right containers share the same stretch
-        # factor so the centre group lands at the true window centre.
+        # The left and right containers share a stretch factor so the centre
+        # group lands at the true window centre.
         top = QFrame(self)
         top.setStyleSheet(f"background-color: {BG};")
         top_lay = QHBoxLayout(top)
@@ -531,14 +523,14 @@ class NiftiApp(
         # Build all tool panels (populates self._tool_panels)
         self._build_controls()
 
-        # Tool navigation bar
-        # One exclusive toggle button per tool; clicking swaps the stacked
-        # page on the left.  Order here = display order.
+        # Tool navigation bar: one exclusive toggle per tool, in display order.
         tool_order = [
             ("viewer",   "Viewer"),
             ("metadata", "Metadata"),
             ("stats",      "Stats"),
-            ("material",   "Material"),
+            ("threshold",  "Threshold"),
+            ("binarize",   "Binarise"),
+            ("beam_hardening", "Beam Hardening"),
             ("background", "Background"),
             ("reorient",   "Reorient"),
             ("rotate",   "Rotate"),
@@ -590,8 +582,8 @@ class NiftiApp(
         h_split = QSplitter(Qt.Orientation.Horizontal, v_split)
         h_split.setHandleWidth(6)
 
-        # Left: stacked widget of tool panels, wrapped in a scroll area so
-        # tall panels (e.g. Material Mapping) don't force the window wider.
+        # Tool panels in a scroll area so tall panels do not widen the
+        # window.
         left = QWidget(h_split)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
@@ -600,6 +592,10 @@ class NiftiApp(
         left_scroll = QScrollArea(left)
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Without this the panels grow past the pane and the descriptions
+        # run off the edge instead of wrapping.
+        left_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._tool_stack = QStackedWidget()
         self._tool_stack.setStyleSheet(f"background-color: {BG};")
@@ -626,7 +622,7 @@ class NiftiApp(
         self._tool_nav_buttons["viewer"].setChecked(True)
         self._tool_stack.setCurrentIndex(self._tool_stack_index["viewer"])
 
-        # Right: visualisation notebook (Log tab removed - log is its own pane)
+        # Right: visualisation notebook
         right = QWidget(h_split)
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
@@ -640,33 +636,36 @@ class NiftiApp(
         self._triplanar_tab = QWidget()
         self._viewer3d_tab = QWidget()
         self._histogram_tab = QWidget()
-        self._emap_tab = QWidget()
         self._porosity_tab = QWidget()
+        self._binarize_tab = QWidget()
+        self._beam_hardening_tab = QWidget()
         self._metadata_tab = QWidget()
         self._export_tab = QWidget()
 
         for w in (self._triplanar_tab, self._viewer3d_tab, self._histogram_tab,
-                  self._emap_tab, self._porosity_tab, self._metadata_tab,
+                  self._porosity_tab, self._binarize_tab,
+                  self._beam_hardening_tab, self._metadata_tab,
                   self._export_tab):
             w.setStyleSheet(f"background-color: {BG};")
 
         nb.addTab(self._triplanar_tab, "  Tri-Planar  ")
         nb.addTab(self._viewer3d_tab, "  3-D View  ")
         nb.addTab(self._histogram_tab, "  Histogram  ")
-        nb.addTab(self._emap_tab, "  E-Map Viewer  ")
         nb.addTab(self._porosity_tab, "  Porosity  ")
+        nb.addTab(self._binarize_tab, "  Binarise  ")
+        nb.addTab(self._beam_hardening_tab, "  Beam Hardening  ")
         nb.addTab(self._metadata_tab, "  Metadata  ")
         nb.addTab(self._export_tab, "  Export  ")
 
         self._nb = nb
-        # Named aliases so action handlers can switch tabs by key rather than
-        # importing the widget references. Keep in sync with the addTab order.
+        # Named aliases so action handlers can switch tabs by key.
         self._tab_by_name = {
             'triplanar': self._triplanar_tab,
             'view3d':    self._viewer3d_tab,
             'histogram': self._histogram_tab,
-            'emap':      self._emap_tab,
             'porosity':  self._porosity_tab,
+            'binarize':  self._binarize_tab,
+            'beam_hardening': self._beam_hardening_tab,
             'metadata':  self._metadata_tab,
             'export':    self._export_tab,
         }
@@ -675,8 +674,9 @@ class NiftiApp(
         self._build_3d_view(self._viewer3d_tab)
         nb.currentChanged.connect(self._on_tab_changed)
         self._build_histogram_tab(self._histogram_tab)
-        self._build_emap_tab(self._emap_tab)
         self._build_porosity_tab(self._porosity_tab)
+        self._build_binarize_tab(self._binarize_tab)
+        self._build_beam_hardening_tab(self._beam_hardening_tab)
         self._build_metadata_tab(self._metadata_tab)
         self._build_export_tab(self._export_tab)
 
@@ -721,7 +721,7 @@ class NiftiApp(
 
         sb_lay.addStretch(1)
 
-        # Stop button — visible only while a background task is running.
+        # Stop button, visible only while a background task is running.
         self._stop_btn = styled_btn(status_bar, "■  Stop",
                                     self._request_stop, danger=True,
                                     small=True)
@@ -746,12 +746,10 @@ class NiftiApp(
 
         root.addWidget(status_bar)
 
-    # convenience shims for Tk StringVar-style call sites
+    # Tk StringVar-style shims
 
-    # ``_info_var`` / ``_status_var`` / ``_probe_var`` / ``_ram_var`` used to
-    # be ``tk.StringVar`` instances on which ``.set(...)`` was called from
-    # many places in ``actions.py`` and the tabs.  Expose tiny .set()-able
-    # shims backed by the QLabels so we don't have to rewrite those calls.
+    # ``.set(...)`` call sites in ``actions.py`` and the tabs expect
+    # ``tk.StringVar`` objects; these properties wrap QLabels instead.
 
     @property
     def _info_var(self):

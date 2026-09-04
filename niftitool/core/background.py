@@ -1,16 +1,10 @@
 """Automatic background detection and removal.
 
-The specimen is found as the *largest connected component* of the
-solid phase (everything at or above the void/solid threshold), then
-``binary_fill_holes`` pulls the internal pores back into the specimen
-mask — so pores are preserved, only the exterior air/background is
-removed.
-
-Everything outside the specimen is replaced by a constant fill value
-(the median of the background, so the histogram keeps a natural air
-peak), and the volume is optionally cropped to the specimen's bounding
-box plus a margin.  The result is returned as a new
-:class:`nibabel.Nifti1Image` with a correctly shifted affine.
+The specimen is the largest connected component of the solid phase, that
+is everything at or above the void/solid threshold. ``binary_fill_holes``
+then returns internal pores to the mask, so only exterior air is removed.
+Voxels outside the specimen are set to a constant fill value and the volume
+is optionally cropped to the specimen bounding box plus a margin.
 """
 
 from __future__ import annotations
@@ -21,8 +15,8 @@ from ..deps import np, nib, ndimage
 def extract_specimen_mask(solid_mask, connectivity: int = 1):
     """Largest connected solid component with its internal holes filled.
 
-    Returns ``(mask, n_components)`` — mask is ``None`` when there is no
-    solid voxel at all.
+    Returns ``(mask, n_components)``; mask is ``None`` when the volume has
+    no solid voxel.
     """
     structure = ndimage.generate_binary_structure(3, connectivity)
     lab, n = ndimage.label(solid_mask, structure=structure)
@@ -58,8 +52,8 @@ def remove_background(
     crop
         Also crop the volume to the specimen bounding box + margin.
     fill
-        Value written outside the specimen; default = background median
-        (keeps a natural-looking air peak in the histogram).
+        Value written outside the specimen. Defaults to the background
+        median, which keeps a realistic air peak in the histogram.
     progress
         Optional ``fn(str)`` stage callback.
 

@@ -1,10 +1,9 @@
 """High-level user-triggered actions.
 
-This mixin contains every ``_do_*`` and ``_export_*`` handler - the
-glue between the controls panel and the pure :mod:`niftitool.core`
-functions.  Actions that do heavy lifting run in a daemon thread and
-marshal results back onto the Qt main thread via :meth:`NiftiApp.after`
-(which is a tk-compat shim around :class:`QTimer` / a signal).
+Mixin holding every ``_do_*`` and ``_export_*`` handler, connecting the
+controls panel to the functions in :mod:`niftitool.core`. Heavy actions run
+in a daemon thread and marshal results back onto the Qt main thread via
+:meth:`NiftiApp.after`.
 """
 
 from __future__ import annotations
@@ -21,9 +20,7 @@ from ..core.histogram import compute_histogram
 from ..core.io import (
     LazyGrayVolume, load_nifti, preview_volume, raw_array, run_gunzip, to_gray,
 )
-from ..core.mapping import compute_E_map
 from ..core.metadata import collect_metadata, get_axis_labels, read_metadata
-from ..core.segmentation import phase_statistics, segment_phases
 from ..deps import HAS_NIBABEL, nib, np
 from ..utils import available_ram_mb, total_ram_mb
 
@@ -31,9 +28,9 @@ from ..utils import available_ram_mb, total_ram_mb
 class ActionsMixin:
     """All user-action handlers.
 
-    Relies on the following state initialised by :class:`NiftiApp`:
-      ``_img, _gray, _path, _hu_vol, _E_map, _labels, _hu_cal,
-      _E_stats, _porosity, _axis_labels, _ww, _wc, _slice_cache``.
+    Uses the state initialised by :class:`NiftiApp`: ``_img``, ``_gray``,
+    ``_path``, ``_porosity``, ``_axis_labels``, ``_ww``, ``_wc`` and
+    ``_slice_cache``.
     """
 
     # File loading
@@ -51,18 +48,15 @@ class ActionsMixin:
             QMessageBox.critical(self, "Missing dependency",
                                  "nibabel is not installed.")
             return
-        for attr in ('_gray', '_img', '_hu_vol', '_E_map', '_labels'):
+        for attr in ('_gray', '_img'):
             if getattr(self, attr, None) is not None:
                 setattr(self, attr, None)
         gc.collect()
         self._slice_cache.set_volume(None)
         self._reset_tri_artists()
         self._auto_wwwc = None      # new volume → new auto window
-        self._hu_cal = {}
-        # New file → new intensity distribution: re-arm the auto threshold
-        # and reset the display window. A stale Window W/C from the
-        # previous file can map the new data entirely transparent in the
-        # 3-D view ("volume disappears").
+        # Re-arm the auto threshold and window. A stale W/C from the previous
+        # file can render the new volume transparent in the 3-D view.
         try:
             self._void_thresh_var.set("auto")
             self._reset_window()
@@ -70,15 +64,13 @@ class ActionsMixin:
             pass
         self._log_sep(f"Loading: {Path(path).name}")
 
-        # nibabel can mmap plain .nii but has to decompress .nii.gz entirely
-        # into RAM. For large gzipped files that's the quickest way to OOM;
-        # steer the user at the Gunzip button early.
+        # nibabel mmaps plain .nii but must decompress .nii.gz fully into RAM.
         try:
             sz_mb = Path(path).stat().st_size / (1024 ** 2)
             if path.lower().endswith('.gz') and sz_mb > 500:
                 self._append_log(
                     f"  Large gzipped file ({sz_mb:.0f} MiB). nibabel must "
-                    f"decompress to RAM before any read — consider the "
+                    f"decompress to RAM before any read. Consider the "
                     f"Gunzip button on the top bar first for lower memory "
                     f"use.",
                     'warn',
@@ -86,9 +78,8 @@ class ActionsMixin:
         except OSError:
             pass
 
-        # On RAM-constrained machines, offer to pre-crop huge volumes so
-        # the user never has to materialise them fully. If they accept,
-        # we swap `path` for the cropped sidecar and continue.
+        # On RAM-constrained machines a large volume may be pre-cropped to a
+        # sidecar file, which is loaded in place of the original.
         cropped_path = self._maybe_offer_precrop(path)
         if cropped_path is not None:
             path = cropped_path
@@ -105,13 +96,11 @@ class ActionsMixin:
     _PRECROP_RAM_GB_CAP = 16.0
 
     def _maybe_offer_precrop(self, path: str) -> str | None:
-        """Return a path to a cropped sidecar the user asked us to create,
-        or ``None`` to mean "just load *path* as-is".
+        """Return the path of a cropped sidecar, or ``None`` to load *path* as-is.
 
-        Triggered only when the file is large (>1.5 GiB) *and* the system
-        has ≤16 GiB of RAM. Peeking the NIfTI header via ``nib.load`` does
-        not materialise the volume — nibabel returns a proxy, so the crop
-        reads only the needed bytes through the file mmap.
+        Offered only for files above ``_PRECROP_FILE_MB`` on systems with at
+        most ``_PRECROP_RAM_GB_CAP`` of RAM. ``nib.load`` returns a proxy, so
+        the crop reads only the needed bytes through the file mmap.
         """
         try:
             sz_mb = Path(path).stat().st_size / (1024 ** 2)
@@ -160,7 +149,6 @@ class ActionsMixin:
             cropped = run_cropper(img_hdr, x_range, y_range, z_range)
 
             src = Path(path)
-            # Strip both ``.nii`` and ``.nii.gz`` for a clean stem.
             stem = src.name
             for ext in (".nii.gz", ".nii"):
                 if stem.lower().endswith(ext):
@@ -210,7 +198,7 @@ class ActionsMixin:
             rlay.addWidget(s0)
             rlay.addWidget(QLabel("to", row))
             rlay.addWidget(s1)
-            form.addRow(f"{ax} (0 – {dim}):", row)
+            form.addRow(f"{ax} (0 - {dim}):", row)
             spin_pairs[ax] = (s0, s1)
 
         bb = QDialogButtonBox(
@@ -270,6 +258,7 @@ class ActionsMixin:
             self._append_log(f"  Physical size: {phys} mm", 'dim')
 
             self.after(0, self._autofill_crop)
+            self.after(0, self._update_simulation_input_defaults)
             self.after(0, self._update_tri_sliders)
             self.after(0, self._refresh_triplanar)
             self.after(0, self._prog.advance)
@@ -293,18 +282,15 @@ class ActionsMixin:
             if not isinstance(g, LazyGrayVolume):
                 return
 
-            # Estimate the float32 footprint of the full volume and skip the
-            # eager materialisation if it would consume more than ~60% of
-            # free RAM. Staying on the lazy proxy keeps the slice viewer
-            # responsive (nibabel serves slices straight from the mmap);
-            # the heavy compute actions (`_get_gray`) still materialise on
-            # demand, which is where the user is paying for it anyway.
+            # Skip eager materialisation above 60% of free RAM. The lazy
+            # proxy still serves slices from the file mmap and compute
+            # actions materialise on demand.
             est_mb = g.size * 4 / (1024 ** 2)
             free_mb = available_ram_mb()
             if free_mb is not None and est_mb > 0.60 * free_mb:
                 self._append_log(
                     f"  Volume is {est_mb:.0f} MiB float32 vs {free_mb:.0f} "
-                    f"MiB free — staying on the lazy proxy. Slicing reads "
+                    f"MiB free, staying on the lazy proxy. Slicing reads "
                     f"through the file mmap; compute steps will still "
                     f"materialise on demand.",
                     'warn',
@@ -327,7 +313,7 @@ class ActionsMixin:
             self.after(0, _swap)
         except MemoryError:
             self._append_log(
-                "  Not enough RAM to materialise full volume — staying lazy.",
+                "  Not enough RAM to materialise full volume, staying lazy.",
                 'warn',
             )
         except Exception as ex:
@@ -345,10 +331,9 @@ class ActionsMixin:
     def _get_gray_lazy(self):
         """Like :meth:`_get_gray` but never materialises the volume.
 
-        Returns whatever ``self._gray`` is (ndarray or LazyGrayVolume) —
-        both support ``shape`` and per-slice ``[:, :, z]`` access, which
-        is all the streaming code paths need.  Use this from anything
-        that must work on volumes larger than RAM.
+        Returns an ndarray or a ``LazyGrayVolume``. Both support ``shape``
+        and per-slice ``[:, :, z]`` access, which is all the streaming paths
+        need.
         """
         if self._gray is None and self._img is not None:
             self._gray = LazyGrayVolume(self._img.dataobj)
@@ -359,9 +344,8 @@ class ActionsMixin:
     def _ram_guard(self, bytes_per_voxel: float, what: str) -> bool:
         """Return True if a full-resolution *what* fits in RAM, else warn.
 
-        Estimates ``voxels × bytes_per_voxel`` against available memory
-        and pops an actionable message instead of letting numpy die with
-        an opaque MemoryError.
+        Compares voxels * bytes_per_voxel against available memory and shows
+        a dialog instead of raising MemoryError.
         """
         if self._img is None:
             return False
@@ -376,9 +360,9 @@ class ActionsMixin:
                 f"resolution, but only {avail_mb / 1024:.1f} GiB RAM is "
                 f"free.\n\n"
                 f"Options:\n"
-                f"  •  Crop the volume first (Crop tool) — a region of "
+                f"  •  Crop the volume first (Crop tool); a region of "
                 f"interest is usually enough.\n"
-                f"  •  Use the Porosity tab / histogram / report — those "
+                f"  •  Use the Porosity tab / histogram / report; those "
                 f"work at any size (they stream and downsample "
                 f"automatically)."
             )
@@ -387,18 +371,17 @@ class ActionsMixin:
             ))
             self._append_log(
                 f"  {what}: needs ~{needed_mb / 1024:.1f} GiB, "
-                f"{avail_mb / 1024:.1f} GiB free — aborted. "
+                f"{avail_mb / 1024:.1f} GiB free, aborted. "
                 f"Crop first or use the streaming tools.", 'warn',
             )
             return False
         return True
 
     def _resolve_void_thresh(self):
-        """Current void threshold as a float; ``'auto'`` → Otsu.
+        """Current void threshold as a float, using Otsu when set to ``'auto'``.
 
-        The computed value is written back into the field (so the user
-        sees what was used and can tweak it) and logged.  Returns None
-        when no file is loaded and the field is on auto.
+        The computed value is written back into the field and logged. Returns
+        None when the field is on auto and no file is loaded.
         """
         txt = str(self._void_thresh_var.get()).strip().lower()
         if txt not in ("", "auto"):
@@ -410,8 +393,7 @@ class ActionsMixin:
             return None
         from ..core.segmentation import otsu_threshold
 
-        vol = self._hu_vol if self._hu_vol is not None \
-            else self._get_gray_lazy()
+        vol = self._get_gray_lazy()
         if hasattr(vol, "subsample_flat"):
             flat = vol.subsample_flat(2_000_000)
         else:
@@ -422,7 +404,7 @@ class ActionsMixin:
         self._void_thresh_var.set(f"{t:.1f}")
         self._append_log(
             f"  Void threshold: auto (Otsu) → {t:.1f}  "
-            f"(sampled range {float(flat.min()):.0f} … {float(flat.max()):.0f})",
+            f"(sampled range {float(flat.min()):.0f} to {float(flat.max()):.0f})",
             'teal',
         )
         return t
@@ -430,16 +412,13 @@ class ActionsMixin:
     def _sane_void_thresh(self, thresh: float) -> float:
         """Sanity-check *thresh* against the actual intensity distribution.
 
-        The classic trap: the HU-style default (−500) applied to an
-        uncalibrated scan whose raw intensities start at 0 — the void
-        mask is empty and porosity reads 0.000 %.  If the threshold
-        selects (almost) nothing or (almost) everything, offer the Otsu
-        split instead.  Runs on the GUI thread (shows a dialog).
-        Returns the threshold to use.
+        A threshold that selects almost nothing or almost everything is the
+        usual symptom of a value carried over from another scan, so the Otsu
+        split is offered instead. Must run on the GUI thread. Returns the
+        threshold to use.
         """
         try:
-            vol = self._hu_vol if self._hu_vol is not None \
-                else self._get_gray_lazy()
+            vol = self._get_gray_lazy()
             if vol is None:
                 return thresh
             if hasattr(vol, "subsample_flat"):
@@ -461,7 +440,7 @@ class ActionsMixin:
                 f"The void threshold {thresh:g} selects {what} "
                 f"({frac * 100:.3f} % of sampled voxels).\n\n"
                 f"Your volume's intensity range is about "
-                f"{mn:.0f} … {mx:.0f}, so this threshold probably "
+                f"{mn:.0f} to {mx:.0f}, so this threshold probably "
                 f"doesn't match the data.\n\n"
                 f"Use the automatic (Otsu) threshold  {t_auto:.1f}  "
                 f"instead?",
@@ -472,7 +451,7 @@ class ActionsMixin:
                 self._void_thresh_var.set(f"{t_auto:.1f}")
                 self._append_log(
                     f"  Void threshold auto-corrected: {thresh:g} → "
-                    f"{t_auto:.1f}  (Otsu; volume range {mn:.0f}–{mx:.0f})",
+                    f"{t_auto:.1f}  (Otsu; volume range {mn:.0f}-{mx:.0f})",
                     'teal',
                 )
                 return float(t_auto)
@@ -483,12 +462,6 @@ class ActionsMixin:
     def _require_img(self) -> bool:
         if self._img is None:
             QMessageBox.warning(self, "No file", "Please open a NIfTI file first.")
-            return False
-        return True
-
-    def _require_emap(self) -> bool:
-        if self._E_map is None:
-            QMessageBox.warning(self, "No E-Map", "Please compute the E-Map first.")
             return False
         return True
 
@@ -567,12 +540,8 @@ class ActionsMixin:
                 self._log_sep("Metadata")
                 self._set_status("Reading metadata...", busy=True)
                 gray_lazy = self._get_gray_lazy() if self._gray is not None else None
-                sections = collect_metadata(
-                    self._img, gray_lazy, self._hu_vol, self._labels,
-                )
-                txt = read_metadata(
-                    self._img, gray_lazy, self._hu_vol, self._labels,
-                )
+                sections = collect_metadata(self._img, gray_lazy)
+                txt = read_metadata(self._img, gray_lazy)
                 self._append_log(txt, 'dim')
                 self.after(0, self.show_metadata_sections, sections)
                 self.after(0, self._show_tab, 'metadata')
@@ -597,7 +566,7 @@ class ActionsMixin:
                 except Exception:
                     n_bins = 256
                 zidx, means, counts, edges, mn, mx = compute_histogram(gray, n_bins)
-                self._append_log(f"  Shape: {gray.shape}  range: {mn:.2f}–{mx:.2f}", 'dim')
+                self._append_log(f"  Shape: {gray.shape}  range: {mn:.2f}-{mx:.2f}", 'dim')
                 self._append_log(
                     f"  Mean: {float(gray.mean()):.4f}  "
                     f"Std: {float(gray.std()):.4f}", 'dim',
@@ -632,6 +601,13 @@ class ActionsMixin:
                 self._set_status(f"Reorienting to {target}...", busy=True)
                 result = run_reorientation(self._img, target)
                 self._append_log(f"  New shape: {result.shape}", 'ok')
+                self._rotation_history.append({
+                    "operation": "reorient",
+                    "target_axcodes": target,
+                    "resampled": False,
+                    "new_shape": [int(v) for v in result.shape[:3]],
+                    "saved_to": str(out_path) if out_path else None,
+                })
                 if out_path:
                     nib.save(result, str(out_path))
                     self._append_log(f"  Saved → {Path(out_path).name}", 'ok')
@@ -681,6 +657,14 @@ class ActionsMixin:
                 self._set_status(f"Rotating {angle}° around {axis.upper()}...", busy=True)
                 result = run_angle_rotation(self._img, axis, angle)
                 self._append_log(f"  New shape: {result.shape}", 'ok')
+                self._rotation_history.append({
+                    "operation": "rotate",
+                    "axis": str(axis),
+                    "angle_deg": float(angle),
+                    "resampled": True,
+                    "new_shape": [int(v) for v in result.shape[:3]],
+                    "saved_to": str(out_path) if out_path else None,
+                })
                 if out_path:
                     nib.save(result, str(out_path))
                     self._set_status("Rotation saved.", busy=False)
@@ -744,145 +728,6 @@ class ActionsMixin:
         threading.Thread(target=_run, daemon=True).start()
 
     # Material mapping actions
-
-    def _do_compute_emap(self):
-        if not self._require_img():
-            return
-        # Resolve 'auto' before reading model params — simple mode derives
-        # its bilinear split from this same field.
-        void_thresh = self._resolve_void_thresh()
-        if void_thresh is None:
-            QMessageBox.critical(self, "Bad parameters",
-                                 "Could not determine a void threshold.")
-            return
-        try:
-            model = self._model_var.get()
-            params = self._get_model_params()
-            agg_str = self._agg_thresh_var.get().strip()
-            agg_thresh = float(agg_str) if agg_str else None
-        except Exception as ex:
-            QMessageBox.critical(self, "Bad parameters", str(ex))
-            return
-        # gray + E_map float32 + labels uint8 + working copy ≈ 13 B/voxel.
-        if not self._ram_guard(13.0, "Computing a full-resolution E-Map"):
-            return
-        void_thresh = self._sane_void_thresh(void_thresh)
-        # Simple mode ties the bilinear split to the void threshold, so
-        # keep them consistent if the threshold was just auto-corrected.
-        if params.get("hu_thresh") is not None \
-                and not self._mat_advanced_check.isChecked():
-            params["hu_thresh"] = void_thresh
-
-        def _run():
-            try:
-                self._log_sep(f"E-Map Computation  model={model}")
-                self._set_status("Computing E-Map...", busy=True)
-                gray = self._get_gray()
-                hu_vol = self._hu_vol if self._hu_vol is not None else gray
-
-                E_map = compute_E_map(hu_vol, model, params, void_thresh)
-                labels = segment_phases(hu_vol, void_thresh, agg_thresh)
-                stats, porosity = phase_statistics(hu_vol, E_map, labels)
-
-                self._E_map = E_map
-                self._labels = labels
-                self._E_stats = stats
-                self._porosity = porosity
-
-                self._append_log(f"  E-Map shape : {E_map.shape}", 'teal')
-                self._append_log(
-                    f"  E range     : {float(E_map.min()):.2f}  –  "
-                    f"{float(E_map.max()):.2f} MPa", 'teal',
-                )
-                self._append_log(
-                    f"  E mean ± std: {float(E_map.mean()):.2f} ± "
-                    f"{float(E_map.std()):.2f} MPa", 'teal',
-                )
-                self._append_log(f"  Porosity    : {porosity * 100:.2f}%", 'teal')
-
-                for phase_name, s in stats.items():
-                    self._append_log(
-                        f"  {phase_name:20s}  vol={s['vol_frac'] * 100:.2f}%  "
-                        f"E={s['E_mean_MPa']:.1f} MPa", 'dim',
-                    )
-
-                def _upd():
-                    self._e_stat_labels["E_min"].set(f"{float(E_map.min()):.2f} MPa")
-                    self._e_stat_labels["E_max"].set(f"{float(E_map.max()):.2f} MPa")
-                    self._e_stat_labels["E_mean"].set(f"{float(E_map.mean()):.2f} MPa")
-                    self._e_stat_labels["E_std"].set(f"{float(E_map.std()):.2f} MPa")
-                    self._e_stat_labels["porosity"].set(f"{porosity * 100:.2f}%")
-
-                self.after(0, _upd)
-                self.after(0, self._update_emap_sliders)
-                self.after(50, self._refresh_emap_viewer)
-                self.after(50, self._show_tab, 'emap')
-                self._set_status("E-Map complete.", busy=False)
-            except Exception as ex:
-                self._append_log(f"  E-Map error: {ex}", 'err')
-                self._set_status("E-Map error.", busy=False)
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    # Exports
-
-    def _export_labels_nifti(self):
-        if self._labels is None:
-            QMessageBox.warning(self, "No labels", "Compute E-Map first.")
-            return
-        stem = self._path.name.replace('.nii.gz', '').replace('.nii', '')
-        out = self._ask_save_path(f"{stem}_phases.nii.gz")
-        if not out:
-            return
-
-        def _run():
-            try:
-                self._log_sep("Export Phase Labels NIfTI")
-                self._set_status("Saving labels...", busy=True)
-                hdr = self._img.header.copy()
-                hdr.set_data_dtype(np.uint8)
-                lbl_img = nib.Nifti1Image(self._labels, self._img.affine, hdr)
-                nib.save(lbl_img, str(out))
-                self._append_log(
-                    f"  Saved → {Path(out).name}  (0=void, 1=matrix, 2=aggregate)",
-                    'ok',
-                )
-                self._set_status("Labels saved.", busy=False)
-            except Exception as ex:
-                self._append_log(f"  {ex}", 'err')
-                self._set_status("Export error.", busy=False)
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _export_stats_csv(self):
-        if not self._E_stats:
-            QMessageBox.warning(self, "No stats", "Compute E-Map first.")
-            return
-        stem = self._path.name.replace('.nii.gz', '').replace('.nii', '')
-        out = self._ask_save_path(
-            f"{stem}_phase_stats.csv", ext=".csv",
-            ftypes=[("CSV", "*.csv"), ("All", "*.*")],
-        )
-        if not out:
-            return
-        try:
-            lines = [
-                "phase,voxels,vol_frac,HU_mean,HU_std,"
-                "E_mean_MPa,E_min_MPa,E_max_MPa,E_std_MPa",
-            ]
-            for phase, s in self._E_stats.items():
-                lines.append(
-                    f"{phase},{s['voxels']},{s['vol_frac']:.6f},"
-                    f"{s['HU_mean']:.4f},{s['HU_std']:.4f},"
-                    f"{s['E_mean_MPa']:.4f},{s['E_min_MPa']:.4f},"
-                    f"{s['E_max_MPa']:.4f},{s['E_std_MPa']:.4f}"
-                )
-            lines.append(f"porosity,,,{self._porosity:.6f},,,,")
-            with open(out, 'w') as f:
-                f.write("\n".join(lines))
-            self._append_log(f"  Stats CSV → {Path(out).name}", 'ok')
-        except Exception as ex:
-            self._append_log(f"  {ex}", 'err')
 
     # Background removal
 
@@ -957,8 +802,8 @@ class ActionsMixin:
     def _do_generate_report(self):
         """Bundle everything computed so far into a multi-page PDF.
 
-        Only the loaded volume is mandatory — sections for phases, voids
-        and the E-map are included when their data exists.
+        Only the loaded volume is required; the other sections are included
+        when their data exists.
         """
         if not self._require_img():
             return
@@ -972,12 +817,7 @@ class ActionsMixin:
             return
 
         # Snapshot GUI-owned state on the main thread.
-        model_name, model_params, void_thresh = "", {}, None
-        try:
-            model_name = self._model_var.get()
-            model_params = self._get_model_params()
-        except Exception:
-            pass
+        void_thresh = None
         try:
             void_thresh = float(self._void_thresh_var.get())
         except Exception:
@@ -996,8 +836,7 @@ class ActionsMixin:
                     if self.cancel_requested():
                         raise OperationCancelled()
                     self._set_status(f"Report: {st}...", busy=True)
-                # Figures never need full resolution — stream a strided
-                # preview so huge volumes work on small machines too.
+                # Figures never need full resolution; stream a strided preview.
                 max_prev = 150_000_000
                 avail = available_ram_mb()
                 if avail is not None:
@@ -1013,12 +852,12 @@ class ActionsMixin:
                     )
 
                 skipped = []
-                if self._labels is None:
-                    skipped.append("phases")
                 if getattr(self, '_void_result', None) is None:
                     skipped.append("voids")
-                if self._E_map is None:
-                    skipped.append("E-map")
+                if getattr(self, '_bh_fit', None) is None:
+                    skipped.append("beam hardening")
+                if getattr(self, '_pore_threshold_result', None) is None:
+                    skipped.append("pore threshold")
                 if skipped:
                     self._append_log(
                         f"  Not computed, skipping section(s): "
@@ -1033,16 +872,16 @@ class ActionsMixin:
                     dtype=str(self._img.get_data_dtype()),
                     gray=gray,
                     ww=self._ww, wc=self._wc,
-                    hu_cal=self._hu_cal or None,
-                    hu_vol=self._hu_vol,
-                    labels=self._labels,
-                    phase_stats=self._E_stats or None,
-                    porosity=self._porosity if self._E_stats else None,
                     void_result=getattr(self, '_void_result', None),
-                    E_map=self._E_map,
-                    model_name=model_name,
-                    model_params=model_params,
                     void_thresh=void_thresh,
+                    bin_result=getattr(self, '_bin_result', None),
+                    bh_fit=getattr(self, '_bh_fit', None),
+                    pore_threshold=getattr(self, '_pore_threshold_result',
+                                           None),
+                    pore_sensitivity=(
+                        (getattr(self, '_pore_threshold_info', None) or {})
+                        .get('porosity_sensitivity_pct')
+                    ),
                     progress=_stage,
                 )
                 self._append_log(

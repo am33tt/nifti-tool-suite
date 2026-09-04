@@ -1,7 +1,6 @@
-"""3-D viewer (VTK-backed, Slicer-style).
+"""3-D viewer backed by VTK.
 
-Embeds the VTK render window via QVTKRenderWindowInteractor so we can
-use the same pipeline 3D Slicer and ParaView use, with no Tcl/Tk.
+Embeds the VTK render window via QVTKRenderWindowInteractor.
 """
 
 from __future__ import annotations
@@ -63,7 +62,7 @@ class View3DMixin:
         base_font = QFont("Segoe UI", 9)
         BAR_H = 26  # unified pixel height for every toolbar control
 
-        # Mode radios (no heading — the two labels are self-explanatory).
+        # Mode radios
         mode_row = QWidget(ctrl)
         mr_lay = QHBoxLayout(mode_row)
         mr_lay.setContentsMargins(0, 0, 0, 0); mr_lay.setSpacing(6)
@@ -82,9 +81,8 @@ class View3DMixin:
             rb.setFont(base_font)
             rb.setStyleSheet(mode_rb_style)
             rb.setFixedHeight(BAR_H)
-            # Reserve room for the bold-weight label so toggling modes
-            # doesn't reflow the toolbar. +24 accounts for the indicator
-            # circle + its gap on most styles.
+            # Reserve room for the bold checked label so switching modes does
+            # not reflow the toolbar; 24 px covers the indicator and its gap.
             rb.setMinimumWidth(QFontMetrics(bold_font).horizontalAdvance(label) + 24)
             self._3d_mode_group.addButton(rb)
             self._3d_mode_radios[value] = rb
@@ -104,10 +102,8 @@ class View3DMixin:
         reset_btn.setFixedHeight(BAR_H)
         ctrl_lay.addWidget(reset_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # Camera-preset dropdown. Labels follow radiology convention
-        # (A=anterior, P=posterior, L/R=patient left/right, S=superior,
-        # I=inferior). "—" is a no-op placeholder so the combo shows a
-        # neutral state until the user actively picks a view.
+        # Camera presets. Labels follow radiology convention (A=anterior,
+        # P=posterior, L/R=patient left/right, S=superior, I=inferior).
         preset_lbl = QLabel("View:", ctrl)
         preset_lbl.setFont(base_font)
         preset_lbl.setStyleSheet(f"color: {TEXT_DIM}; background-color: transparent;")
@@ -118,7 +114,7 @@ class View3DMixin:
         self._3d_view_combo.setFixedHeight(BAR_H)
         self._3d_view_combo.setToolTip("Jump the camera to a preset angle.")
         for label, preset in (
-            ("— Select —", None),
+            ("Select view", None),
             ("Superior (top)",      "superior"),
             ("Inferior (bottom)",   "inferior"),
             ("Anterior (front)",    "anterior"),
@@ -154,7 +150,7 @@ class View3DMixin:
         self._3d_move_cb.setFixedHeight(BAR_H)
         self._3d_move_cb.setToolTip(
             "When on, click-drag translates the picked volume or STL "
-            "instead of rotating the view — useful for aligning an STL "
+            "instead of rotating the view, useful for aligning an STL "
             "overlay with the volume."
         )
         self._3d_move_cb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
@@ -199,8 +195,7 @@ class View3DMixin:
             title_row = QWidget(cf)
             title_lay = QHBoxLayout(title_row)
             title_lay.setContentsMargins(0, 0, 0, 0); title_lay.setSpacing(4)
-            # Per-axis visibility toggle — lets the user hide a plane and
-            # work with just one or two orthogonal slices at a time.
+            # Per-axis visibility toggle.
             vis_cb = QCheckBox(title_row)
             vis_cb.setChecked(True)
             vis_cb.setToolTip(f"Show / hide the {labels[ax]} slice plane.")
@@ -268,36 +263,46 @@ class View3DMixin:
 
         self._vtk_iren = rw.GetInteractor()
         self._vtk_iren.Initialize()
-        # Do NOT call ``Start()`` - the Qt event loop drives the interactor.
-        # NOTE: do not raise the interactor's DesiredUpdateRate here — it
-        # makes vtkSmartVolumeMapper drop to very coarse sampling and the
-        # volume renders as a washed-out box.
+        # Do not call ``Start()``: the Qt event loop drives the interactor.
+        # While the camera moves, vtkSmartVolumeMapper trades sample distance
+        # for speed to meet the update rate. The EndInteractionEvent observer
+        # below restores full quality once it stops.
+        self._vtk_iren.SetDesiredUpdateRate(15.0)
+        self._vtk_iren.SetStillUpdateRate(0.5)
+        self._vtk_iren.AddObserver(
+            'EndInteractionEvent', self._on_3d_interaction_end
+        )
 
-        # Two interactor styles: camera (rotate the scene) and actor (drag the
-        # grabbed prop). Default is camera. ``MotionFactor`` slows both down
-        # so fine analysis doesn't overshoot on small mouse moves.
+        # Two interactor styles: camera (rotate the scene) and actor (drag
+        # the grabbed prop), camera by default. ``MotionFactor`` damps both.
         self._style_camera = vtk.vtkInteractorStyleTrackballCamera()
         self._style_actor = vtk.vtkInteractorStyleTrackballActor()
-        # Only the camera style exposes ``SetMotionFactor``; the actor
-        # style translates by screen-pixel math and has no equivalent
-        # scalar knob. Guard so future VTK versions don't crash us either.
+        # Only the camera style exposes ``SetMotionFactor``; the actor style
+        # translates in screen pixels.
         for style in (self._style_camera, self._style_actor):
             if hasattr(style, 'SetMotionFactor'):
                 style.SetMotionFactor(6.0)
+            style.AddObserver(
+                'EndInteractionEvent', self._on_3d_interaction_end
+            )
         self._vtk_iren.SetInteractorStyle(self._style_camera)
+
+        self._setup_3d_lighting()
 
         self._vtk_image = None
         self._vtk_volume = None
         self._vtk_plane_actors = []
+        self._vtk_plane_borders = {}
+        self._vtk_outline_actor = None
+        self._vtk_stats = None
         self._vtk_built_for_id = None
         self._vtk_built_shape = None
         self._vtk_first_render_done = False
 
         self._3d_redraw_pending = None
 
-        # Orientation marker (bottom-left corner, rotates with camera) plus a
-        # cube-axes actor planted on the volume bounds so the user can read
-        # voxel extents straight off the viewport.
+        # Corner orientation marker plus a cube-axes actor on the volume
+        # bounds, reporting voxel extents in the viewport.
         self._cube_axes = None
         self._build_axes_indicators()
 
@@ -308,9 +313,8 @@ class View3DMixin:
 
     # STL overlays (boundary-condition preprocessing)
 
-    # Qualitative palette for distinguishing BC regions at a glance. Cycles
-    # when the user loads more STLs than colors — the user can still tell
-    # them apart from the list label.
+    # Qualitative palette for BC regions, cycled when more STLs than colors
+    # are loaded.
     _STL_PALETTE = (
         "#E5484D", "#2FA84F", "#3B82F6", "#F59E0B",
         "#8B5CF6", "#14B8A6", "#EC4899", "#06B6D4",
@@ -367,8 +371,7 @@ class View3DMixin:
             lambda on, e=entry: self._on_stl_visibility(e, on)
         )
 
-        # If no volume has framed the scene yet, reset the camera so the
-        # newly added STL is actually in view.
+        # With no volume framing the scene, reset the camera onto the STL.
         if self._vtk_image is None and len(self._stl_overlays) == 1:
             self._vtk_renderer.ResetCamera()
         self._vtk_widget.GetRenderWindow().Render()
@@ -430,16 +433,14 @@ class View3DMixin:
     def _on_3d_move_toggled(self, checked: bool):
         """Swap the interactor style between rotate-camera and translate-actor.
 
-        Trackball-actor mode is needed to drag an STL overlay into place on
-        top of the NIfTI volume when the two were authored in different
-        coordinate frames.
+        Actor mode drags an STL overlay into alignment with the volume when
+        the two were authored in different coordinate frames.
         """
         style = self._style_actor if checked else self._style_camera
         self._vtk_iren.SetInteractorStyle(style)
 
     def _focus_on_stl(self, entry: dict):
-        """Zoom the camera onto a single STL's bounds — handy when the
-        STL is tiny relative to the volume and otherwise invisible."""
+        """Zoom the camera onto a single STL's bounds."""
         actor = entry["actor"]
         b = actor.GetBounds()
         self._vtk_renderer.ResetCamera(b)
@@ -481,8 +482,7 @@ class View3DMixin:
         widget.SetOrientationMarker(marker)
         widget.SetInteractor(self._vtk_iren)
         widget.SetViewport(0.0, 0.0, 0.18, 0.22)
-        # Corner gizmo is always on — it only indicates orientation and
-        # takes negligible screen space. The "Axes" checkbox governs the
+        # The corner gizmo is always on. The "Axes" checkbox governs the
         # on-volume cube-axes actor, not this marker.
         widget.SetEnabled(1)
         widget.InteractiveOff()
@@ -498,9 +498,8 @@ class View3DMixin:
     def _ensure_cube_axes(self, shape, spacing):
         """Rebuild the cube-axes bounds and tick style for the current volume.
 
-        Ticks are in world-space units (voxel index * spacing), so a 400x400x600
-        volume at unit spacing reads 400 / 400 / 600 directly off the X / Y / Z
-        edges. Cheap: VTK just emits line + text primitives on the bounding box.
+        Ticks are in world units (voxel index * spacing), so a 400x400x600
+        volume at unit spacing reads 400, 400, 600 on the X, Y, Z edges.
         """
         import vtk
 
@@ -511,9 +510,9 @@ class View3DMixin:
         if self._cube_axes is None:
             axes = vtk.vtkCubeAxesActor()
             axes.SetCamera(self._vtk_renderer.GetActiveCamera())
-            # Titles are set to a single space rather than "" — an empty
-            # string makes the internal vtkVectorText fire "Text is not
-            # set!" every frame. Opacity=0 hides the space visually.
+            # Titles are a single space rather than "": an empty string makes
+            # the internal vtkVectorText report "Text is not set!" every
+            # frame. Opacity 0 hides the space.
             axes.SetXTitle(" "); axes.SetYTitle(" "); axes.SetZTitle(" ")
             axes.SetXUnits(""); axes.SetYUnits(""); axes.SetZUnits("")
             axes.SetFlyModeToStaticEdges()
@@ -523,8 +522,8 @@ class View3DMixin:
             axes.DrawXGridlinesOff()
             axes.DrawYGridlinesOff()
             axes.DrawZGridlinesOff()
-            # Try to switch labels to screen-space 2D text so SetFontSize
-            # has a predictable effect (VTK 8.x+ supports SetUse2DMode).
+            # Switch labels to screen-space 2D text so SetFontSize has a
+            # predictable effect (VTK 8.x and later support SetUse2DMode).
             try:
                 axes.SetUse2DMode(1)
             except AttributeError:
@@ -547,8 +546,7 @@ class View3DMixin:
             axes.GetXAxesLinesProperty().SetColor(*self._hex_to_rgb(AXIS_COLOR['X']))
             axes.GetYAxesLinesProperty().SetColor(*self._hex_to_rgb(AXIS_COLOR['Y']))
             axes.GetZAxesLinesProperty().SetColor(*self._hex_to_rgb(AXIS_COLOR['Z']))
-            # Tick marks + gridline properties: match the axis colors so the
-            # small ticks at each label stay visible against the volume.
+            # Gridline properties also govern the small ticks at each label.
             for tick_prop in (axes.GetXAxesGridlinesProperty(),
                               axes.GetYAxesGridlinesProperty(),
                               axes.GetZAxesGridlinesProperty()):
@@ -559,25 +557,24 @@ class View3DMixin:
         self._cube_axes.SetVisibility(self._3d_axes_cb.isChecked())
 
     def _on_3d_axes_toggled(self, checked: bool):
-        # Only toggles the on-volume cube-axes actor. The corner XYZ
-        # gizmo stays visible regardless (wired on in _build_axes_indicators).
+        # Toggles the on-volume cube-axes actor only; the corner gizmo stays.
         if self._cube_axes is not None:
             self._cube_axes.SetVisibility(bool(checked))
         if hasattr(self, '_vtk_widget'):
             self._vtk_widget.GetRenderWindow().Render()
 
     def _on_volume_materialised(self):
-        """The lazy proxy was promoted to a real ndarray.  Invalidate any
-        VTK image data we built from a previous (different) array."""
+        """The lazy proxy was promoted to a real ndarray; invalidate VTK
+        image data built from the previous array."""
         self._vtk_built_for_id = None
         self._vtk_built_shape = None
-        # If the user is currently looking at the 3-D tab, render now;
-        # otherwise wait until they switch to it (handled by app.py).
+        # Render now only if the 3-D tab is current; app.py handles the
+        # deferred case on tab switch.
         if hasattr(self, '_nb') and self._nb.currentWidget() is self._viewer3d_tab:
             self._do_3d_render()
 
     def maybe_auto_render_3d(self):
-        """Called by app.py when the user switches to the 3-D View tab."""
+        """Called by app.py when the 3-D View tab becomes current."""
         if not HAS_VTK or self._gray is None:
             return
         if not self._vtk_first_render_done:
@@ -608,8 +605,8 @@ class View3DMixin:
     def _on_3d_idx_entered(self, axis, edit):
         """Jump the 3-D slice slider to a typed index.
 
-        Only meaningful in "planes" mode, but we still sync the slider in
-        "volume" mode so the value sticks if the user later toggles modes.
+        Only visible in "planes" mode. The slider is synced in either mode so
+        the value survives a mode switch.
         """
         txt = edit.text().strip()
         if not txt:
@@ -648,8 +645,8 @@ class View3DMixin:
         self._vtk_widget.GetRenderWindow().Render()
 
     def _on_3d_view_preset_picked(self, index: int):
-        """Dropdown chose a preset — apply and snap back to the placeholder
-        so the user can re-pick the same view a second time."""
+        """Apply the chosen preset, then snap the combo back to the
+        placeholder so the same view can be picked again."""
         preset = self._3d_view_combo.itemData(index)
         if preset is None:
             return
@@ -661,16 +658,16 @@ class View3DMixin:
     def _set_3d_view_preset(self, preset: str):
         """Aim the camera at a canonical anatomical view.
 
-        Voxel index axes in this viewer are (X=sagittal, Y=coronal, Z=axial),
-        so patient-left = +X, anterior = +Y, superior = +Z in world space.
-        We pick a unit direction from focal-point → camera, then let VTK's
-        ``ResetCamera`` fit the distance so the whole volume stays visible.
+        Voxel index axes are (X=sagittal, Y=coronal, Z=axial), so in world
+        space patient-left is +X, anterior +Y and superior +Z. The preset
+        gives a unit direction from focal point to camera; ``ResetCamera``
+        fits the distance.
         """
         if not HAS_VTK:
             return
         ren = self._vtk_renderer
         bounds = ren.ComputeVisiblePropBounds()
-        # Empty scene — ComputeVisiblePropBounds returns an inverted range.
+        # Empty scene, ComputeVisiblePropBounds returns an inverted range.
         if bounds[0] > bounds[1]:
             return
         cx = 0.5 * (bounds[0] + bounds[1])
@@ -712,9 +709,10 @@ class View3DMixin:
     # render
 
     def _pick_downsample(self, shape) -> int:
-        """Pick an isotropic stride so the GPU copy fits in a fraction of the
-        free RAM budget. Returns 1 (no downsample) when we have headroom or
-        psutil isn't available. Cheap to call — just arithmetic."""
+        """Pick an isotropic stride so the GPU copy fits the free RAM budget.
+
+        Returns 1 (no downsample) when there is headroom or when psutil is
+        unavailable."""
         nx, ny, nz = shape
         voxels = float(nx) * float(ny) * float(nz)
         # float32 scalars on the GPU side
@@ -731,9 +729,8 @@ class View3DMixin:
     def _get_3d_array(self):
         """Return the 3-D array to upload, downsampled when RAM is tight.
 
-        For :class:`LazyGrayVolume` we read a strided slice straight from
-        the mmap-backed proxy, so we never pay for the full float32 copy
-        when the user is working with 5-12 GiB files on a crowded box.
+        For :class:`LazyGrayVolume` the strided read comes from the
+        mmap-backed proxy, avoiding a float32 copy of a multi-GiB file.
         """
         if self._gray is None:
             return None, 1
@@ -749,7 +746,6 @@ class View3DMixin:
             self._set_status(
                 f"Large volume - loading at 1/{ds} for 3-D...", busy=True,
             )
-            # Strided read from the lazy proxy -- no full materialisation.
             arr = np.asarray(self._gray[::ds, ::ds, ::ds], dtype=np.float32)
             return arr, ds
 
@@ -781,7 +777,7 @@ class View3DMixin:
             if mode == "volume":
                 self._build_volume_actor(arr)
             else:
-                self._build_plane_actors(arr.shape)
+                self._build_plane_actors(arr)
 
             if not self._vtk_first_render_done:
                 self._vtk_renderer.ResetCamera()
@@ -800,15 +796,15 @@ class View3DMixin:
 
         nx, ny, nz = arr.shape
         spacing = self._img.header.get_zooms() if self._img is not None else (1, 1, 1)
-        # Scale spacing by the downsample factor so the cube-axes bounds
-        # stay in original-world units (voxel index * original spacing).
+        # Scale spacing by the downsample factor so the cube-axes bounds stay
+        # in original world units (voxel index * original spacing).
         sx = float(spacing[0]) * float(downsample)
         sy = float(spacing[1]) * float(downsample)
         sz = float(spacing[2]) * float(downsample)
 
         # Single float32 Fortran-ordered buffer handed to VTK with
-        # deep=False — saves a ~4*nx*ny*nz byte copy. The Python
-        # reference is retained so the buffer outlives the VTK array.
+        # deep=False, saving a 4*nx*ny*nz byte copy. The Python reference is
+        # kept so the buffer outlives the VTK array.
         flat = np.asarray(arr, dtype=np.float32, order='F').ravel(order='F')
         self._vtk_flat_buffer = flat
 
@@ -827,42 +823,96 @@ class View3DMixin:
         self._vtk_renderer.RemoveAllViewProps()
         self._vtk_volume = None
         self._vtk_plane_actors = []
+        self._vtk_plane_borders = {}
+        self._vtk_outline_actor = None
         self._vtk_first_render_done = False
 
         self._ensure_cube_axes((nx, ny, nz), (sx, sy, sz))
         self._vtk_renderer.AddActor(self._cube_axes)
 
-        # Re-attach STL overlays wiped by RemoveAllViewProps above so the
-        # user's BC regions survive a volume reload.
+        # Re-attach STL overlays wiped by RemoveAllViewProps above.
         for entry in getattr(self, '_stl_overlays', ()):
             self._vtk_renderer.AddActor(entry["actor"])
 
+    def _volume_stats(self, arr):
+        """Cached (auto_lo, auto_hi, min, max) for the uploaded array.
+
+        Sampled and cached per array; a full min/max scan per render costs
+        seconds on a multi-GiB volume.
+        """
+        key = (id(arr), tuple(arr.shape))
+        cached = getattr(self, '_vtk_stats', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        ww, wc = auto_window(arr)
+        flat = np.asarray(arr).reshape(-1)
+        sample = flat[:: max(1, flat.size // 500_000)]
+        stats = (wc - ww / 2.0, wc + ww / 2.0,
+                 float(sample.min()), float(sample.max()))
+        self._vtk_stats = (key, stats)
+        return stats
+
     def _window_bounds(self, arr):
+        """Display window: the user's W/C when set, else the automatic one.
+
+        Shares :func:`auto_window` with the 2-D viewer so a volume looks the
+        same in both and a min-max range cannot flatten the specimen.
+        """
+        p_lo, p_hi, amin, amax = self._volume_stats(arr)
         ww, wc = self._ww, self._wc
         if ww is None or wc is None:
-            ww, wc = auto_window(arr)
-        lo = wc - ww / 2.0
-        hi = wc + ww / 2.0
-        # Safety net: if the window misses the data range (stale W/C from
-        # another file, or a preset that doesn't match this scan), every
-        # voxel gets opacity 0 and the volume "disappears". Fall back to
-        # an automatic window computed from the actual array.
-        amin, amax = float(arr.min()), float(arr.max())
-        if hi <= amin or lo >= amax:
-            ww, wc = auto_window(arr)
-            lo = wc - ww / 2.0
-            hi = wc + ww / 2.0
+            lo, hi = p_lo, p_hi
+        else:
+            lo, hi = wc - ww / 2.0, wc + ww / 2.0
+            # A stale window from another file maps every voxel to one end of
+            # the ramp, hiding the volume.
+            if hi <= amin or lo >= amax:
+                lo, hi = p_lo, p_hi
         if hi <= lo:
             hi = lo + 1.0
         return lo, hi
+
+    def _setup_3d_lighting(self):
+        """Key plus fill camera light, for readable shading under rotation."""
+        import vtk
+        self._vtk_renderer.RemoveAllLights()
+        for position, intensity in (((0.6, 0.6, 1.0), 1.0),
+                                    ((-0.7, -0.2, 0.6), 0.45)):
+            light = vtk.vtkLight()
+            light.SetLightTypeToCameraLight()
+            light.SetPosition(*position)
+            light.SetFocalPoint(0.0, 0.0, 0.0)
+            light.SetIntensity(intensity)
+            self._vtk_renderer.AddLight(light)
+
+    def _on_3d_interaction_end(self, *_args):
+        """Re-render at full sampling once the camera stops moving."""
+        if not hasattr(self, '_vtk_widget'):
+            return
+        try:
+            rw = self._vtk_widget.GetRenderWindow()
+            rw.SetDesiredUpdateRate(0.001)
+            rw.Render()
+        except Exception:
+            pass
+
+    def _clear_plane_props(self):
+        """Remove the slice planes and their outlines from the renderer."""
+        for actor in getattr(self, '_vtk_plane_actors', ()):
+            self._vtk_renderer.RemoveActor(actor)
+        for _src, border in getattr(self, '_vtk_plane_borders', {}).values():
+            self._vtk_renderer.RemoveActor(border)
+        if getattr(self, '_vtk_outline_actor', None) is not None:
+            self._vtk_renderer.RemoveActor(self._vtk_outline_actor)
+        self._vtk_plane_actors = []
+        self._vtk_plane_borders = {}
+        self._vtk_outline_actor = None
 
     # volume rendering
 
     def _build_volume_actor(self, arr):
         import vtk
-        for actor in self._vtk_plane_actors:
-            self._vtk_renderer.RemoveActor(actor)
-        self._vtk_plane_actors = []
+        self._clear_plane_props()
 
         lo, hi = self._window_bounds(arr)
 
@@ -875,14 +925,23 @@ class View3DMixin:
             ctf = vtk.vtkColorTransferFunction()
             otf = vtk.vtkPiecewiseFunction()
 
+            gof = vtk.vtkPiecewiseFunction()
+
             prop = vtk.vtkVolumeProperty()
             prop.SetColor(ctf)
             prop.SetScalarOpacity(otf)
+            prop.SetGradientOpacity(gof)
             prop.SetInterpolationTypeToLinear()
             prop.ShadeOn()
-            prop.SetAmbient(0.35)
-            prop.SetDiffuse(0.7)
-            prop.SetSpecular(0.2)
+            prop.SetAmbient(0.20)
+            prop.SetDiffuse(0.85)
+            prop.SetSpecular(0.35)
+            prop.SetSpecularPower(24.0)
+            # Opacity accumulates per world-distance unit. The default of
+            # 1.0 mm is much larger than a CT voxel, which makes an
+            # unadjusted volume look like fog.
+            spacing = self._vtk_image.GetSpacing()
+            prop.SetScalarOpacityUnitDistance(float(min(spacing)))
 
             vol = vtk.vtkVolume()
             vol.SetMapper(mapper)
@@ -891,21 +950,37 @@ class View3DMixin:
             self._vtk_volume = vol
             self._vtk_volume_ctf = ctf
             self._vtk_volume_otf = otf
+            self._vtk_volume_gof = gof
             self._vtk_renderer.AddVolume(vol)
         else:
             ctf = self._vtk_volume_ctf
             otf = self._vtk_volume_otf
+            gof = self._vtk_volume_gof
 
+        span = hi - lo
+
+        # Warm grey ramp, so dense material reads as a solid surface rather
+        # than a grey cloud.
         ctf.RemoveAllPoints()
-        ctf.AddRGBPoint(lo,                       0.0, 0.0, 0.0)
-        ctf.AddRGBPoint(lo + (hi - lo) * 0.5,     0.55, 0.55, 0.55)
-        ctf.AddRGBPoint(hi,                       1.0, 1.0, 1.0)
+        ctf.AddRGBPoint(lo,                  0.10, 0.10, 0.12)
+        ctf.AddRGBPoint(lo + span * 0.35,    0.45, 0.42, 0.38)
+        ctf.AddRGBPoint(lo + span * 0.60,    0.82, 0.76, 0.66)
+        ctf.AddRGBPoint(lo + span * 0.85,    0.96, 0.93, 0.86)
+        ctf.AddRGBPoint(hi,                  1.00, 0.99, 0.95)
 
         otf.RemoveAllPoints()
-        otf.AddPoint(lo,                          0.00)
-        otf.AddPoint(lo + (hi - lo) * 0.25,       0.00)
-        otf.AddPoint(lo + (hi - lo) * 0.55,       0.30)
-        otf.AddPoint(hi,                          0.85)
+        otf.AddPoint(lo,                     0.00)
+        otf.AddPoint(lo + span * 0.20,       0.00)
+        otf.AddPoint(lo + span * 0.45,       0.08)
+        otf.AddPoint(lo + span * 0.70,       0.45)
+        otf.AddPoint(hi,                     0.90)
+
+        # Gradient opacity suppresses the homogeneous interior and keeps
+        # material boundaries, giving the surface relief.
+        gof.RemoveAllPoints()
+        gof.AddPoint(0.0,                    0.00)
+        gof.AddPoint(span * 0.02,            0.30)
+        gof.AddPoint(span * 0.10,            1.00)
 
     # slice-plane mode
 
@@ -922,14 +997,14 @@ class View3DMixin:
             self._3d_idx[ax] = mid
             self._3d_idx_widgets[ax].setText(str(mid))
 
-    def _build_plane_actors(self, shape):
+    def _build_plane_actors(self, arr):
         import vtk
 
         if self._vtk_volume is not None:
             self._vtk_renderer.RemoveVolume(self._vtk_volume)
             self._vtk_volume = None
 
-        nx, ny, nz = shape
+        lo, hi = self._window_bounds(arr)
         if not self._vtk_plane_actors:
             self._vtk_plane_actors = []
             for axis in ('X', 'Y', 'Z'):
@@ -938,15 +1013,61 @@ class View3DMixin:
                 self._vtk_renderer.AddActor(actor)
                 actor.axis_letter = axis
                 self._vtk_plane_actors.append(actor)
+                self._add_plane_border(axis)
+            self._add_volume_outline()
+
+        for actor in self._vtk_plane_actors:
+            prop = actor.GetProperty()
+            # vtkImageActor maps scalars through its own window/level, which
+            # defaults to 255/127.5. CT scalars run to five figures, so
+            # without this every voxel saturates and the planes render white.
+            prop.SetColorWindow(hi - lo)
+            prop.SetColorLevel((hi + lo) / 2.0)
+            prop.SetInterpolationTypeToLinear()
+            # Slices carry their own intensities, so scene lights must not
+            # tint them as the camera moves.
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
 
         for axis, actor in zip(('X', 'Y', 'Z'), self._vtk_plane_actors):
             self._update_plane_position(axis, self._3d_idx[axis], render=False)
             actor.SetVisibility(1 if self._3d_plane_visible.get(axis, True) else 0)
 
+    def _add_plane_border(self, axis):
+        """Outline one slice plane in its tri-planar axis colour."""
+        import vtk
+        source = vtk.vtkOutlineSource()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        border = vtk.vtkActor()
+        border.SetMapper(mapper)
+        rgb = self._hex_to_rgb(AXIS_COLOR[axis])
+        border.GetProperty().SetColor(*rgb)
+        border.GetProperty().SetLineWidth(2.0)
+        border.GetProperty().SetLighting(False)
+        self._vtk_renderer.AddActor(border)
+        self._vtk_plane_borders[axis] = (source, border)
+
+    def _add_volume_outline(self):
+        """Draw the volume's bounding box so empty space stays legible."""
+        import vtk
+        outline = vtk.vtkOutlineFilter()
+        outline.SetInputData(self._vtk_image)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(outline.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.45, 0.42, 0.38)
+        actor.GetProperty().SetLineWidth(1.2)
+        actor.GetProperty().SetLighting(False)
+        self._vtk_renderer.AddActor(actor)
+        self._vtk_outline_actor = actor
+
     def _on_3d_plane_visibility_toggled(self, axis: str, visible: bool):
-        """User toggled a slice-plane tick. Hide/show the matching VTK
-        actor — only meaningful in Sliced mode, but we record the state
-        either way so switching modes honors it.
+        """Show or hide the matching VTK plane actor.
+
+        Only visible in Sliced mode. The state is recorded in either mode so
+        a mode switch honours it.
         """
         self._3d_plane_visible[axis] = bool(visible)
         actor = next(
@@ -957,6 +1078,9 @@ class View3DMixin:
         if actor is None:
             return
         actor.SetVisibility(1 if visible else 0)
+        border = getattr(self, '_vtk_plane_borders', {}).get(axis)
+        if border is not None:
+            border[1].SetVisibility(1 if visible else 0)
         if hasattr(self, '_vtk_widget'):
             self._vtk_widget.GetRenderWindow().Render()
 
@@ -977,6 +1101,10 @@ class View3DMixin:
             actor.SetDisplayExtent(0, nx - 1, idx, idx, 0, nz - 1)
         else:
             actor.SetDisplayExtent(0, nx - 1, 0, ny - 1, idx, idx)
+        border = getattr(self, '_vtk_plane_borders', {}).get(axis)
+        if border is not None:
+            border[0].SetBounds(actor.GetBounds())
+            border[1].SetVisibility(actor.GetVisibility())
         if render:
             self._vtk_widget.GetRenderWindow().Render()
 

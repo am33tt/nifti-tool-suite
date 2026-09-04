@@ -1,41 +1,36 @@
 """Left-hand controls panel.
 
-Everything the user adjusts before running an action lives here:
-viewer settings, intensity stats, material model,
-reorientation, angle rotation, crop ROI.
+Holds the settings adjusted before running an action: viewer settings,
+intensity statistics, the void/pore threshold, binarisation, beam-hardening
+correction, background removal, reorientation, rotation and the crop
+region.
 
 Each tool is built into its own :class:`_ToolPanel` and stored in
-``self._tool_panels``; the main window stacks them and exposes one at
-a time via the top navigation bar.
+``self._tool_panels``. The main window stacks them and shows one at a time
+via the top navigation bar.
 """
 
 from __future__ import annotations
 
-import json
 import threading
-from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QRadioButton, QVBoxLayout,
-    QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPlainTextEdit, QRadioButton, QSizePolicy,
+    QVBoxLayout, QWidget,
 )
 
-from ..config import (
-    ACCENT, BG, BORDER, CMAPS, CT_PRESETS, ENTRY_BG, MATERIAL_PRESETS, PANEL,
-    TEAL, TEXT, TEXT_DIM,
-)
+from ..config import ACCENT, BORDER, CMAPS, CT_PRESETS, TEXT, TEXT_DIM
 from .widgets import IntRangeRow, styled_btn, styled_entry
 
 
 class _ToolPanel(QWidget):
     """One tool page shown in the left stacked panel.
 
-    Exposes ``.content`` / ``.content_layout`` so the existing section
-    body code (originally written for ``CollapsibleSection``) keeps
-    working unchanged.
+    Exposes ``.content`` and ``.content_layout``, the container the section
+    body appends its rows to.
     """
 
     def __init__(self, title: str, parent=None):
@@ -68,8 +63,8 @@ class _ToolPanel(QWidget):
 # small shims
 
 class _WidgetVar:
-    """Shim that lets call-sites use ``.get()`` / ``.set()`` on a QLineEdit
-    or QComboBox or QCheckBox (like ``tk.StringVar`` / ``tk.BooleanVar``).
+    """Gives QLineEdit, QComboBox and QCheckBox the ``.get()`` and ``.set()``
+    interface the call sites expect from ``tk.StringVar``.
     """
 
     def __init__(self, widget):
@@ -105,17 +100,56 @@ def _small_label(text, parent=None, *, width=None, color=TEXT_DIM, bold=False):
     q.setStyleSheet(f"color: {color}; background-color: transparent;")
     if width is not None:
         q.setFixedWidth(width)
+    else:
+        # An unwrapped label reports its whole text as a minimum width, which
+        # the row and then the tool column inherit, pushing the panels past
+        # the edge of the pane. Wrapping makes the minimum one word wide, and
+        # heightForWidth lets the layout add the rows the label needs.
+        _make_wrappable(q)
     return q
+
+
+def _make_wrappable(label: QLabel, minimum: int = 40) -> QLabel:
+    """Let *label* wrap and shrink instead of widening its column."""
+    label.setWordWrap(True)
+    policy = label.sizePolicy()
+    policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+    policy.setVerticalPolicy(QSizePolicy.Policy.Minimum)
+    policy.setHeightForWidth(True)
+    label.setSizePolicy(policy)
+    label.setMinimumWidth(minimum)
+    return label
+
+
+def _hint(text, parent):
+    """Full-width wrapped note, for the line under a control row."""
+    q = QLabel(text, parent)
+    q.setFont(QFont("Segoe UI", 8))
+    q.setStyleSheet(f"color: {TEXT_DIM}; background-color: transparent;")
+    q.setContentsMargins(0, 0, 0, 4)
+    return _make_wrappable(q)
+
+
+def _field_row(parent, label, widget, *, label_width=92):
+    """``label  [widget]`` row that never forces the column wider."""
+    row = QWidget(parent)
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 2, 0, 2)
+    lay.setSpacing(4)
+    lay.addWidget(_small_label(label, row, width=label_width))
+    lay.addWidget(widget)
+    lay.addStretch(1)
+    return row
 
 
 class ControlsMixin:
     """Adds ``_build_controls`` and all its helpers to :class:`NiftiApp`."""
 
     def _build_controls(self):
-        """Populate ``self._tool_panels`` - one :class:`_ToolPanel` per tool.
+        """Populate ``self._tool_panels``, one :class:`_ToolPanel` per tool.
 
-        The main window owns a :class:`QStackedWidget` that swaps these in
-        as the user clicks the top navigation buttons.
+        The main window owns a :class:`QStackedWidget` that swaps these in as
+        the user clicks the top navigation buttons.
         """
         self._tool_panels: dict[str, _ToolPanel] = {}
 
@@ -204,195 +238,56 @@ class ControlsMixin:
             sec.content_layout.addWidget(row)
             self._stat_labels[key] = _LabelVar(lv)
 
-        # Material mapping — simple by default, everything scientific
-        # (models, presets, HU calibration) lives behind one Advanced
-        # toggle so the common no-phantom workflow is a single panel.
-        sec = _ToolPanel("⚙️  Material / Stiffness  →  E [MPa]")
-        self._tool_panels["material"] = sec
+        # Void / pore threshold
+        sec = _ToolPanel("\u25d1  Threshold")
+        self._tool_panels["threshold"] = sec
 
-        intro = _small_label(
-            "Below the threshold = void/pores, above = solid with one "
-            "stiffness. Works directly on the scanner intensities. Leave "
-            "the threshold on 'auto' and it is found automatically (Otsu).",
-            sec.content,
-        )
-        intro.setWordWrap(True)
-        sec.content_layout.addWidget(intro)
+        sec.content_layout.addWidget(_hint(
+            "One grey level separates pore/void from solid material. Every "
+            "measurement downstream \u2014 porosity, background removal, "
+            "binarisation \u2014 reads it from here, so they always agree "
+            "with each other.", sec.content,
+        ))
 
-        # Void/solid threshold (+ automatic Otsu pick)
-        vt_row = QWidget(sec.content); vrl = QHBoxLayout(vt_row)
-        vrl.setContentsMargins(0, 2, 0, 2); vrl.setSpacing(4)
-        vrl.addWidget(_small_label("Void thresh", vt_row, width=90))
-        self._void_thresh_widget = styled_entry(vt_row, width=8)
+        self._void_thresh_widget = styled_entry(sec.content, width=9)
         self._void_thresh_widget.setText("auto")
         self._void_thresh_widget.setToolTip(
-            "'auto' = find the void/solid split automatically (Otsu).\n"
-            "Or type an intensity value."
+            "'auto' finds the void/solid split with Otsu on a subsample.\n"
+            "Or type a grey value directly."
         )
-        vrl.addWidget(self._void_thresh_widget)
-        vrl.addWidget(_small_label("intensity", vt_row))
-        vrl.addWidget(styled_btn(vt_row, "Auto (Otsu)",
-                                 self._auto_void_thresh, small=True))
-        vrl.addStretch(1)
-        sec.content_layout.addWidget(vt_row)
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Threshold", self._void_thresh_widget))
         self._void_thresh_var = _WidgetVar(self._void_thresh_widget)
 
-        # Solid stiffness
-        es_row = QWidget(sec.content); esl = QHBoxLayout(es_row)
-        esl.setContentsMargins(0, 2, 0, 2); esl.setSpacing(4)
-        esl.addWidget(_small_label("E solid", es_row, width=90))
-        self._simple_E_widget = styled_entry(es_row, width=10)
-        self._simple_E_widget.setText("30000.0")
-        esl.addWidget(self._simple_E_widget)
-        esl.addWidget(_small_label("MPa   (concrete paste ≈ 30 GPa)", es_row))
-        esl.addStretch(1)
-        sec.content_layout.addWidget(es_row)
-        self._simple_E_var = _WidgetVar(self._simple_E_widget)
+        sec.content_layout.addWidget(_hint(
+            "'auto' = Otsu on a subsample of the volume. The Porosity tab's "
+            "\u25b6 Auto Threshold measures it properly from the specimen "
+            "interior and writes the result back here.", sec.content,
+        ))
 
         sec.content_layout.addWidget(
-            styled_btn(sec.content, "▶  Compute E-Map",
-                       self._do_compute_emap, accent=True, small=True),
+            styled_btn(sec.content, "Auto (Otsu)", self._auto_void_thresh,
+                       small=True),
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
-
-        # E stats
-        self._e_stat_labels: dict = {}
-        for key in ("E_min", "E_max", "E_mean", "E_std", "porosity"):
-            row = QWidget(sec.content); rl = QHBoxLayout(row)
-            rl.setContentsMargins(0, 1, 0, 1); rl.setSpacing(4)
-            rl.addWidget(_small_label(f"{key.replace('_', ' '):>10}:", row,
-                                      width=80, color=TEXT_DIM))
-            lv = QLabel("--", row)
-            lv.setFont(QFont("Consolas", 10))
-            lv.setStyleSheet(f"color: {TEAL}; background-color: transparent;")
-            rl.addWidget(lv); rl.addStretch(1)
-            sec.content_layout.addWidget(row)
-            self._e_stat_labels[key] = _LabelVar(lv)
-
-        # ── Advanced (collapsed by default) ──────────────────────────
-        self._mat_advanced_check = QCheckBox(
-            "Advanced  (material models, presets)",
-            sec.content,
-        )
-        self._mat_advanced_check.setFont(QFont("Segoe UI", 9))
-        self._mat_advanced_check.setStyleSheet(
-            f"color: {TEXT}; background-color: transparent;"
-        )
-        sec.content_layout.addWidget(self._mat_advanced_check)
-
-        adv = QWidget(sec.content)
-        adv_lay = QVBoxLayout(adv)
-        adv_lay.setContentsMargins(0, 4, 0, 0)
-        adv_lay.setSpacing(3)
-        adv.setVisible(False)
-        sec.content_layout.addWidget(adv)
-        self._mat_advanced_frame = adv
-
-        pr_row = QWidget(adv); prl = QHBoxLayout(pr_row)
-        prl.setContentsMargins(0, 2, 0, 2); prl.setSpacing(4)
-        prl.addWidget(_small_label("Preset", pr_row, width=70))
-        self._mat_preset_widget = QComboBox(pr_row)
-        self._mat_preset_widget.addItems(list(MATERIAL_PRESETS.keys()))
-        self._mat_preset_widget.setCurrentText("AM Concrete (default)")
-        self._mat_preset_widget.setFixedWidth(210)
-        prl.addWidget(self._mat_preset_widget); prl.addStretch(1)
-        adv_lay.addWidget(pr_row)
-        self._mat_preset_var = _WidgetVar(self._mat_preset_widget)
-        self._mat_preset_widget.currentTextChanged.connect(
-            lambda _t: self._apply_material_preset()
-        )
-
-        mod_row = QWidget(adv); mrl = QHBoxLayout(mod_row)
-        mrl.setContentsMargins(0, 2, 0, 2); mrl.setSpacing(4)
-        mrl.addWidget(_small_label("Model", mod_row, width=70))
-        self._model_group = QButtonGroup(mod_row)
-        self._model_radios: dict = {}
-        for m in ("linear", "power", "bilinear", "table"):
-            rb = QRadioButton(m, mod_row)
-            rb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
-            rb.setFont(QFont("Segoe UI", 9))
-            self._model_group.addButton(rb)
-            self._model_radios[m] = rb
-            mrl.addWidget(rb)
-        self._model_radios["bilinear"].setChecked(True)
-        mrl.addStretch(1)
-        adv_lay.addWidget(mod_row)
-
-        # ``_model_var`` is a tk-compat shim reading from the radio group.
-        self._model_var = _RadioVar(self._model_radios, default="bilinear")
-        for rb in self._model_radios.values():
-            rb.toggled.connect(self._on_model_toggled)
-
-        adv_note = _small_label(
-            "linear / power / table map the voxel intensity to a "
-            "spatially varying stiffness E.", adv,
-        )
-        adv_note.setWordWrap(True)
-        adv_lay.addWidget(adv_note)
-
-        self._model_params_frame = QWidget(adv)
-        self._model_params_layout = QVBoxLayout(self._model_params_frame)
-        self._model_params_layout.setContentsMargins(0, 2, 0, 2)
-        self._model_params_layout.setSpacing(2)
-        self._model_params_frame.setStyleSheet(
-            f"background-color: {PANEL};"
-        )
-        adv_lay.addWidget(self._model_params_frame)
-        self._model_param_vars: dict = {}
-        self._model_param_widgets: dict = {}
-
-        ag_row = QWidget(adv); arl = QHBoxLayout(ag_row)
-        arl.setContentsMargins(0, 2, 0, 2); arl.setSpacing(4)
-        arl.addWidget(_small_label("Aggreg. thresh", ag_row, width=90))
-        self._agg_thresh_widget = styled_entry(ag_row, width=8)
-        arl.addWidget(self._agg_thresh_widget)
-        arl.addWidget(_small_label("intensity  (blank = 2-phase)", ag_row))
-        arl.addStretch(1)
-        adv_lay.addWidget(ag_row)
-        self._agg_thresh_var = _WidgetVar(self._agg_thresh_widget)
-
-        self._mat_note_label = QLabel("", adv)
-        self._mat_note_label.setWordWrap(True)
-        self._mat_note_label.setFont(QFont("Segoe UI", 9))
-        self._mat_note_label.setStyleSheet(
-            f"color: {TEXT_DIM}; background-color: transparent;"
-        )
-        adv_lay.addWidget(self._mat_note_label)
-        self._mat_note_var = _LabelVar(self._mat_note_label)
-
-        adv_lay.addWidget(
-            styled_btn(adv, "Load Preset JSON...",
-                       self._load_preset_json, small=True),
-            alignment=Qt.AlignmentFlag.AlignLeft,
-        )
-
-        self._mat_advanced_check.toggled.connect(self._on_advanced_toggled)
-
-        self._update_model_panel()
-        self._apply_material_preset()
 
         # Background removal
         sec = _ToolPanel("🧹 Background Removal")
         self._tool_panels["background"] = sec
 
-        bg_info = _small_label(
-            "Detects the specimen automatically (largest connected solid "
-            "region — internal pores are kept), removes everything outside "
-            "it, and saves a clean new NIfTI file. Uses the same automatic "
-            "threshold as the Material panel.", sec.content,
-        )
-        bg_info.setWordWrap(True)
-        sec.content_layout.addWidget(bg_info)
+        sec.content_layout.addWidget(_hint(
+            "Finds the specimen as the largest connected solid region with "
+            "its internal pores kept, removes everything outside it and "
+            "saves a clean new NIfTI. Uses the grey level from the Threshold "
+            "panel.", sec.content,
+        ))
 
-        bm_row = QWidget(sec.content); bml = QHBoxLayout(bm_row)
-        bml.setContentsMargins(0, 2, 0, 2); bml.setSpacing(4)
-        bml.addWidget(_small_label("Margin", bm_row, width=90))
-        self._bg_margin_widget = styled_entry(bm_row, width=6)
+        self._bg_margin_widget = styled_entry(sec.content, width=6)
         self._bg_margin_widget.setText("10")
-        bml.addWidget(self._bg_margin_widget)
-        bml.addWidget(_small_label("voxels kept around the specimen", bm_row))
-        bml.addStretch(1)
-        sec.content_layout.addWidget(bm_row)
+        self._bg_margin_widget.setToolTip(
+            "Voxels of padding kept around the specimen bounding box.")
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Margin", self._bg_margin_widget))
 
         self._bg_crop_widget = QCheckBox(
             "Crop to specimen bounding box", sec.content,
@@ -410,23 +305,228 @@ class ControlsMixin:
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
+        # Binarisation for the finite cell method
+        sec = _ToolPanel("\u25a3  Binarise")
+        self._tool_panels["binarize"] = sec
+
+        sec.content_layout.addWidget(_hint(
+            "Writes the indicator field the finite cell method integrates "
+            "against: uint8, 1 where material, 0 where pore or background. "
+            "The threshold is measured inside the specimen envelope, so air "
+            "around the part cannot drag it. Results appear in the Binarise "
+            "tab.", sec.content,
+        ))
+
+        self._bin_method_combo = QComboBox(sec.content)
+        self._bin_method_combo.addItems(
+            ["otsu", "isodata", "valley", "sigma", "triangle", "manual"])
+        self._bin_method_combo.setToolTip(
+            "otsu      between-class variance, refined by isodata "
+            "(the same rule the porosity uses, so the numbers agree)\n"
+            "isodata   Ridler-Calvard iterative intermeans\n"
+            "valley    minimum of the smoothed histogram on the material "
+            "peak's lower flank\n"
+            "sigma     material mode minus k standard deviations; robust "
+            "when the pore peak is too small for Otsu\n"
+            "triangle  Zack's rule; suits a dominant material peak with a "
+            "long tail\n"
+            "manual    the value typed below"
+        )
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Method", self._bin_method_combo))
+
+        self._bin_k_widget = styled_entry(sec.content, width=6)
+        self._bin_k_widget.setText("3.0")
+        self._bin_k_widget.setToolTip("k for the sigma method.")
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "sigma k", self._bin_k_widget))
+
+        self._bin_manual_widget = styled_entry(sec.content, width=10)
+        self._bin_manual_widget.setPlaceholderText("grey value")
+        self._bin_manual_widget.setToolTip(
+            "Threshold used by the manual method.")
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Manual value", self._bin_manual_widget))
+
+        self._bin_smooth_widget = styled_entry(sec.content, width=6)
+        self._bin_smooth_widget.setText("0")
+        self._bin_smooth_widget.setToolTip(
+            "Gaussian sigma in voxels applied before thresholding. Smooths "
+            "speckle, but also rounds thin features \u2014 keep it below "
+            "one voxel unless the scan is very noisy."
+        )
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Smooth", self._bin_smooth_widget))
+
+        self._bin_downsample_widget = styled_entry(sec.content, width=6)
+        self._bin_downsample_widget.setText("1")
+        self._bin_downsample_widget.setToolTip(
+            "Block-average by this factor before writing. A block becomes "
+            "material when at least half of it is, which preserves the "
+            "material fraction far better than taking every n-th voxel."
+        )
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Downsample", self._bin_downsample_widget))
+
+        self._bin_minvoid_widget = styled_entry(sec.content, width=6)
+        self._bin_minvoid_widget.setText("0")
+        self._bin_minvoid_widget.setToolTip(
+            "Fill pores smaller than this many voxels. 0 keeps every pore.")
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Min void", self._bin_minvoid_widget))
+
+        self._bin_largest_check = QCheckBox(
+            "Keep only the largest body", sec.content)
+        self._bin_largest_check.setFont(QFont("Segoe UI", 9))
+        self._bin_largest_check.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;")
+        self._bin_largest_check.setToolTip(
+            "Material not connected to the main body is an unconstrained "
+            "rigid body in the analysis. The islands are counted either way."
+        )
+        sec.content_layout.addWidget(self._bin_largest_check)
+
+        self._bin_refine_check = QCheckBox(
+            "Refine inside the specimen", sec.content)
+        self._bin_refine_check.setChecked(True)
+        self._bin_refine_check.setFont(QFont("Segoe UI", 9))
+        self._bin_refine_check.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;")
+        self._bin_refine_check.setToolTip(
+            "Recompute the threshold using only voxels inside the specimen "
+            "envelope, so surrounding air cannot pull it away from the "
+            "pore/material boundary."
+        )
+        sec.content_layout.addWidget(self._bin_refine_check)
+
+        bin_btns = QWidget(sec.content); bbl = QHBoxLayout(bin_btns)
+        bbl.setContentsMargins(0, 4, 0, 0); bbl.setSpacing(4)
+        bbl.addWidget(styled_btn(bin_btns, "\u25b6  Preview",
+                                 self._do_binarize_preview, accent=True,
+                                 small=True))
+        bbl.addWidget(styled_btn(bin_btns, "Write NIfTI...",
+                                 self._do_binarize_write, small=True))
+        bbl.addStretch(1)
+        sec.content_layout.addWidget(bin_btns)
+
+        sec.content_layout.addWidget(
+            styled_btn(sec.content, "Threshold sweep",
+                       self._do_binarize_sweep, small=True),
+            alignment=Qt.AlignmentFlag.AlignLeft,
+        )
+        sec.content_layout.addWidget(_hint(
+            "The sweep reports the void fraction against threshold = mode "
+            "\u2212 k\u00b7sigma. A real pore population shows up as a "
+            "plateau; a value picked off the steep part is measuring the "
+            "material's own noise.", sec.content,
+        ))
+
+        # Beam-hardening correction
+        sec = _ToolPanel("\u2600  Beam Hardening")
+        self._tool_panels["beam_hardening"] = sec
+
+        sec.content_layout.addWidget(_hint(
+            "A polychromatic beam hardens as it penetrates, so the surface "
+            "layer of a specimen reconstructs brighter than its core. The "
+            "depth of every voxel below the real specimen surface is "
+            "measured with a distance transform \u2014 not as a distance to "
+            "the image border \u2014 so cylinders, notched and T-shaped "
+            "parts, scans with air around them and anisotropic voxels are "
+            "all handled correctly. Results appear in the Beam Hardening "
+            "tab.", sec.content,
+        ))
+
+        self._bh_poly_deg = styled_entry(sec.content, width=6)
+        self._bh_poly_deg.setText("4")
+        self._bh_poly_deg.setToolTip(
+            "Degree of the depth fit. 4 is a good default; above 6 starts "
+            "fitting noise in the sparse deep bins."
+        )
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Poly degree", self._bh_poly_deg))
+
+        self._bh_bin_mm = styled_entry(sec.content, width=6)
+        self._bh_bin_mm.setText("0.25")
+        self._bh_bin_mm.setToolTip("Depth bin width in mm.")
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Bin width", self._bh_bin_mm))
+
+        self._bh_stride_widget = styled_entry(sec.content, width=6)
+        self._bh_stride_widget.setText("0")
+        self._bh_stride_widget.setToolTip(
+            "Analysis grid step. 0 chooses one from the free memory.")
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Stride", self._bh_stride_widget))
+
+        self._bh_border_check = QCheckBox(
+            "Image border is specimen surface", sec.content,
+        )
+        self._bh_border_check.setChecked(True)
+        self._bh_border_check.setFont(QFont("Segoe UI", 9))
+        self._bh_border_check.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;"
+        )
+        self._bh_border_check.setToolTip(
+            "On: the specimen was cropped flush to its bounding box, so the "
+            "edge of the volume is a real surface.\n"
+            "Off: the volume is an arbitrary cut through a larger part, so "
+            "depth is measured only from real material/air interfaces."
+        )
+        sec.content_layout.addWidget(self._bh_border_check)
+
+        self._bh_removebg_check = QCheckBox(
+            "Zero the background outside", sec.content,
+        )
+        self._bh_removebg_check.setFont(QFont("Segoe UI", 9))
+        self._bh_removebg_check.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;"
+        )
+        sec.content_layout.addWidget(self._bh_removebg_check)
+
+        self._bh_dtype_combo = QComboBox(sec.content)
+        self._bh_dtype_combo.addItems(["float32", "int16"])
+        self._bh_dtype_combo.setToolTip(
+            "float32 keeps the corrected values exactly; int16 halves the "
+            "file size but rounds and clips them."
+        )
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Output dtype", self._bh_dtype_combo))
+
+        bh_btns = QWidget(sec.content); bhl = QHBoxLayout(bh_btns)
+        bhl.setContentsMargins(0, 4, 0, 0); bhl.setSpacing(4)
+        bhl.addWidget(styled_btn(bh_btns, "\u25b6  Measure",
+                                 self._do_beam_hardening_fit, accent=True,
+                                 small=True))
+        bhl.addWidget(styled_btn(bh_btns, "Apply && Save...",
+                                 self._do_beam_hardening_apply, small=True))
+        bhl.addStretch(1)
+        sec.content_layout.addWidget(bh_btns)
+
         # Reorientation
-        sec = _ToolPanel("🔄 Reorientation  (no resample)")
+        sec = _ToolPanel("🔄  Reorient")
         self._tool_panels["reorient"] = sec
 
-        row = QWidget(sec.content); rl = QHBoxLayout(row)
-        rl.setContentsMargins(0, 2, 0, 2); rl.setSpacing(4)
-        rl.addWidget(_small_label("Target", row, width=50))
-        self._reorient_target_widget = styled_entry(row, width=8)
+        sec.content_layout.addWidget(_hint(
+            "Relabels the axes to the target orientation by flipping and "
+            "permuting them. No interpolation, so no voxel value changes.",
+            sec.content,
+        ))
+
+        self._reorient_target_widget = styled_entry(sec.content, width=8)
         self._reorient_target_widget.setText("RAS")
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Target", self._reorient_target_widget,
+                       label_width=54))
+
+        preset_row = QWidget(sec.content); prl = QHBoxLayout(preset_row)
+        prl.setContentsMargins(0, 2, 0, 2); prl.setSpacing(4)
         for preset in ("RAS", "LPS", "LAS"):
-            b = styled_btn(row, preset,
-                           lambda p=preset: self._reorient_target_widget.setText(p),
-                           small=True)
-            rl.addWidget(b)
-        rl.addWidget(self._reorient_target_widget)
-        rl.addStretch(1)
-        sec.content_layout.addWidget(row)
+            prl.addWidget(styled_btn(
+                preset_row, preset,
+                lambda p=preset: self._reorient_target_widget.setText(p),
+                small=True))
+        prl.addStretch(1)
+        sec.content_layout.addWidget(preset_row)
         self._reorient_target = _WidgetVar(self._reorient_target_widget)
 
         self._reorient_save_widget = QCheckBox("Choose save path", sec.content)
@@ -445,7 +545,7 @@ class ControlsMixin:
         )
 
         # Angle Rotation
-        sec = _ToolPanel("↩  Angle Rotation  (resample)")
+        sec = _ToolPanel("↩  Rotate  (resamples)")
         self._tool_panels["rotate"] = sec
 
         row = QWidget(sec.content); rl = QHBoxLayout(row)
@@ -465,19 +565,21 @@ class ControlsMixin:
         sec.content_layout.addWidget(row)
         self._rot_axis = _RadioVar(self._rot_axis_radios, default="z")
 
-        row2 = QWidget(sec.content); r2l = QHBoxLayout(row2)
-        r2l.setContentsMargins(0, 2, 0, 2); r2l.setSpacing(4)
-        r2l.addWidget(_small_label("Angle °", row2, width=50))
-        self._rot_angle_widget = styled_entry(row2, width=7)
+        self._rot_angle_widget = styled_entry(sec.content, width=7)
         self._rot_angle_widget.setText("45")
-        r2l.addWidget(self._rot_angle_widget)
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Angle °", self._rot_angle_widget,
+                       label_width=54))
+
+        quick = QWidget(sec.content); qrl = QHBoxLayout(quick)
+        qrl.setContentsMargins(0, 2, 0, 2); qrl.setSpacing(4)
         for deg in (90, 180, 270):
-            b = styled_btn(row2, str(deg),
-                           lambda d=deg: self._rot_angle_widget.setText(str(d)),
-                           small=True)
-            r2l.addWidget(b)
-        r2l.addStretch(1)
-        sec.content_layout.addWidget(row2)
+            qrl.addWidget(styled_btn(
+                quick, str(deg),
+                lambda d=deg: self._rot_angle_widget.setText(str(d)),
+                small=True))
+        qrl.addStretch(1)
+        sec.content_layout.addWidget(quick)
         self._rot_angle = _WidgetVar(self._rot_angle_widget)
 
         self._rot_save_widget = QCheckBox("Choose save path", sec.content)
@@ -496,7 +598,7 @@ class ControlsMixin:
         )
 
         # Crop
-        sec = _ToolPanel("✂️  Crop  (ROI selection)")
+        sec = _ToolPanel("✂️  Crop")
         self._tool_panels["crop"] = sec
 
         self._crop_rows: dict = {}
@@ -527,26 +629,6 @@ class ControlsMixin:
             alignment=Qt.AlignmentFlag.AlignLeft,
         )
 
-    # Advanced toggle
-
-    def _on_advanced_toggled(self, checked: bool):
-        self._mat_advanced_frame.setVisible(bool(checked))
-        if checked:
-            # Carry the simple-mode values into the bilinear params so
-            # the user starts from what they already had.
-            if self._model_var.get() == "bilinear":
-                if "hu_thresh" in self._model_param_vars:
-                    self._model_param_vars["hu_thresh"].set(
-                        self._void_thresh_var.get()
-                    )
-                if "E_solid" in self._model_param_vars:
-                    self._model_param_vars["E_solid"].set(
-                        self._simple_E_var.get()
-                    )
-        else:
-            # Back to simple mode: bilinear is the only model there.
-            self._model_var.set("bilinear")
-
     # Automatic void/solid threshold
 
     def _auto_void_thresh(self):
@@ -561,194 +643,24 @@ class ControlsMixin:
                 from ..core.segmentation import otsu_threshold
 
                 self._set_status("Finding threshold (Otsu)...", busy=True)
-                vol = self._hu_vol if self._hu_vol is not None \
-                    else self._get_gray_lazy()
+                vol = self._get_gray_lazy()
                 if hasattr(vol, "subsample_flat"):
-                    # Lazy volume — sample without materialising it.
+                    # Lazy volume, sample without materialising it.
                     flat = vol.subsample_flat(2_000_000)
                 else:
                     flat = vol.ravel()
                     if flat.size > 2_000_000:
                         flat = flat[:: flat.size // 2_000_000]
                 t = otsu_threshold(flat)
-                domain = "HU" if self._hu_vol is not None else "raw intensity"
                 self.after(0, self._void_thresh_var.set, f"{t:.1f}")
                 self._append_log(
-                    f"  Auto void threshold (Otsu): {t:.1f}  [{domain}]",
-                    'teal',
-                )
+                    f"  Auto void threshold (Otsu): {t:.1f}", 'teal')
                 self._set_status("Auto threshold set.", busy=False)
             except Exception as ex:
                 self._append_log(f"  Auto threshold error: {ex}", 'err')
                 self._set_status("Auto threshold error.", busy=False)
 
         threading.Thread(target=_run, daemon=True).start()
-
-    # Model params panel
-
-    def _on_model_toggled(self, checked: bool):
-        # Only rebuild once, on the *newly-checked* button.
-        if not checked:
-            return
-        self._update_model_panel()
-
-    def _update_model_panel(self):
-        # Clear children
-        while self._model_params_layout.count():
-            item = self._model_params_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._model_param_vars.clear()
-        self._model_param_widgets.clear()
-
-        model = self._model_var.get()
-        f = self._model_params_frame
-        lay = self._model_params_layout
-
-        def param_row(lbl_text, key, default, unit=""):
-            r = QWidget(f); rl = QHBoxLayout(r)
-            rl.setContentsMargins(0, 2, 0, 2); rl.setSpacing(4)
-            rl.addWidget(_small_label(lbl_text, r, width=100))
-            e = styled_entry(r, width=10); e.setText(str(default))
-            rl.addWidget(e)
-            if unit:
-                rl.addWidget(_small_label(unit, r))
-            rl.addStretch(1)
-            lay.addWidget(r)
-            self._model_param_widgets[key] = e
-            self._model_param_vars[key] = _WidgetVar(e)
-
-        if model == "linear":
-            lay.addWidget(_small_label("E = a·I + b  [MPa]   (I = intensity)", f))
-            param_row("a  (slope)", "a", "20.0", "MPa per unit")
-            param_row("b  (intercept)", "b", "0.0", "MPa")
-            param_row("E_void", "E_void", "0.001", "MPa")
-
-        elif model == "power":
-            lay.addWidget(_small_label("E = a · I^b  [MPa]   (I = intensity)", f))
-            param_row("a  (scale)", "a", "0.09", "MPa")
-            param_row("b  (exponent)", "b", "1.92")
-            param_row("Min I clamp", "hu_min_clamp", "1.0")
-            param_row("E_void", "E_void", "0.001", "MPa")
-
-        elif model == "bilinear":
-            lay.addWidget(_small_label("Piecewise: void | solid", f))
-            param_row("Intensity thresh", "hu_thresh", "-200")
-            param_row("E_void", "E_void", "0.001", "MPa")
-            param_row("E_solid", "E_solid", "30000.0", "MPa")
-
-        elif model == "table":
-            lay.addWidget(_small_label("Piecewise-linear table\nEnter intensity values:", f))
-            self._table_text_widget = QPlainTextEdit(f)
-            self._table_text_widget.setStyleSheet(
-                f"QPlainTextEdit {{ background-color: {ENTRY_BG}; "
-                f"color: {TEXT}; border: 1px solid {BORDER}; }}"
-            )
-            self._table_text_widget.setFont(QFont("Consolas", 9))
-            self._table_text_widget.setFixedHeight(110)
-            self._table_text_widget.setPlainText(
-                "# intensity  E_MPa\n"
-                "-1000       0.001\n"
-                " -500       0.001\n"
-                "    0    5000.0\n"
-                "  500   25000.0\n"
-                " 1000   40000.0\n"
-            )
-            lay.addWidget(self._table_text_widget)
-            lay.addWidget(_small_label("(Lines starting with # are comments)", f))
-            # Provide ``_table_text`` with a ``.get('1.0','end')``-like API
-            # so actions.py / this file's _get_model_params can stay
-            # close to the tk form.
-            self._table_text = _PlainTextShim(self._table_text_widget)
-
-    def _get_model_params(self):
-        # Simple mode: one threshold + one solid stiffness → bilinear.
-        if not self._mat_advanced_check.isChecked():
-            try:
-                return {
-                    "hu_thresh": float(self._void_thresh_var.get()),
-                    "E_void": 0.001,
-                    "E_solid": float(self._simple_E_var.get()),
-                }
-            except Exception as ex:
-                raise ValueError(f"Bad parameter input: {ex}")
-        model = self._model_var.get()
-        vars_ = self._model_param_vars
-        try:
-            if model == "linear":
-                return {
-                    "a": float(vars_["a"].get()),
-                    "b": float(vars_["b"].get()),
-                    "E_void": float(vars_["E_void"].get()),
-                }
-            if model == "power":
-                return {
-                    "a": float(vars_["a"].get()),
-                    "b": float(vars_["b"].get()),
-                    "hu_min_clamp": float(vars_["hu_min_clamp"].get()),
-                    "E_void": float(vars_["E_void"].get()),
-                }
-            if model == "bilinear":
-                return {
-                    "hu_thresh": float(vars_["hu_thresh"].get()),
-                    "E_void": float(vars_["E_void"].get()),
-                    "E_solid": float(vars_["E_solid"].get()),
-                }
-            if model == "table":
-                lines = self._table_text.get('1.0', 'end').strip().splitlines()
-                hu_vals: list[float] = []
-                E_vals: list[float] = []
-                for line in lines:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    parts = line.split()
-                    hu_vals.append(float(parts[0]))
-                    E_vals.append(float(parts[1]))
-                return {"hu": hu_vals, "E": E_vals}
-        except Exception as ex:
-            raise ValueError(f"Bad parameter input: {ex}")
-
-    def _apply_material_preset(self, *_args):
-        name = self._mat_preset_var.get()
-        preset = MATERIAL_PRESETS.get(name)
-        if not preset:
-            return
-        self._model_var.set(preset.get("model", "linear"))
-        # Only let presets overwrite the threshold in advanced mode — the
-        # simple-mode default is 'auto' and should stay that way.
-        if getattr(self, "_mat_advanced_check", None) is not None \
-                and self._mat_advanced_check.isChecked():
-            self._void_thresh_var.set(str(preset.get("void_thresh", "auto")))
-        self._mat_note_var.set(preset.get("notes", ""))
-        self._update_model_panel()
-        params = preset.get("params", {})
-        for k, v in params.items():
-            if k in self._model_param_vars:
-                self._model_param_vars[k].set(str(v))
-
-    def _load_preset_json(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load material preset JSON", "",
-            "JSON (*.json);;All files (*.*)",
-        )
-        if not path:
-            return
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            MATERIAL_PRESETS.update(data)
-            # Refresh combo items
-            self._mat_preset_widget.blockSignals(True)
-            self._mat_preset_widget.clear()
-            self._mat_preset_widget.addItems(list(MATERIAL_PRESETS.keys()))
-            self._mat_preset_widget.blockSignals(False)
-            self._append_log(
-                f"  Loaded {len(data)} preset(s) from {Path(path).name}", 'ok',
-            )
-        except Exception as ex:
-            QMessageBox.critical(self, "JSON Error", str(ex))
 
     # Windowing helpers
 

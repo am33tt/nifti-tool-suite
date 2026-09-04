@@ -1,14 +1,13 @@
 """Reusable PyQt6 widgets (styled button, collapsible section, progress).
 
-Nothing here knows about the application state - all widgets are pure
-presentation components.  Styling is applied inline via stylesheets so
-they look approximately like the Tk originals.
+The widgets hold no application state; styling is applied inline through
+stylesheets.
 """
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QPainter, QColor, QFont, QPen
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
     QToolButton, QVBoxLayout, QWidget,
@@ -18,6 +17,78 @@ from ..config import (
     ACCENT, BG, BORDER, BTN_BG, BTN_HOV, ERR, PANEL, PANEL2, TEAL, TEXT, TEXT_DIM,
     ENTRY_BG,
 )
+
+
+# matplotlib toolbar
+
+def tint_icon(icon: QIcon, color: str) -> QIcon:
+    """Recolour an icon to *color*, keeping its shape.
+
+    The icon is used as its own mask through ``SourceIn``, so the original
+    colour does not matter; black and white glyphs both come out in the
+    requested colour.
+    """
+    sizes = icon.availableSizes()
+    if not sizes:
+        return icon
+    largest = max(sizes, key=lambda s: s.width() * s.height())
+    source = icon.pixmap(largest)
+    if source.isNull():
+        return icon
+
+    tinted = QPixmap(source.size())
+    tinted.setDevicePixelRatio(source.devicePixelRatio())
+    tinted.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tinted)
+    try:
+        painter.drawPixmap(0, 0, source)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), QColor(color))
+    finally:
+        painter.end()
+    return QIcon(tinted)
+
+
+def style_nav_toolbar(toolbar, *, color: str = TEXT, background: str = PANEL2):
+    """Make a matplotlib navigation toolbar legible on the light panels.
+
+    Matplotlib picks the toolbar icon colour once, at construction, from the
+    widget palette: a dark palette background makes it refill every icon with
+    the palette foreground, which is white. This application paints its
+    panels through a stylesheet and never touches the palette, so under a
+    dark system theme the toolbar shows white icons on a cream panel.
+
+    The palette is therefore corrected, so later icons are left alone, and
+    every icon already on the toolbar is repainted in the application text
+    colour.
+    """
+    palette = toolbar.palette()
+    for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
+                 QPalette.ColorRole.Button):
+        palette.setColor(role, QColor(background))
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText,
+                 QPalette.ColorRole.Text):
+        palette.setColor(role, QColor(color))
+    toolbar.setPalette(palette)
+
+    for action in toolbar.actions():
+        icon = action.icon()
+        if icon is not None and not icon.isNull():
+            action.setIcon(tint_icon(icon, color))
+
+    toolbar.setStyleSheet(
+        f"QToolBar {{ background-color: {background}; border: none;"
+        f" padding: 2px; spacing: 2px; }}"
+        f"QToolButton {{ background-color: transparent; color: {color};"
+        f" border: 1px solid transparent; border-radius: 3px; padding: 3px; }}"
+        f"QToolButton:hover {{ background-color: {BTN_HOV}; }}"
+        f"QToolButton:checked {{ background-color: {BTN_HOV};"
+        f" border: 1px solid {BORDER}; }}"
+        f"QToolButton:pressed {{ background-color: {BORDER}; }}"
+        f"QLabel {{ color: {color}; background-color: transparent; }}"
+    )
+    return toolbar
 
 
 # atoms
@@ -35,9 +106,7 @@ def styled_btn(parent, text, cmd, *, accent=False, danger=False, small=False,
                teal=False, **_kw):
     """Return a themed :class:`QPushButton`.
 
-    The signature is the same as the Tk ``styled_btn`` - a ``parent``
-    widget is passed but it does not dictate layout; callers add the
-    button to their own layout explicitly.
+    ``parent`` sets ownership only; callers add the button to a layout.
     """
     if teal:
         bg, fg = TEAL, "#FFFFFF"
@@ -74,7 +143,7 @@ def styled_entry(parent=None, *, width=None, placeholder=""):
     if placeholder:
         e.setPlaceholderText(placeholder)
     if width is not None:
-        # Rough char → px conversion; good enough for a compact row.
+        # Approximate character-to-pixel conversion.
         e.setFixedWidth(int(width * 8))
     return e
 
@@ -194,9 +263,7 @@ class IntRangeRow(QWidget):
 
         lay.addStretch(1)
 
-        # Back-compat attribute names used in the Tk code ------------------
-        # Instead of :class:`tk.StringVar` we expose tiny shims that
-        # ``actions.py`` can call ``.get()`` / ``.set()`` on.
+        # ``.get()`` and ``.set()`` shims for the call sites in actions.py.
         self.start_var = _LineEditVar(self.lo)
         self.end_var = _LineEditVar(self.hi)
 
@@ -205,11 +272,7 @@ class IntRangeRow(QWidget):
 
 
 class _LineEditVar:
-    """Duck-typed ``tk.StringVar`` - ``.get()`` / ``.set()`` on a QLineEdit.
-
-    Keeps the Tk-style call sites in ``actions.py`` working byte-for-byte
-    without forcing us to rewrite widget reads.
-    """
+    """Duck-typed ``tk.StringVar`` - ``.get()`` / ``.set()`` on a QLineEdit."""
 
     def __init__(self, line_edit: QLineEdit):
         self._w = line_edit
@@ -323,10 +386,8 @@ class StageProgressBar(QWidget):
         w = self.width()
         h = self.height()
 
-        # Background
         p.fillRect(0, 0, w, h, QColor(PANEL2))
 
-        # Label area (left 100px)
         label_w = 100
         if self._label_text:
             p.setPen(QColor(TEXT_DIM))
@@ -334,13 +395,11 @@ class StageProgressBar(QWidget):
             p.drawText(6, 0, label_w, h, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                        self._label_text)
 
-        # Bar area (right)
         bar_x = label_w + 6
         bar_w = max(10, w - bar_x - 8)
         bar_y = 3
         bar_h = h - 6
 
-        # Determine fill fraction
         if self._mode == 'stage':
             if self._stage_idx < 0 or self._stage_idx >= len(self.STAGES):
                 frac = 0.0
@@ -351,22 +410,19 @@ class StageProgressBar(QWidget):
         else:
             frac = 0.0
 
-        # Draw stage segments: six equal cells filled up to the current stage.
+        # One cell per stage, filled up to the current fraction.
         n = len(self.STAGES)
         cell_w = bar_w / n
         for i in range(n):
             x = int(bar_x + i * cell_w)
             cw = int((bar_x + (i + 1) * cell_w)) - x - 1
-            # Base
             p.fillRect(x, bar_y, cw, bar_h, QColor(BORDER))
-            # Accent fill if this cell is covered
             covered_frac = max(0.0, min(1.0, frac * n - i))
             if covered_frac > 0:
                 fw = int(cw * covered_frac)
                 if fw > 0:
                     p.fillRect(x, bar_y, fw, bar_h, QColor(ACCENT))
 
-        # Percent label in the middle of the bar
         p.setPen(QColor(TEXT if frac > 0.5 else TEXT_DIM))
         p.setFont(QFont("Segoe UI", 8))
         p.drawText(bar_x, bar_y, bar_w, bar_h,

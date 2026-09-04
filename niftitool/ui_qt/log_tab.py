@@ -61,14 +61,11 @@ class LogTabMixin:
         self._log_widget.clear()
 
     def _append_log(self, text: str, tag: str = ''):
-        """Thread-safe.  Emits a signal that's connected to
-        :meth:`_do_append_log` on the GUI thread in ``app.py``.
-        """
-        # ``_post_log_signal`` is defined on NiftiApp.
+        """Emit a signal handled by :meth:`_do_append_log` on the GUI thread."""
         try:
             self._post_log_signal.emit(text, tag)
         except Exception:
-            # Fallback for the rare case we're called before signals are wired.
+            # Fallback for calls made before the signals are wired.
             self._do_append_log(text, tag)
 
     def _do_append_log(self, text: str, tag: str):

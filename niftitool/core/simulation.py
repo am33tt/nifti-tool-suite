@@ -1,25 +1,19 @@
 """mlhp-backed linear-elastic FCM simulation driver.
 
-Mirrors ``examples/ctScanLinearElastic.py`` from the scanbasedanalysis
-repo, but takes its inputs (voxel volume, spacing, origin, material
-fields) from the running GUI's in-memory state rather than from disk.
+Follows ``examples/ctScanLinearElastic.py`` from the scanbasedanalysis
+repo but takes its inputs (voxel volume, spacing, origin, material fields)
+from in-memory state rather than from disk.
 
-The pipeline:
+Pipeline:
   1. Build an FCM scaling field from the loaded voxel volume.
-  2. Build a refined hp grid + tensor-product basis.
-  3. Apply zero-Dirichlet BCs on the user-selected face.
-  4. Integrate K and f over the FCM domain (constant E and nu, or a
-     voxel-data-backed E field if the GUI has an E-Map ready).
-  5. Solve with CG + additive-Schwarz preconditioner.
-  6. Postprocess to a .pvtu (PVtuOutput) for ParaView / the 3-D tab.
+  2. Build a refined hp grid and tensor-product basis.
+  3. Apply zero-Dirichlet BCs on the selected face.
+  4. Integrate K and f over the FCM domain.
+  5. Solve with CG and an additive-Schwarz preconditioner.
+  6. Write a .pvtu for ParaView and the 3-D tab.
 
-Two entry points:
-  ``run_linear_elastic_in_memory`` — calls mlhp directly in this process.
-  ``run_external_executable``       — spawns a compiled fracture/steel
-                                      driver via subprocess; the GUI
-                                      passes a ct.hpp through stdin /
-                                      file path so the C++ driver can
-                                      pick up the calibrated material.
+Entry points: ``run_linear_elastic_in_memory`` calls mlhp in this process,
+``run_external_executable`` spawns a compiled driver via subprocess.
 """
 
 from __future__ import annotations
@@ -33,11 +27,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-LogFn = Callable[[str, str], None]  # (message, tag) — tag in {'', 'ok', 'err', 'warn', 'dim', 'teal'}
+LogFn = Callable[[str, str], None]  # (message, tag), tag in {'', 'ok', 'err', 'warn', 'dim', 'teal'}
 
 
-# Path to the JSON file remembering the last-used mlhp folder so the user
-# only has to pick it once.
+# Remembers the last-used mlhp folder so it only has to be picked once.
 _CONFIG_DIR = Path.home() / ".niftitool"
 _MLHP_CONFIG = _CONFIG_DIR / "mlhp_path.json"
 
@@ -63,15 +56,16 @@ def save_mlhp_path(folder: str) -> None:
             json.dumps({"folder": str(folder)}, indent=2), encoding="utf-8",
         )
     except Exception:
-        # Persistence is best-effort; never fail the run because of it.
+        # Persistence is best-effort; a failure must not abort the run.
         pass
 
 
 def _discover_mlhp_paths(folder: str) -> list[str]:
-    """Find folders inside ``folder`` that hold ``mlhp.py`` or the
-    compiled ``pymlhpcore`` extension, so we can ``sys.path``-prepend
-    each one. The user might point at the repo root, the build folder,
-    or the python-bindings source dir — we accept any of those.
+    """Find folders under ``folder`` holding ``mlhp.py`` or the compiled
+    ``pymlhpcore`` extension, to prepend to ``sys.path``.
+
+    ``folder`` may be the repo root, the build folder or the python-bindings
+    source directory.
     """
     root = Path(folder)
     if not root.exists():
@@ -89,7 +83,7 @@ def _discover_mlhp_paths(folder: str) -> list[str]:
     if (root / "mlhp.py").exists() or any(root.glob("pymlhpcore*")):
         _add(root)
 
-    # Limit recursion — bindings live near the top of the tree in practice.
+    # Limit recursion, bindings live near the top of the tree in practice.
     for pattern in ("mlhp.py", "pymlhpcore*.pyd", "pymlhpcore*.so",
                     "pymlhpcore*.dll"):
         for hit in root.rglob(pattern):
@@ -107,11 +101,10 @@ def _discover_mlhp_paths(folder: str) -> list[str]:
 def try_import_mlhp(folder: Optional[str] = None) -> tuple[bool, str]:
     """Attempt to import the ``mlhp`` module.
 
-    If ``folder`` is given, scan it for ``mlhp.py`` / ``pymlhpcore*``
-    and prepend each match to ``sys.path`` before trying. Returns
-    ``(ok, message)`` — ``message`` is human-readable for the GUI log.
+    If ``folder`` is given, scan it for ``mlhp.py`` and ``pymlhpcore*`` and
+    prepend each match to ``sys.path`` first. Returns ``(ok, message)``,
+    where ``message`` is meant for the GUI log.
     """
-    # Already importable? Nothing to do.
     if "mlhp" in sys.modules:
         return True, "mlhp already imported"
 
@@ -131,7 +124,7 @@ def try_import_mlhp(folder: Optional[str] = None) -> tuple[bool, str]:
         return True, "mlhp imported successfully"
     except ImportError as ex:
         return False, f"mlhp import failed: {ex}"
-    except Exception as ex:  # pragma: no cover — surface unexpected errors
+    except Exception as ex:  # pragma: no cover, surface unexpected errors
         return False, f"mlhp import raised {type(ex).__name__}: {ex}"
 
 
@@ -147,7 +140,7 @@ class SimParams:
     polynomial_degree: int = 2
     refinement_depth: int = 1
 
-    # Material — used when ``use_emap_as_E`` is False, or as units when True.
+    # Material; used when ``use_emap_as_E`` is False.
     youngs_modulus_pa: float = 200e9
     poisson_ratio: float = 0.3
 
@@ -157,8 +150,8 @@ class SimParams:
     # Zero-Dirichlet face index in mlhp's convention (0 = -x face).
     fixed_face: int = 0
 
-    # FCM penalty for the "outside" region — keeps K nonsingular without
-    # actually loading void elements.
+    # FCM penalty for the outside region, keeping K nonsingular without
+    # loading void elements.
     alpha_fcm: float = 1e-8
 
     # Quadrature subdivision per element (one int per axis).
@@ -167,8 +160,8 @@ class SimParams:
     # CG tolerance / iteration cap.
     cg_max_iter: int = 1000
 
-    # If True and an E-Map is supplied, the per-voxel modulus replaces the
-    # constant ``youngs_modulus_pa`` (still in Pa — caller must scale MPa→Pa).
+    # If True and a modulus map is supplied, the per-voxel modulus replaces
+    # the constant ``youngs_modulus_pa``. Still in Pa, so the caller scales.
     use_emap_as_E: bool = False
 
     # Output path stem (no extension); mlhp adds ``.pvtu``.
@@ -181,9 +174,7 @@ class SimParams:
 def mlhp_available() -> bool:
     """Return True if the ``mlhp`` Python module is importable.
 
-    Honours a previously-saved folder (see :func:`load_saved_mlhp_path`)
-    so a user who picked the path in an earlier run doesn't have to
-    pick it again.
+    Honours a previously-saved folder (see :func:`load_saved_mlhp_path`).
     """
     if "mlhp" in sys.modules:
         return True
@@ -202,14 +193,13 @@ def run_linear_elastic_in_memory(
     voxel_volume,                     # numpy.ndarray (3-D, float-castable)
     params: SimParams,
     *,
-    emap=None,                        # Optional[np.ndarray] — modulus per voxel
+    emap=None,                        # Optional[np.ndarray], modulus per voxel
     log: LogFn = _noop_log,
 ) -> dict:
     """Run a linear-elastic FCM analysis on ``voxel_volume``.
 
-    Returns a dict with summary stats and the output file path. Raises
-    on any solver / setup failure — callers should wrap in try/except
-    and route exceptions to the GUI log.
+    Returns a dict with summary statistics and the output file path.
+    Raises on any setup or solver failure.
     """
     import mlhp
     import numpy as np
@@ -220,11 +210,9 @@ def run_linear_elastic_in_memory(
     nvoxels = [int(n) for n in voxel_volume.shape[:D]]
     lengths = [nvoxels[i] * spacing[i] for i in range(D)]
 
-    # Align the voxel data to the mesh's own [0, lengths] frame.
-    # NIfTI's affine origin is for anatomical / world-space registration —
-    # using it here produces a mesh / FCM mismatch when the affine offset
-    # is non-zero (you see the volume occupy only the overlap region with
-    # the rest of the mesh sitting in the FCM "outside" α ~ 1e-8 phase).
+    # Align the voxel data to the mesh [0, lengths] frame. The NIfTI affine
+    # origin is for world-space registration, and a non-zero offset leaves
+    # part of the mesh in the FCM outside phase.
     origin = [0.0, 0.0, 0.0]
     affine_origin = _voxel_origin_from_affine(img.affine)
 
@@ -235,7 +223,7 @@ def run_linear_elastic_in_memory(
     log(f"   FCM origin     : {origin} (mesh-aligned)", 'dim')
     if any(abs(x) > 1e-9 for x in affine_origin):
         log(
-            f"   note: NIfTI affine origin {affine_origin} ignored — "
+            f"   note: NIfTI affine origin {affine_origin} ignored, "
             f"using (0,0,0) so the voxel data fills the whole mesh.",
             'dim',
         )
@@ -258,11 +246,9 @@ def run_linear_elastic_in_memory(
 
     log("3. Material + integrand", 'dim')
     if params.use_emap_as_E and emap is not None:
-        # emap is in MPa from the GUI; mlhp expects consistent units —
-        # if the user picked Pa for body force, scale here.
-        # Same origin convention as the scaling field above — the E-Map
-        # voxel grid must share the mesh's (0,0,0)-anchored frame, not
-        # NIfTI world-space, otherwise modulus values land in the wrong
+        # The modulus map is in MPa and its units must match the body force.
+        # Same origin convention as the scaling field above: the grid must
+        # share the mesh (0,0,0)-anchored frame or values land in the wrong
         # cells.
         emap_flat = np.ascontiguousarray(emap, dtype=np.float64).ravel()
         E_field = mlhp.scalarFieldFromVoxelData(
@@ -345,12 +331,10 @@ def run_external_executable(
 ) -> int:
     """Spawn a compiled mlhp/fracture driver and stream its stdout to ``log``.
 
-    Use this for solvers that exist only as C++ binaries (e.g. the
-    ``steel_specimen`` / ``voxel_fracturetest`` executables in the
-    scanbasedanalysis repo). The GUI is expected to have already
-    written any required ``ct.hpp`` / input files into ``cwd``.
-
-    Returns the process exit code.
+    For solvers that exist only as C++ binaries, such as the
+    ``steel_specimen`` and ``voxel_fracturetest`` executables in the
+    scanbasedanalysis repo. Any required input files must already exist in
+    ``cwd``. Returns the process exit code.
     """
     exe = Path(exe_path)
     if not exe.exists():

@@ -1,27 +1,13 @@
-"""Per-void (pore) analytics on a segmented volume.
+"""Per void analytics on a thresholded volume.
 
-Connected-component analysis of the void phase:
+Connected component analysis of the void phase: label each pocket,
+measure it (volume, equivalent diameter, sphericity, elongation,
+centroid, bounding box) and summarise the population.
 
-* label every disconnected air pocket inside the specimen,
-* measure each one (volume, equivalent diameter, sphericity, elongation,
-  centroid, bounding box),
-* summarise the population (count, size distribution percentiles,
-  nearest-neighbour spacing).
-
-This is the analysis AM-concrete / porous-media papers report, so the
-numbers here feed both the Porosity tab and the PDF report generator.
-
-Design notes
-------------
-* The exterior air surrounding the specimen is (optionally, default on)
-  removed by discarding components that touch the volume boundary —
-  otherwise it would register as one giant "void" and swamp the stats.
-* Sphericity needs a surface area.  A triangulated surface from marching
-  cubes is accurate but costs time per void, so it's only computed for
-  voids with at least ``sphericity_min_voxels`` voxels (below that the
-  mesh is too coarse to mean anything anyway).
-* Everything returns plain floats / numpy arrays so the module stays
-  GUI-free and unit-testable.
+Components touching the volume boundary are dropped by default, since
+the exterior air would otherwise register as one giant void. Sphericity
+needs a surface area from a marching cubes mesh and is computed only
+above sphericity_min_voxels, below which the mesh is too coarse.
 """
 
 from __future__ import annotations
@@ -43,13 +29,11 @@ BYTES_PER_ANALYSIS_VOXEL = 10.0
 
 def choose_stride(shape, available_mb=None, *, budget_frac=0.5,
                   bytes_per_voxel=BYTES_PER_ANALYSIS_VOXEL) -> int:
-    """Smallest voxel stride so the void analysis fits in RAM.
+    """Smallest voxel stride for which the analysis fits in RAM.
 
-    ``stride == 1`` analyses at full resolution; ``stride == n`` reads
-    every n-th voxel along each axis (n³-fold memory reduction) and the
-    caller scales the voxel spacing accordingly so all physical sizes
-    stay correct.  Falls back to a conservative 4 GiB budget when psutil
-    is unavailable.
+    stride n reads every n-th voxel along each axis, so the caller must
+    scale the voxel spacing by n to keep physical sizes correct. Falls back
+    to a 4 GiB budget when psutil is missing.
     """
     total = int(shape[0]) * int(shape[1]) * int(shape[2])
     if available_mb is None:
@@ -62,11 +46,10 @@ def choose_stride(shape, available_mb=None, *, budget_frac=0.5,
 
 
 def build_void_mask(volume, thresh, stride: int = 1, progress=None):
-    """Stream a boolean void mask one Z-slice at a time.
+    """Stream a boolean void mask one Z slice at a time.
 
-    ``volume`` only needs ``shape`` and 2-D ``[:, :, z]`` slicing — an
-    ndarray and a :class:`~niftitool.core.io.LazyGrayVolume` both work,
-    so the full-resolution float32 volume is never materialised.
+    volume needs only shape and 2-D [:, :, z] slicing, so an ndarray and a
+    LazyGrayVolume both work and the float32 volume is never materialised.
     """
     sx, sy, sz = volume.shape[:3]
     zids = range(0, sz, stride)
@@ -81,6 +64,38 @@ def build_void_mask(volume, thresh, stride: int = 1, progress=None):
         if progress is not None and (i % 25 == 0 or i == n - 1):
             progress(i + 1, n)
     return mask
+
+
+def specimen_from_void_mask(void_mask, erode: int = 0):
+    """Specimen mask derived from an existing void mask.
+
+    void_mask is intensity < threshold, so its complement is the solid
+    phase. The specimen is the largest connected solid component with its
+    holes filled, which puts the pores back inside it.
+
+    Porosity measured against the whole array counts surrounding air in the
+    denominator, so the same specimen in a wider field of view would report
+    a lower figure. Measuring against the specimen removes that dependence.
+
+    erode drops that many voxels from the surface. The outermost layer is a
+    partial volume mixture and would otherwise count as a shell of pores.
+    """
+    solid = ~np.asarray(void_mask, dtype=bool)
+    if not solid.any():
+        return np.zeros(solid.shape, dtype=bool)
+    structure = ndimage.generate_binary_structure(3, 1)
+    lab, n = ndimage.label(solid, structure=structure)
+    if n > 1:
+        counts = np.bincount(lab.ravel())
+        counts[0] = 0
+        solid = lab == int(counts.argmax())
+    del lab
+    spec = ndimage.binary_fill_holes(solid)
+    if erode:
+        eroded = ndimage.binary_erosion(spec, iterations=int(erode))
+        if eroded.any():
+            spec = eroded
+    return np.asarray(spec, dtype=bool)
 
 
 @dataclass
@@ -104,15 +119,23 @@ class PorosityResult:
     total_void_voxels:  int
     total_volume_mm3:   float    # specimen volume analysed
     void_volume_mm3:    float
-    porosity_pct:       float    # closed porosity (border-touching removed if excluded)
+    porosity_pct:       float    # closed porosity, referred to the specimen when known
     border_void_voxels: int      # voxels discarded as exterior air
     spacing_mm:         tuple
     connectivity:       int
     min_voxels:         int
     exclude_border:     bool
     stride:             int = 1   # >1 = analysed on a downsampled grid
+    # Denominator the porosity is referred to. 0 means the whole analysed
+    # array, which over-counts whenever there is air around the specimen.
+    specimen_voxels:    int = 0
+    volume_porosity_pct: float = float("nan")  # same voids, whole-array basis
     raw_void_voxels:    int = 0   # voxels below threshold BEFORE filtering
     analysed_voxels:    int = 0   # total voxels in the analysed grid
+    # Sizes of every component surviving the border filter, before the
+    # minimum size filter, so the count can be re-derived without
+    # relabelling the volume.
+    component_sizes:    object = None
     voids:              list = field(default_factory=list)   # [VoidRecord], largest first
     # population stats over eq_diam_mm (NaN when n_voids == 0)
     d_mean_mm:   float = float("nan")
@@ -167,31 +190,22 @@ def analyze_voids(
     min_voxels: int = 8,
     connectivity: int = 1,
     exclude_border: bool = True,
+    specimen_voxels: int | None = None,
     max_detailed: int = DEFAULT_MAX_DETAILED_VOIDS,
     sphericity_min_voxels: int = DEFAULT_SPHERICITY_MIN_VOXELS,
     compute_sphericity: bool = True,
     progress=None,
 ) -> PorosityResult:
-    """Run the full per-void analysis.
+    """Run the full per void analysis.
 
-    Parameters
-    ----------
-    void_mask
-        Boolean volume, ``True`` where the voxel is void/air.  Build it
-        with ``labels == 0`` from :mod:`.segmentation` or ``hu < thresh``.
-    spacing
-        Voxel size ``(sx, sy, sz)`` in mm.
-    min_voxels
-        Ignore components smaller than this (scanner noise).
-    connectivity
-        1 = faces only (6-connected), 2 = +edges (18), 3 = +corners (26).
-    exclude_border
-        Drop components touching the volume boundary (exterior air).
-    max_detailed
-        Cap on per-void records (largest first); everything still counts
-        toward porosity totals.
-    progress
-        Optional ``fn(done, total)`` callback for UI progress.
+    void_mask is True where the voxel is void, spacing is the voxel size in
+    mm. connectivity is 1 for faces, 2 for edges, 3 for corners, and
+    components below min_voxels or touching the border are dropped.
+
+    specimen_voxels is the denominator the porosity is referred to. Pass it
+    whenever there is air around the specimen, from specimen_from_void_mask;
+    without it the air inflates the denominator. max_detailed caps the per
+    void records, largest first, but everything counts towards the totals.
     """
     void_mask = np.asarray(void_mask, dtype=bool)
     spacing = tuple(float(s) for s in spacing[:3])
@@ -218,10 +232,10 @@ def analyze_voids(
     counts = np.bincount(lab.ravel())
     if counts.size:
         counts[0] = 0                      # background
+    all_sizes = counts[counts > 0].astype(np.int64)
     keep = np.flatnonzero(counts >= max(1, int(min_voxels)))
     total_void_voxels = int(counts[keep].sum())
 
-    # Largest first; cap detailed measurement.
     order = keep[np.argsort(counts[keep])[::-1]]
     detailed = order[: max_detailed]
 
@@ -239,7 +253,6 @@ def analyze_voids(
         vol = cnt * vox_mm3
         eq_d = float((6.0 * vol / np.pi) ** (1.0 / 3.0))
 
-        # centroid (voxel + mm)
         loc = np.argwhere(sub).mean(axis=0)
         cen_vox = tuple(float(loc[k] + sl[k].start) for k in range(3))
         cen_mm = tuple(cen_vox[k] * spacing[k] for k in range(3))
@@ -261,12 +274,21 @@ def analyze_voids(
             progress(i + 1, n_det)
 
     void_volume_mm3 = total_void_voxels * vox_mm3
+    volume_porosity = 100.0 * total_void_voxels / max(1, void_mask.size)
+    if specimen_voxels:
+        porosity = 100.0 * total_void_voxels / max(1, int(specimen_voxels))
+        basis_mm3 = int(specimen_voxels) * vox_mm3
+    else:
+        porosity = volume_porosity
+        basis_mm3 = total_volume_mm3
     result = PorosityResult(
         n_voids=len(keep),
         total_void_voxels=total_void_voxels,
-        total_volume_mm3=total_volume_mm3,
+        total_volume_mm3=basis_mm3,
         void_volume_mm3=void_volume_mm3,
-        porosity_pct=100.0 * total_void_voxels / void_mask.size,
+        porosity_pct=porosity,
+        volume_porosity_pct=volume_porosity,
+        specimen_voxels=int(specimen_voxels or 0),
         border_void_voxels=border_void_voxels,
         spacing_mm=spacing,
         connectivity=connectivity,
@@ -274,6 +296,7 @@ def analyze_voids(
         exclude_border=exclude_border,
         raw_void_voxels=raw_void_voxels,
         analysed_voxels=int(void_mask.size),
+        component_sizes=all_sizes,
         voids=records,
     )
 
@@ -329,28 +352,56 @@ def summary_lines(result: PorosityResult) -> list[str]:
     if r.stride > 1:
         lines.append(
             f"Downsampled ×{r.stride}      : analysed every {r.stride}. voxel "
-            f"to fit in RAM — voids smaller than "
+            f"to fit in RAM; voids smaller than "
             f"~{2 * max(r.spacing_mm):.3f} mm are not resolved"
         )
     raw_pct = 100.0 * r.raw_void_voxels / max(1, r.analysed_voxels)
+    basis = "specimen" if r.specimen_voxels else "whole analysed array"
     lines += [
         f"Raw void fraction   : {raw_pct:.3f} %  "
         f"(all voxels below threshold, before filters)",
-        f"Closed porosity     : {r.porosity_pct:.3f} %  "
+        f"Closed porosity     : {r.porosity_pct:.3f} % of the {basis}  "
         f"(voids ≥ {r.min_voxels} vox, border excluded)",
-        f"Void volume         : {r.void_volume_mm3:.3f} mm³ "
-        f"of {r.total_volume_mm3:.1f} mm³ analysed",
+        f"Void volume         : {r.void_volume_mm3:.4f} mm³ "
+        f"of {r.total_volume_mm3:.2f} mm³ of {basis}",
     ]
+    if r.specimen_voxels:
+        lines.append(
+            f"Specimen analysed   : {r.specimen_voxels:,} voxels "
+            f"({100.0 * r.specimen_voxels / max(1, r.analysed_voxels):.1f} % "
+            f"of the array; the surrounding air is excluded from the "
+            f"denominator, so the porosity does not depend on how much "
+            f"air happens to be in the field of view)"
+        )
+    else:
+        lines.append(
+            "Basis warning       : porosity is referred to the whole "
+            "array because no specimen mask was supplied; any air "
+            "around the specimen inflates the denominator and "
+            "understates the porosity."
+        )
     if r.exclude_border:
         lines.append(
             f"Border air removed  : {r.border_void_voxels} voxels "
             f"(exterior, not counted)"
         )
+    if r.component_sizes is not None and len(r.component_sizes):
+        sizes = np.asarray(r.component_sizes)
+        sweep = {m: int((sizes >= m).sum()) for m in (1, 2, 4, 8, 16, 32)}
+        pairs = "  ".join(f"\u2265{m}: {n}" for m, n in sweep.items())
+        lines.append(f"Count vs min size   : {pairs}")
+        single = 100.0 * float((sizes < 2).sum()) / max(1, sizes.size)
+        lines.append(
+            f"Single-voxel objects: {single:.1f} % of all dark objects \u2014 "
+            f"a lone dark voxel is noise or partial volume, not a pore, so "
+            f"the count is only meaningful together with the minimum size "
+            f"it was measured at."
+        )
     if r.voids:
         lines += [
             f"Eq. diameter        : mean {r.d_mean_mm:.4f}  "
             f"median {r.d_median_mm:.4f}  max {r.d_max_mm:.4f} mm",
-            f"Diameter p10–p90    : {r.d_p10_mm:.4f} – {r.d_p90_mm:.4f} mm",
+            f"Diameter p10-p90    : {r.d_p10_mm:.4f} - {r.d_p90_mm:.4f} mm",
         ]
         if not np.isnan(r.mean_nn_dist_mm):
             lines.append(

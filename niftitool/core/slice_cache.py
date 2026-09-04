@@ -1,23 +1,12 @@
 """LRU-bounded cache for windowed 2-D slices.
 
-Why this exists
----------------
-Every time the user drags a triplanar slider, the viewer needs a
-windowed, float32, ``[0, 1]`` 2-D slice to hand to matplotlib. Recomputing
-that per frame is wasteful:
+Slicing a volume is a cheap numpy view, but :func:`apply_window` allocates
+and touches a new float32 buffer per frame (about 16 MiB for a 2000 by 2000
+slice), which dominates triplanar slider interaction.
 
-* Slicing the volume is a numpy *view* → cheap.
-* But :func:`apply_window` allocates a fresh ``float32`` buffer of the
-  slice size, does a ``clip`` and a ``subtract`` and a ``multiply``.
-  For a 2000 × 2000 slice that's ~16 MiB touched per frame.
-
-The user rarely looks at more than ~5 distinct slice indices per axis
-per window setting while inspecting a volume. Caching those lets us
-serve repeat frames from RAM and keep the interaction at native monitor
-refresh rate.
-
-Key is ``(axis, idx, ww, wc)``. The cache is invalidated whenever the
-volume itself changes (new file loaded, crop applied, reorient, …).
+The cache key is ``(axis, idx, ww, wc, max_px)``. The cache must be
+invalidated whenever the volume changes, for example on load, crop or
+reorientation.
 """
 
 from __future__ import annotations
@@ -36,7 +25,7 @@ class SliceCache:
     ----------
     max_entries : int, default 48
         Maximum number of cached slices. Each entry is one float32 2-D
-        array; 48 on a 2000² volume is ~750 MiB at worst. Tune to taste.
+        array, so 48 entries of a 2000 by 2000 volume is 750 MiB at worst.
     """
 
     __slots__ = ("_vol", "_entries", "_max", "_lock")
@@ -45,11 +34,11 @@ class SliceCache:
         self._vol = None
         self._entries: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._max = max_entries
-        # get() may be called from the GUI thread and the prefetch worker
-        # concurrently; OrderedDict mutation needs a lock.
+        # get() runs on the GUI thread and the prefetch worker at the same
+        # time, so OrderedDict mutation needs a lock.
         self._lock = threading.Lock()
 
-    # ── lifecycle ────────────────────────────────────────────────────────────
+    # Lifecycle
 
     def set_volume(self, gray) -> None:
         """Bind a new volume and clear the cache."""
@@ -62,21 +51,18 @@ class SliceCache:
         with self._lock:
             self._entries.clear()
 
-    # ── queries ──────────────────────────────────────────────────────────────
+    # Queries
 
     def get(self, axis: str, idx: int, ww: float, wc: float,
             max_px: int | None = None):
         """Return a windowed slice along *axis* at index *idx*.
 
-        ``axis`` is one of ``'X'``, ``'Y'``, ``'Z'``. The returned array
-        is already transposed into the same orientation the viewer uses
-        (``.T``) and in ``[0, 1]`` float32. Do *not* mutate it — it is
-        the actual cache entry.
+        ``axis`` is one of ``'X'``, ``'Y'``, ``'Z'``. The returned array is
+        transposed into the viewer orientation and is float32 in ``[0, 1]``.
+        It is the live cache entry, so do not mutate it.
 
-        ``max_px`` decimates the slice so its longest side is at most
-        that many pixels — a screen panel is only a few hundred pixels
-        wide, so windowing and drawing a 2000² slice per frame is pure
-        waste. The viewer keeps data coordinates intact by drawing the
+        ``max_px`` decimates the slice so its longest side is at most that
+        many pixels. The viewer preserves data coordinates by drawing the
         decimated image with the original extent.
         """
         if self._vol is None:
@@ -86,7 +72,7 @@ class SliceCache:
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
-                self._entries.move_to_end(key)   # mark recently used
+                self._entries.move_to_end(key)
                 return entry
             g = self._vol
 
@@ -109,7 +95,7 @@ class SliceCache:
                 self._entries.popitem(last=False)  # evict oldest
         return windowed
 
-    # ── diagnostics ──────────────────────────────────────────────────────────
+    # Diagnostics
 
     def __len__(self) -> int:
         return len(self._entries)

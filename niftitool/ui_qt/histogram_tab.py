@@ -12,7 +12,8 @@ from ..config import (
     ACCENT, BG, BORDER, ERR, PANEL2, TEAL, TEXT, TEXT_DIM,
 )
 from ..deps import HAS_MPL
-from .widgets import styled_btn, styled_entry
+from .figure_viewer import click_hint, enable_click_to_enlarge
+from .widgets import style_nav_toolbar, styled_btn, styled_entry
 
 
 class _WidgetVar:
@@ -64,9 +65,13 @@ class HistogramTabMixin:
         tb = QWidget(parent)
         tb_lay = QHBoxLayout(tb)
         tb_lay.setContentsMargins(0, 0, 0, 0)
-        tb_lay.addWidget(NavigationToolbar2Tk(self._hist_canvas, tb))
+        tb_lay.addWidget(style_nav_toolbar(
+            NavigationToolbar2Tk(self._hist_canvas, tb)))
+        tb_lay.addWidget(click_hint(tb))
         tb_lay.addStretch(1)
         root.addWidget(tb)
+
+        enable_click_to_enlarge(self._hist_canvas, self._hist_fig, self)
 
         opts = QWidget(parent)
         opts_lay = QHBoxLayout(opts)

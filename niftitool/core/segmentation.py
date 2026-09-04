@@ -1,17 +1,9 @@
-"""Threshold-based phase segmentation and per-phase statistics.
+"""Automatic grey-level thresholding.
 
-Three-phase labelling for concrete-like volumes:
-
-* **Void / air**   — HU below ``void_thresh``
-* **Matrix**       — HU between ``void_thresh`` and ``solid_thresh``
-* **Aggregate**    — HU above ``solid_thresh`` (when ``solid_thresh`` is given)
-
-If ``solid_thresh`` is ``None`` the volume is simply binarised into
-void vs solid.
-
-The statistics returned by :func:`phase_statistics` match the columns of
-the CSV exporter in :mod:`niftitool.core.cpp_export` so the UI and the
-file output never disagree.
+:func:`otsu_threshold` is the shared void/solid rule: the porosity
+analysis, the background removal, the beam-hardening specimen mask and
+the binarisation all call it, so a threshold quoted by one of them means
+the same thing in the others.
 """
 
 from __future__ import annotations
@@ -19,15 +11,12 @@ from __future__ import annotations
 from ..deps import np
 
 
-PHASE_NAMES = {0: "Void/Air", 1: "Matrix/Paste", 2: "Aggregate/Solid"}
-
-
 def otsu_threshold(values, nbins: int = 512) -> float:
-    """Classic Otsu threshold on a flat sample of intensities.
+    """Otsu threshold on a flat sample of intensities.
 
-    Maximises between-class variance over a histogram — a good automatic
-    void/solid split for bimodal CT data (air peak vs material peak).
-    Works on raw intensities or HU alike; no calibration required.
+    Maximises between-class variance over a histogram, which suits bimodal
+    CT data with an air peak and a material peak. Accepts raw intensities or
+    HU and needs no calibration.
     """
     v = np.asarray(values, dtype=np.float64).ravel()
     v = v[np.isfinite(v)]
@@ -49,12 +38,11 @@ def otsu_threshold(values, nbins: int = 512) -> float:
     sigma_b[~np.isfinite(sigma_b)] = -1.0
     t = float(centers[int(np.argmax(sigma_b))])
 
-    # Refine to the midpoint between the class means (isodata /
-    # Ridler–Calvard).  With well-separated peaks the raw Otsu optimum is
-    # flat across the whole empty valley and argmax lands at its very
-    # edge — e.g. "threshold 25" on data whose material peak sits in the
-    # thousands.  The midpoint lands mid-valley, which also captures
-    # partial-volume voxels around small pores.
+    # Refine to the midpoint between the class means (isodata,
+    # Ridler-Calvard). With well-separated peaks the Otsu optimum is flat
+    # across the empty valley and argmax lands at its edge, while the
+    # midpoint sits mid-valley and also captures partial-volume voxels
+    # around small pores.
     for _ in range(20):
         lo = v[v < t]
         hi = v[v >= t]
@@ -66,45 +54,3 @@ def otsu_threshold(values, nbins: int = 512) -> float:
             break
         t = t_new
     return float(t)
-
-
-def segment_phases(hu_vol, void_thresh, solid_thresh=None):
-    """Return a ``uint8`` label volume using the two thresholds above."""
-    labels = np.zeros(hu_vol.shape, dtype=np.uint8)
-    labels[hu_vol >= void_thresh] = 1
-    if solid_thresh is not None:
-        labels[hu_vol >= solid_thresh] = 2
-    return labels
-
-
-def phase_statistics(hu_vol, E_vol, labels):
-    """Return ``(stats_dict, porosity)``.
-
-    ``stats_dict`` has one entry per *occupied* phase, keyed by the
-    phase's human-readable name.  Each entry includes voxel count,
-    volume fraction, HU mean/std, and E min/mean/max/std in MPa.
-
-    Porosity is extracted as the volume fraction of the void phase, or
-    0.0 if no void voxels exist.
-    """
-    total = hu_vol.size
-    stats: dict = {}
-    for pid, name in PHASE_NAMES.items():
-        mask = labels == pid
-        count = int(mask.sum())
-        if count == 0:
-            continue
-        E_vals  = E_vol[mask]
-        hu_vals = hu_vol[mask]
-        stats[name] = {
-            "voxels":     count,
-            "vol_frac":   count / total,
-            "HU_mean":    float(hu_vals.mean()),
-            "HU_std":     float(hu_vals.std()),
-            "E_mean_MPa": float(E_vals.mean()),
-            "E_min_MPa":  float(E_vals.min()),
-            "E_max_MPa":  float(E_vals.max()),
-            "E_std_MPa":  float(E_vals.std()),
-        }
-    porosity = stats.get("Void/Air", {}).get("vol_frac", 0.0)
-    return stats, porosity

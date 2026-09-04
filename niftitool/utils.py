@@ -25,9 +25,8 @@ def process_rss_mb() -> float | None:
 def available_ram_mb() -> float | None:
     """System-wide free RAM in MiB. ``None`` if psutil is missing.
 
-    Used as a soft budget: callers that are about to allocate a multi-GB
-    float32 array check this and stay on the lazy (memory-mapped) path
-    when they would blow past available headroom.
+    Used as a soft budget. Callers facing a large allocation stay on the
+    memory-mapped path when it would exceed the available headroom.
     """
     if not HAS_PSUTIL:
         return None
@@ -49,10 +48,9 @@ def total_ram_mb() -> float | None:
 
 @contextmanager
 def timed(label: str, logger=None):
-    """Context manager that records wall-clock duration. If *logger* is a
-    callable it is invoked with ``"<label>: <ms> ms"`` on exit.
+    """Measure wall-clock duration of the enclosed block.
 
-    Useful for instrumenting hot paths without pulling in a profiler.
+    If *logger* is callable it is invoked on exit with ``"<label>: <ms> ms"``.
     """
     t0 = time.perf_counter()
     try:

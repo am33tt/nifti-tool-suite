@@ -1,19 +1,12 @@
 """File I/O primitives for NIfTI volumes.
 
-Responsibilities
-----------------
-* :func:`load_nifti` — wraps :func:`nibabel.load`.
-* :func:`raw_array`  — materialises the voxel array from a nibabel proxy.
-* :func:`to_gray`    — collapses any dtype (including RGB-structured and
-  4-D) down to a float32 scalar volume suitable for windowing and HU
-  calibration.
-* :class:`LazyGrayVolume` — wraps a nibabel ``ArrayProxy`` so the file is
-  not eagerly materialised. Slicing returns a float32 2-D/3-D array
-  on demand, which is what makes loading near-instant for large files
-  (Slicer-style: just memory-map the header and read pixels as needed).
-* :func:`run_gunzip` — stand-alone ``.nii.gz`` → ``.nii`` decompressor.
-
-All heavy work is deferred to numpy / nibabel so the functions are thin.
+* :func:`load_nifti` wraps :func:`nibabel.load`.
+* :func:`raw_array` materialises the voxel array from a nibabel proxy.
+* :func:`to_gray` collapses any dtype (structured RGB, 4-D, scalar) to a
+  float32 scalar volume for windowing and HU calibration.
+* :class:`LazyGrayVolume` wraps a nibabel ``ArrayProxy`` so the file is not
+  materialised eagerly; slicing returns float32 on demand.
+* :func:`run_gunzip` decompresses ``.nii.gz`` to ``.nii``.
 """
 
 from __future__ import annotations
@@ -38,12 +31,12 @@ def raw_array(img):
 def to_gray(data):
     """Reduce any voxel array to a float32 scalar volume.
 
-    Handles three common layouts:
+    Handles three layouts:
 
-    1. **Structured RGB** (dtype has fields ``'R','G','B'``) — averaged into
-       luminance using equal weights (no photometric luma; CT is not perceptual).
-    2. **4-D stacks** of shape ``(X, Y, Z, C)`` — first three channels averaged.
-    3. **Plain scalar** volumes — cast to ``float32``.
+    1. Structured RGB (dtype with fields ``'R','G','B'``), averaged with
+       equal weights; photometric luma does not apply to CT.
+    2. 4-D stacks of shape ``(X, Y, Z, C)``, first three channels averaged.
+    3. Scalar volumes, cast to ``float32``.
     """
     if data.dtype.names and 'R' in data.dtype.names:
         return (
@@ -62,15 +55,12 @@ def to_gray(data):
 class LazyGrayVolume:
     """Float32 scalar 3-D view of a nibabel ``ArrayProxy``.
 
-    The proxy is memory-mapped (for ``.nii``) or lazily decoded (for
-    ``.nii.gz``) by nibabel.  We do **not** materialise the whole volume on
-    load — slicing pulls only the bytes that are asked for, which is what
-    keeps the open-file step near-instant for multi-hundred-MB volumes.
+    The proxy is memory-mapped (``.nii``) or decoded lazily (``.nii.gz``) by
+    nibabel, so slicing reads only the requested bytes.
 
-    Quacks like an ndarray for the operations the viewer hits on the hot
-    path: ``shape``, ``dtype``, ``ndim``, ``size`` and ``__getitem__``.
-    For full-array reductions (``min``/``mean``/``percentile``/...), call
-    :meth:`to_array` once and operate on the result.
+    Implements the ndarray surface the viewer uses on the hot path:
+    ``shape``, ``dtype``, ``ndim``, ``size`` and ``__getitem__``. For exact
+    full-array reductions call :meth:`to_array` once.
     """
 
     __slots__ = ("_proxy", "_is_rgb", "_is_4d", "shape", "dtype", "ndim", "_full")
@@ -79,7 +69,6 @@ class LazyGrayVolume:
         self._proxy = dataobj
         self._full = None  # cache for to_array()
 
-        # Detect RGB structured dtype vs plain scalar vs 4-D channel stack.
         proxy_dtype = getattr(dataobj, 'dtype', None)
         self._is_rgb = bool(
             proxy_dtype is not None
@@ -103,8 +92,7 @@ class LazyGrayVolume:
         """Cast a raw proxy slice/volume into a float32 scalar array.
 
         ``channel_axis`` says whether ``raw`` still has the trailing
-        per-channel axis (true for 4-D inputs that we always read with a
-        full last-axis slice).
+        per-channel axis, which is the case for 4-D inputs.
         """
         if self._is_rgb:
             return (
@@ -117,8 +105,8 @@ class LazyGrayVolume:
         return raw.astype(np.float32, copy=False)
 
     def __getitem__(self, key):
-        # 4-D proxies need an extra trailing slice so we read all channels
-        # and average them down to a scalar slice.
+        # 4-D proxies need a trailing full slice so every channel is read
+        # and averaged into a scalar slice.
         if self._is_4d:
             if isinstance(key, tuple):
                 key = key + (slice(None),)
@@ -128,22 +116,20 @@ class LazyGrayVolume:
         return self._convert(raw, channel_axis=self._is_4d)
 
     def to_array(self):
-        """Materialise the full float32 scalar volume (cached after first call).
+        """Materialise the full float32 scalar volume, cached after the first
+        call.
 
-        Use this only when you genuinely need the entire array — full
-        statistics, histogram over every voxel, calibration, E-Map, etc.
+        Only for operations needing every voxel, such as exact statistics or
+        a full-volume histogram.
         """
         if self._full is None:
             raw = np.asanyarray(self._proxy)
             self._full = self._convert(raw, channel_axis=self._is_4d)
         return self._full
 
-    # ── ndarray-like reductions (cheap, subsample-based) ────────────────────
-    #
-    # The triplanar viewer's auto-window helper calls ``.min()`` / ``.max()``
-    # on the volume.  Materialising the full array there would defeat the
-    # whole point of the lazy load, so we serve those reductions from a
-    # representative subsample.  Slicer does the same thing.
+    # ndarray-like reductions served from a subsample, and therefore
+    # approximate. The auto-window helper calls .min() and .max() on the hot
+    # path, where materialising the full array would defeat the lazy load.
 
     def min(self):
         s = self.subsample_flat(1_000_000)
@@ -169,12 +155,11 @@ class LazyGrayVolume:
         return a.astype(dtype, copy=False) if dtype is not None else a
 
     def subsample_flat(self, max_voxels: int):
-        """Cheap flat float32 sample, representative of the WHOLE volume.
+        """Flat 1-D float32 sample representative of the whole volume.
 
-        Reads a handful of Z slices spread evenly across the stack (not
-        just the middle — for stacked-specimen scans the middle can be an
-        air gap, which would poison any threshold computed from the
-        sample).  Returned array is 1-D float32.
+        Reads Z slices spread evenly across the stack rather than only the
+        middle, which in stacked-specimen scans can be an air gap and would
+        bias any threshold derived from the sample.
         """
         sx, sy, sz = self.shape
         n_slices = int(min(sz, 9))
@@ -190,12 +175,12 @@ class LazyGrayVolume:
 
 
 def preview_volume(volume, max_voxels: int = 150_000_000, progress=None):
-    """Strided float32 copy of *volume* small enough to plot / report.
+    """Strided float32 copy of *volume* small enough to plot or report.
 
-    Works on ndarrays and :class:`LazyGrayVolume` alike, reading one Z
-    slice at a time so the full-resolution volume is never materialised.
-    Returns ``(preview, stride)`` — ``stride == 1`` means the input was
-    already small enough (and, for ndarrays, is returned as-is).
+    Accepts ndarrays and :class:`LazyGrayVolume`, reading one Z slice at a
+    time so the full-resolution volume is never materialised. Returns
+    ``(preview, stride)``; ``stride == 1`` means the input was already small
+    enough and is returned unchanged.
     """
     sx, sy, sz = volume.shape[:3]
     total = sx * sy * sz
@@ -219,10 +204,10 @@ def preview_volume(volume, max_voxels: int = 150_000_000, progress=None):
 
 
 def run_gunzip(gz_path: str | Path) -> Path:
-    """Decompress ``*.nii.gz`` → ``*.nii`` into the same directory.
+    """Decompress ``*.nii.gz`` to ``*.nii`` in the same directory.
 
-    Raises :class:`ValueError` if the input does not end in ``.gz``.
-    Returns the path of the written file.
+    Raises :class:`ValueError` if the input does not end in ``.gz``. Returns
+    the path of the written file.
     """
     gz_path = Path(gz_path)
     if gz_path.suffix != '.gz':

@@ -1,25 +1,18 @@
 """Geometric operations on NIfTI volumes.
 
-Three distinct operations live here, all of which update both the voxel
-array **and** the affine/header so that downstream tools (Paraview,
-Slicer, a simulation mesh generator, …) see a coherent volume.
+Each operation updates the voxel array and the affine/header together so
+downstream tools see a coherent volume.
 
-1. :func:`run_reorientation` — a *label-swap only* operation. The voxel
-   order is permuted/flipped so the anatomical axis codes match the
-   requested target (e.g. ``"RAS"``), but every physical point keeps
-   exactly the same world coordinate.  No resampling, no interpolation,
-   no information loss.
+1. :func:`run_reorientation` permutes and flips axes so the anatomical
+   codes match a target such as ``"RAS"``. No resampling, so every physical
+   point keeps its world coordinate.
+2. :func:`run_angle_rotation` resamples at an arbitrary angle with bicubic
+   spline interpolation (``order=3``), which blurs the volume slightly.
+3. :func:`run_cropper` applies an integer index slice and updates the
+   affine origin. Lossless.
 
-2. :func:`run_angle_rotation` — an *arbitrary-angle* resample using
-   bicubic spline interpolation (``order=3``). The affine is rotated so
-   the centre of the volume is invariant in world space.  This does
-   resample and therefore slightly blurs the volume; use sparingly.
-
-3. :func:`run_cropper` — an integer index slice plus affine origin
-   update.  Losslessly trims the volume to a region of interest.
-
-Every function returns a fresh :class:`nibabel.Nifti1Image` with a
-properly updated qform/sform.
+Every function returns a fresh :class:`nibabel.Nifti1Image` with updated
+qform/sform.
 """
 
 from __future__ import annotations
@@ -28,14 +21,14 @@ from ..deps import np, nib, nio, ndimage
 from .io import raw_array
 
 
-# ── Reorientation ────────────────────────────────────────────────────────────
+# Reorientation
 
 def run_reorientation(img, target_orientation: str):
     """Reorient *img* to match the three-letter anatomical code
     *target_orientation* (e.g. ``"RAS"``, ``"LPS"``).
 
-    Implemented with :func:`nibabel.orientations.ornt_transform` — this
-    is a pure axis swap/flip and never resamples the volume.
+    Pure axis swap and flip via
+    :func:`nibabel.orientations.ornt_transform`; the volume is not resampled.
     """
     target_orientation = target_orientation.upper()
     cur  = nio.io_orientation(img.affine)
@@ -51,7 +44,7 @@ def run_reorientation(img, target_orientation: str):
     return nib.Nifti1Image(np.asanyarray(reor.dataobj), aff, hdr)
 
 
-# ── Arbitrary-angle rotation ─────────────────────────────────────────────────
+# Arbitrary-angle rotation
 
 def _rot_matrix(axis: str, angle_deg: float):
     """3×3 rotation matrix around one of the three cardinal axes."""
@@ -67,13 +60,10 @@ def _rot_matrix(axis: str, angle_deg: float):
 def run_angle_rotation(img, axis: str, angle_deg: float):
     """Rotate *img* by *angle_deg* around the requested cardinal axis.
 
-    Uses :func:`scipy.ndimage.rotate` with bicubic interpolation and
-    ``reshape=False`` so the output grid dimensions stay put. Structured
-    RGB dtypes are rotated channel-by-channel and reassembled.
-
-    The affine is updated so that the **world-space centre** of the
-    volume is invariant across the rotation — i.e. the rotation acts
-    about the centre, not the corner.
+    Uses :func:`scipy.ndimage.rotate` with ``reshape=False``, so the grid
+    dimensions are unchanged. Structured RGB dtypes are rotated channel by
+    channel and reassembled. The affine is updated so the rotation acts
+    about the world-space volume centre, not the corner.
     """
     data = raw_array(img)
     axis_plane = {'x': (1, 2), 'y': (0, 2), 'z': (0, 1)}
@@ -83,7 +73,7 @@ def run_angle_rotation(img, axis: str, angle_deg: float):
     )
 
     if data.dtype.names:
-        # Structured RGB — rotate each channel, rebuild structured array.
+        # Structured RGB: rotate each channel, then reassemble.
         channels = {}
         for ch in data.dtype.names:
             rot = ndimage.rotate(data[ch].astype(np.float32), **kw)
@@ -114,15 +104,14 @@ def run_angle_rotation(img, axis: str, angle_deg: float):
     return nib.Nifti1Image(rot_data, new_aff, hdr)
 
 
-# ── Cropping ─────────────────────────────────────────────────────────────────
+# Cropping
 
 def run_cropper(img, x_range, y_range, z_range):
     """Crop *img* to the closed-open voxel index ranges provided.
 
-    The affine's translation component is shifted so the cropped volume
-    keeps its real-world position — the voxel that was at index
-    ``(x0, y0, z0)`` before is still at the same millimetre coordinate
-    afterwards.
+    The affine translation is shifted so the cropped volume keeps its
+    world position: the voxel at index ``(x0, y0, z0)`` stays at the same
+    millimetre coordinate.
     """
     shape = img.shape
     for (s, e), dim, ax in zip([x_range, y_range, z_range], shape, 'XYZ'):

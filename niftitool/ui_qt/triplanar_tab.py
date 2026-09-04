@@ -1,20 +1,23 @@
-"""Tri-planar (sagittal / coronal / axial) viewer.
+"""Tri-planar (sagittal, coronal, axial) slice viewer.
 
-See ``ui/triplanar_tab.py`` for the performance rationale. The matplotlib
-draw path is identical; only the slider / layout widgets change.
+Panels are drawn in voxel coordinates but laid out in millimetres, so
+anisotropic volumes keep true proportions. Slices are decimated to the
+panel size and cached; slider drags are blitted instead of redrawn.
 """
 
 from __future__ import annotations
 
+import math
 import threading
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QIntValidator
 from PyQt6.QtWidgets import (
-    QButtonGroup, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSlider,
-    QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QRadioButton, QSizePolicy,
+    QSlider, QVBoxLayout, QWidget,
 )
 
 from ..config import (
@@ -23,19 +26,31 @@ from ..config import (
 )
 from ..core.windowing import apply_window, auto_window
 from ..deps import HAS_MPL, np
-from .widgets import styled_btn
+from .widgets import style_nav_toolbar, styled_btn
 
 
-def _set_layout(fig, tight: bool):
-    """Enable/disable the tight-layout engine (it re-runs on EVERY draw,
-    which costs ~10-30 ms; only needed when artists are rebuilt)."""
+# Hover readout / guide-crosshair update interval (~50 Hz).
+TRI_HOVER_INTERVAL = 0.02
+
+# A voxel read slower than this disables live sampling on hover.
+TRI_SAMPLE_BUDGET = 0.15
+
+# Panel placement, as figure fractions.
+TRI_MARGINS = {'left': 0.02, 'right': 0.98, 'bottom': 0.06, 'top': 0.92,
+               'gap': 0.025}
+
+
+def _disable_layout_engine(fig):
+    """Turn off automatic layout; panel positions are set explicitly.
+
+    Tight layout re-runs on every draw with padding that depends on
+    tick-label width, giving uneven gaps between panels.
+    """
     try:
-        fig.set_layout_engine('tight' if tight else 'none')
+        fig.set_layout_engine('none')
     except Exception:
         try:
-            fig.set_tight_layout(
-                {'pad': 0.4, 'w_pad': 1.8} if tight else False
-            )
+            fig.set_tight_layout(False)
         except Exception:
             pass
 
@@ -89,23 +104,53 @@ class TriplanarMixin:
         self._tri_vline:   dict = {}
         self._tri_compass: dict = {}
 
-        _set_layout(self._tri_fig, True)
+        _disable_layout_engine(self._tri_fig)
         self._tri_canvas = FigureCanvasTkAgg(self._tri_fig)
         root.addWidget(self._tri_canvas, 1)
         self._tri_canvas.mpl_connect('button_press_event', self._on_tri_press)
         self._tri_canvas.mpl_connect('motion_notify_event', self._on_tri_motion)
         self._tri_canvas.mpl_connect('button_release_event', self._on_tri_release)
+        self._tri_canvas.mpl_connect('resize_event', self._on_tri_resize)
+        self._init_tri_probe()
 
         self._build_tri_measure_bar(parent, root)
 
         tb_frame = QWidget(parent)
         tb_lay = QHBoxLayout(tb_frame)
         tb_lay.setContentsMargins(0, 0, 0, 0)
-        tb_lay.addWidget(NavigationToolbar2Tk(self._tri_canvas, tb_frame))
+        tb_lay.addWidget(style_nav_toolbar(
+            NavigationToolbar2Tk(self._tri_canvas, tb_frame)))
         tb_lay.addStretch(1)
+
+        self._tri_same_scale_check = QCheckBox("Same scale in all views",
+                                               tb_frame)
+        # Off by default. A common window is harmless on a roughly cubic
+        # volume but shrinks the axial view on a tall specimen.
+        self._tri_same_scale_check.setChecked(False)
+        self._tri_same_scale_check.setFont(QFont("Segoe UI", 9))
+        self._tri_same_scale_check.setStyleSheet(
+            f"color: {TEXT}; background-color: transparent;")
+        self._tri_same_scale_check.setToolTip(
+            "Off (default): each view frames its own slice and fills its "
+            "panel. Best use of the space, and the only sensible choice when "
+            "the specimen is much taller than it is wide.\n"
+            "On: every view shows the same physical window, so a feature is "
+            "the same size in all three and one scale bar reads for all of "
+            "them, at the cost of the smaller views being framed in a lot "
+            "of empty space.\n"
+            "The geometry is true either way: a slice is never stretched to "
+            "fill a panel."
+        )
+        self._tri_same_scale_check.toggled.connect(
+            self._on_tri_scale_mode_changed)
+        tb_lay.addWidget(self._tri_same_scale_check)
+
+        tb_lay.addWidget(styled_btn(tb_frame, "Fit views",
+                                    self._on_tri_scale_mode_changed,
+                                    small=True))
         root.addWidget(tb_frame)
 
-        # slider bar
+        # Slider bar
         slider_bar = QFrame(parent)
         slider_bar.setStyleSheet(f"background-color: {PANEL2};")
         sb_grid = QGridLayout(slider_bar)
@@ -168,7 +213,7 @@ class TriplanarMixin:
 
         root.addWidget(slider_bar)
 
-        # export buttons
+        # Export buttons
         export_bar = QWidget(parent)
         eb_lay = QHBoxLayout(export_bar)
         eb_lay.setContentsMargins(6, 2, 6, 2)
@@ -181,25 +226,24 @@ class TriplanarMixin:
         eb_lay.addStretch(1)
         root.addWidget(export_bar)
 
-        # Debounce state — slider drags go through the blit fast path;
-        # everything else (cmap, window, load) uses the full refresh.
+        # Slider drags take the blit fast path; cmap, window and load take
+        # the full refresh.
         self._tri_redraw_pending = None
         self._tri_debounce_timer = QTimer(self)
         self._tri_debounce_timer.setSingleShot(True)
         self._tri_debounce_timer.timeout.connect(self._tri_fast_refresh)
 
-        # Blit state: per-axes rendered backgrounds. bg0 = panel without
-        # image/crosshairs (ticks, spines, compass, title, measurements);
-        # bg1 = bg0 + current slice image. Per drag tick we restore bg1
-        # for unchanged panels, redraw one image, and redraw six lines —
-        # instead of re-rendering the entire figure through Agg.
+        # Blit state per axes: bg0 is the panel without image or crosshairs
+        # (ticks, spines, compass, title, measurements), bg1 is bg0 plus the
+        # current slice image. A drag tick restores bg1 for unchanged panels
+        # and redraws one image and six lines.
         self._tri_bg0: dict = {}
         self._tri_bg1: dict = {}
         self._tri_bg_valid = False
         self._tri_canvas.mpl_connect('draw_event', self._on_tri_full_draw)
 
-        # After the drag settles, run one normal draw so panel titles and
-        # any measurement overlays get refreshed at full fidelity.
+        # One normal draw after the drag settles, to refresh titles and
+        # measurement overlays.
         self._tri_sync_timer = QTimer(self)
         self._tri_sync_timer.setSingleShot(True)
         self._tri_sync_timer.timeout.connect(self._tri_canvas.draw_idle)
@@ -209,7 +253,7 @@ class TriplanarMixin:
             ax: _QLabelVar(lbl) for ax, lbl in self._tri_idx_widgets.items()
         }
 
-    # slider / click handlers
+    # Slider and click handlers
 
     def _on_tri_drag(self, axis, val):
         idx = int(val)
@@ -220,16 +264,15 @@ class TriplanarMixin:
         w.blockSignals(False)
         if self._gray is None:
             return
-        # Debounce
-        self._tri_debounce_timer.start(SLIDER_DEBOUNCE_MS)
+        self._tri_debounce_timer.start(self._tri_debounce_ms())
         # Warm the cache around the new position for smooth dragging.
         self._prefetch_tri_neighbors(axis, idx)
 
     def _on_tri_idx_entered(self, axis, edit):
-        """User typed a slice number and committed (Enter / focus out).
+        """Commit a typed slice index (Enter or focus-out).
 
-        Clamp to the slider range and jump. Setting the slider value re-emits
-        valueChanged, which refreshes the canvas through the debounce timer.
+        The value is clamped to the slider range. Setting the slider re-emits
+        valueChanged, which refreshes the canvas via the debounce timer.
         """
         txt = edit.text().strip()
         if not txt:
@@ -254,6 +297,9 @@ class TriplanarMixin:
         if event.inaxes not in ax_map:
             return
         axis = ax_map[event.inaxes]
+        # Measurement tools react to the left button only.
+        if event.button != 1:
+            return
         tool = getattr(self, '_tri_tool', 'pan')
         if tool == 'distance':
             self._on_tri_distance_click(axis, event)
@@ -301,15 +347,11 @@ class TriplanarMixin:
             iz = max(0, min(iz, g.shape[2] - 1))
             raw_val = float(g[ix, iy, iz])
             probe = f"voxel ({ix},{iy},{iz})  raw={raw_val:.1f}"
-            if self._hu_vol is not None:
-                probe += f"  HU={float(self._hu_vol[ix, iy, iz]):.1f}"
-            if self._E_map is not None:
-                probe += f"  E={float(self._E_map[ix, iy, iz]):.1f} MPa"
             self._probe_var.set(probe)
         except Exception:
             pass
 
-    # measurement: toolbar + helpers
+    # Measurement tools
 
     def _build_tri_measure_bar(self, parent, root):
         """Tool selector + status line for distance/ROI measurements."""
@@ -371,7 +413,7 @@ class TriplanarMixin:
 
         root.addWidget(bar)
 
-        # per-axis artist caches
+        # Per-axis artist caches
         self._dist_points: dict = {'X': [], 'Y': [], 'Z': []}
         self._dist_artists: dict = {'X': [], 'Y': [], 'Z': []}
         self._roi_drag_start = None
@@ -391,7 +433,7 @@ class TriplanarMixin:
             'pan': "",
             'distance': "Distance: click two points on any panel.",
             'roi': "ROI: drag a rectangle on any panel.",
-            'profile': "Profile: click two points — a line plot will open.",
+            'profile': "Profile: click two points; a line plot will open.",
         }
         self._tri_measure_status.setText(hints.get(tool, ""))
 
@@ -399,9 +441,9 @@ class TriplanarMixin:
         """Return (h_mm, v_mm) physical spacing of the panel `axis`.
 
         Panels display transposed slices:
-            'X' (sagittal) → (h, v) = (y, z)
-            'Y' (coronal)  → (h, v) = (x, z)
-            'Z' (axial)    → (h, v) = (x, y)
+            'X' (sagittal): (h, v) = (y, z)
+            'Y' (coronal):  (h, v) = (x, z)
+            'Z' (axial):    (h, v) = (x, y)
         """
         if self._img is None:
             return 1.0, 1.0
@@ -418,7 +460,7 @@ class TriplanarMixin:
     def _panel_ax_obj(self, axis):
         return {'X': self._ax_sag, 'Y': self._ax_cor, 'Z': self._ax_axi}[axis]
 
-    # distance tool
+    # Distance tool
 
     def _on_tri_distance_click(self, axis, event):
         pts = self._dist_points[axis]
@@ -471,7 +513,7 @@ class TriplanarMixin:
         self._dist_artists[axis] = []
         self._dist_points[axis] = []
 
-    # profile tool
+    # Profile tool
 
     def _on_tri_profile_click(self, axis, event):
         pts = self._profile_points[axis]
@@ -538,26 +580,8 @@ class TriplanarMixin:
             vi = np.clip(np.round(v_t).astype(int), 0, slice2d.shape[1] - 1)
             raw_vals = slice2d[hi, vi]
 
-        hu_vals = None
-        if self._hu_vol is not None:
-            try:
-                if axis == 'Z':
-                    hu_slice = np.asarray(self._hu_vol[:, :, zi], dtype=np.float32)
-                elif axis == 'Y':
-                    hu_slice = np.asarray(self._hu_vol[:, yi, :], dtype=np.float32)
-                else:
-                    hu_slice = np.asarray(self._hu_vol[xi, :, :], dtype=np.float32)
-                if ndimage is not None:
-                    hu_vals = ndimage.map_coordinates(
-                        hu_slice, [h_t, v_t], order=1, mode='nearest',
-                    )
-                else:
-                    hu_vals = hu_slice[hi, vi]
-            except Exception:
-                hu_vals = None
-
         d_mm = np.linspace(0.0, length_mm, n, dtype=np.float32)
-        return d_mm, raw_vals, hu_vals, n
+        return d_mm, raw_vals, n
 
     def _open_profile_plot(self, axis, pts):
         from matplotlib.figure import Figure
@@ -566,11 +590,11 @@ class TriplanarMixin:
         )
         from PyQt6.QtWidgets import QDialog, QVBoxLayout as _QVBoxLayout
 
-        d_mm, raw, hu, n = self._sample_profile(axis, pts)
+        d_mm, raw, n = self._sample_profile(axis, pts)
         panel_name = {'X': 'Sagittal', 'Y': 'Coronal', 'Z': 'Axial'}[axis]
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Intensity profile — {panel_name}")
+        dlg.setWindowTitle(f"Intensity profile: {panel_name}")
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.resize(640, 380)
         dlg.setStyleSheet(f"background-color: {BG}; color: {TEXT};")
@@ -583,23 +607,15 @@ class TriplanarMixin:
 
         ax = fig.add_subplot(111)
         ax.set_facecolor(PANEL2)
-        ax.plot(d_mm, raw, color=TEAL, lw=1.4, label='raw')
+        ax.plot(d_mm, raw, color=TEAL, lw=1.4, label='grey value')
         ax.set_xlabel("distance (mm)", color=TEXT_DIM, fontsize=9)
-        ax.set_ylabel("raw intensity", color=TEAL, fontsize=9)
+        ax.set_ylabel("grey value", color=TEAL, fontsize=9)
         ax.tick_params(colors=TEXT_DIM, labelsize=8)
         for side in ('top', 'right'):
             ax.spines[side].set_visible(False)
         for side in ('bottom', 'left'):
             ax.spines[side].set_color(BORDER)
 
-        if hu is not None:
-            ax2 = ax.twinx()
-            ax2.plot(d_mm, hu, color=ACCENT, lw=1.2, linestyle='--', label='HU')
-            ax2.set_ylabel("HU", color=ACCENT, fontsize=9)
-            ax2.tick_params(colors=TEXT_DIM, labelsize=8)
-            for side in ('top',):
-                ax2.spines[side].set_visible(False)
-            ax2.spines['right'].set_color(BORDER)
 
         length_mm = float(d_mm[-1]) if len(d_mm) else 0.0
         ax.set_title(
@@ -650,6 +666,11 @@ class TriplanarMixin:
         rect.set_height(abs(y1 - y0))
         self._roi_bounds[axis] = (x0, y0, x1, y1)
         if provisional:
+            # Cap rubber-band redraws; each one repaints the whole figure.
+            now = time.perf_counter()
+            if now - getattr(self, '_roi_draw_t', 0.0) < 0.033:
+                return
+            self._roi_draw_t = now
             self._tri_canvas.draw_idle()
 
     def _finalize_tri_roi(self):
@@ -664,7 +685,7 @@ class TriplanarMixin:
         x0, y0, x1, y1 = bounds
         if abs(x1 - x0) < 1.0 or abs(y1 - y0) < 1.0:
             self._clear_axis_roi(axis)
-            self._tri_measure_status.setText("ROI too small — drag a larger rectangle.")
+            self._tri_measure_status.setText("ROI too small; drag a larger rectangle.")
             self._tri_canvas.draw_idle()
             return
 
@@ -720,24 +741,6 @@ class TriplanarMixin:
 
         panel_name = {'X': 'Sagittal', 'Y': 'Coronal', 'Z': 'Axial'}[axis]
         extra = ""
-        if self._hu_vol is not None:
-            try:
-                if axis == 'Z':
-                    hu_blk = np.asarray(
-                        self._hu_vol[h0:h1 + 1, v0:v1 + 1, zi], dtype=np.float32
-                    )
-                elif axis == 'Y':
-                    hu_blk = np.asarray(
-                        self._hu_vol[h0:h1 + 1, yi, v0:v1 + 1], dtype=np.float32
-                    )
-                else:
-                    hu_blk = np.asarray(
-                        self._hu_vol[xi, h0:h1 + 1, v0:v1 + 1], dtype=np.float32
-                    )
-                extra = f"  HU μ={float(hu_blk.mean()):.1f}"
-            except Exception:
-                pass
-
         self._tri_measure_status.setText(
             f"{panel_name} ROI [{h0}:{h1+1}, {v0}:{v1+1}]  "
             f"μ={mean:.2f}  σ={std:.2f}  min={mn:.1f}  max={mx:.1f}  "
@@ -766,12 +769,11 @@ class TriplanarMixin:
         self._tri_measure_status.setText("")
         self._tri_canvas.draw_idle()
 
-    # refresh (hot path)
+    # Refresh (hot path)
 
     def _effective_window(self):
-        """Current (ww, wc) — the auto window is computed once per volume
-        and cached; recomputing it per slider tick used to scan the whole
-        array every frame."""
+        """Current (ww, wc); the auto window is computed once per volume
+        and cached."""
         if self._gray is None:
             return None
         ww, wc = self._ww, self._wc
@@ -784,8 +786,8 @@ class TriplanarMixin:
         return ww, wc
 
     def _prefetch_tri_neighbors(self, axis, idx):
-        """Warm the slice cache around *idx* in the background so continued
-        dragging hits pre-windowed slices instead of recomputing."""
+        """Warm the slice cache around *idx* in the background, so continued
+        dragging hits pre-windowed slices."""
         if getattr(self, '_tri_prefetch_busy', False):
             return
         g = self._gray
@@ -798,13 +800,20 @@ class TriplanarMixin:
         dim = {'X': g.shape[0], 'Y': g.shape[1], 'Z': g.shape[2]}[axis]
         self._tri_prefetch_busy = True
 
+        cost = getattr(self, '_tri_refresh_cost_ms', 0.0)
+        if cost > 80.0:
+            self._tri_prefetch_busy = False
+            return
+        offsets = (1, -1, 2, -2, 3, -3) if cost < 25.0 else (1, -1)
+        max_px = self._tri_display_px()
+
         def _run():
             try:
-                for d in (1, -1, 2, -2, 3, -3):
+                for d in offsets:
                     j = idx + d
                     if 0 <= j < dim:
                         self._slice_cache.get(
-                            axis, j, ww, wc, max_px=MAX_TRI_DISPLAY_PX,
+                            axis, j, ww, wc, max_px=max_px,
                         )
             except Exception:
                 pass
@@ -818,7 +827,7 @@ class TriplanarMixin:
         if not HAS_MPL or self._gray is None:
             return
 
-        # First volume loaded — retire the welcome banner.
+        # First volume loaded, retire the welcome banner.
         if getattr(self, '_tri_welcome', None) is not None:
             self._tri_welcome.set_visible(False)
             self._tri_welcome_sub.set_visible(False)
@@ -832,13 +841,13 @@ class TriplanarMixin:
         ww, wc = self._effective_window()
 
         cache = self._slice_cache
-        sl_X = cache.get('X', xi, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
-        sl_Y = cache.get('Y', yi, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
-        sl_Z = cache.get('Z', zi, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
+        max_px = self._tri_display_px()
+        sl_X = cache.get('X', xi, ww, wc, max_px=max_px)
+        sl_Y = cache.get('Y', yi, ww, wc, max_px=max_px)
+        sl_Z = cache.get('Z', zi, ww, wc, max_px=max_px)
 
-        # Decimated arrays are drawn with the ORIGINAL extent so every
-        # data coordinate (crosshairs, probe clicks, measurements) stays
-        # in true voxel units.
+        # Decimated arrays keep the original extent, so crosshairs, probe
+        # clicks and measurements stay in voxel units.
         nx, ny, nz = g.shape[0], g.shape[1], g.shape[2]
         extents = {
             'X': (-0.5, ny - 0.5, -0.5, nz - 0.5),
@@ -862,9 +871,8 @@ class TriplanarMixin:
             'Y': (xi, zi),
             'Z': (xi, yi),
         }
-        # For each panel, which slider drives the H-line and which drives the
-        # V-line? Colors come from AXIS_COLOR so a line's hue always matches
-        # its slider in the bottom bar.
+        # Which slider drives each panel H-line and V-line. Colors come from
+        # AXIS_COLOR so a line matches its slider.
         crosshair_axes = {
             'X': ('Z', 'Y'),  # sagittal: horiz = Z-slider, vert = Y-slider
             'Y': ('Z', 'X'),  # coronal
@@ -878,8 +886,7 @@ class TriplanarMixin:
                 rebuilt = True
                 ax_obj.clear()
                 ax_obj.set_facecolor(PANEL2)
-                # Subdued voxel-index ticks so the user can read positions.
-                # Set once on creation; hot path never touches tick state.
+                # Voxel-index ticks, set once; the hot path leaves them.
                 ax_obj.tick_params(
                     colors=TEXT_DIM, labelsize=5, length=2, width=0.4,
                     top=False, right=False, direction='out', pad=1,
@@ -891,11 +898,19 @@ class TriplanarMixin:
                     ax_obj.spines[side].set_linewidth(0.5)
                 im = ax_obj.imshow(
                     sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1,
-                    aspect='equal', interpolation='nearest',
-                    extent=extents[axis],
+                    interpolation='nearest', extent=extents[axis],
                 )
-                # Animated → excluded from normal draws; the blit fast
-                # path (and _on_tri_full_draw) paints them explicitly.
+                # The slice is drawn in voxel indices, so one index step is
+                # h_mm across and v_mm up and the display aspect must be
+                # v_mm/h_mm. 'datalim' keeps the panel box fixed and pads
+                # the view instead, so all three panels stay the same size
+                # whatever the specimen proportions.
+                h_mm, v_mm = self._panel_spacings(axis)
+                if h_mm > 0 and v_mm > 0:
+                    ax_obj.set_aspect(v_mm / h_mm, adjustable='datalim',
+                                      anchor='C')
+                # Animated artists are skipped by normal draws; the blit path
+                # and _on_tri_full_draw paint them explicitly.
                 im.set_animated(True)
                 self._tri_im[axis] = im
                 self._tri_title[axis] = ax_obj.set_title(
@@ -940,30 +955,34 @@ class TriplanarMixin:
                 c['L'].set_text(lft); c['R'].set_text(rgt)
                 c['B'].set_text(bot); c['T'].set_text(top_)
 
-        # Remember what each panel currently shows so the blit fast path
-        # can skip unchanged panels.
+        # What each panel shows, so the fast path can skip unchanged ones.
         self._tri_drawn_key = {
-            'X': (xi, ww, wc), 'Y': (yi, ww, wc), 'Z': (zi, ww, wc),
+            'X': (xi, ww, wc, max_px),
+            'Y': (yi, ww, wc, max_px),
+            'Z': (zi, ww, wc, max_px),
         }
-        # tight-layout is expensive and only needed when axes were rebuilt;
-        # freeze the layout for pure slice updates.
-        _set_layout(self._tri_fig, rebuilt)
+        if rebuilt:
+            self._layout_tri_panels()
+            self._fit_tri_panels()
+            for axis in ('X', 'Y', 'Z'):
+                self._add_tri_scale_bar(self._panel_ax_obj(axis), axis,
+                                        extents[axis])
         self._tri_canvas.draw_idle()
 
-    # blit fast path (slider drags)
+    # Blit fast path (slider drags)
 
     def _on_tri_full_draw(self, _event):
-        """After every full canvas draw: recapture the clean backgrounds
-        and paint the animated artists (images + crosshairs) on top.
+        """Recapture the clean backgrounds after a full draw, then paint the
+        animated artists (images and crosshairs) on top.
 
-        IMPORTANT: no ``canvas.blit()`` in here — this callback runs
-        inside the canvas's own paint cycle, and blitting would request
-        another repaint while painting ("Recursive repaint detected").
-        Drawing into the renderer is enough; the ongoing paint shows it.
+        No ``canvas.blit()`` here: the callback runs inside the canvas paint
+        cycle, so blitting would request a repaint while painting
+        ("Recursive repaint detected"). Drawing into the renderer suffices.
         """
         if self._tri_im.get('X') is None:
             self._tri_bg_valid = False
             return
+        self._update_tri_px_budget()
         canvas = self._tri_canvas
         try:
             for axis in ('X', 'Y', 'Z'):
@@ -975,16 +994,17 @@ class TriplanarMixin:
         except Exception:
             self._tri_bg_valid = False
 
-    def _blit_panels(self, changed, do_blit=True):
-        """Composite the animated artists over cached backgrounds.
+    def _blit_panels(self, changed, do_blit=True, only=None):
+        """Composite the animated artists over the cached backgrounds.
 
-        Panels whose image is unchanged reuse the pre-rendered image
-        background (bg1) — only their two crosshair lines are redrawn.
-        ``do_blit=False`` is used from within the draw-event callback,
-        where the surrounding paint pass will flush the buffer itself.
+        Panels whose image is unchanged reuse bg1 and redraw only their two
+        crosshair lines. ``do_blit=False`` is for the draw-event callback,
+        where the surrounding paint pass flushes the buffer.
         """
         canvas = self._tri_canvas
         for axis in ('X', 'Y', 'Z'):
+            if only is not None and axis not in only:
+                continue
             ax = self._panel_ax_obj(axis)
             im = self._tri_im.get(axis)
             if im is None or axis not in self._tri_bg0:
@@ -1001,6 +1021,9 @@ class TriplanarMixin:
                 ax.draw_artist(hl)
             if vl is not None:
                 ax.draw_artist(vl)
+            for art in self._tri_hover_artists(axis):
+                if art.get_visible():
+                    ax.draw_artist(art)
             if do_blit:
                 canvas.blit(ax.bbox)
 
@@ -1010,11 +1033,12 @@ class TriplanarMixin:
         if not HAS_MPL or self._gray is None:
             return
         if not self._tri_bg_valid or self._tri_im.get('X') is None:
-            # No cached backgrounds yet (first draw, resize, reload) —
-            # take the full path once; its draw recaptures them.
+            # No cached backgrounds yet (first draw, resize, reload); the
+            # full draw recaptures them.
             self._refresh_triplanar()
             return
 
+        t0 = time.perf_counter()
         g = self._gray
         xi = max(0, min(self._tri_idx['X'], g.shape[0] - 1))
         yi = max(0, min(self._tri_idx['Y'], g.shape[1] - 1))
@@ -1022,25 +1046,26 @@ class TriplanarMixin:
         ww, wc = self._effective_window()
 
         cache = self._slice_cache
+        max_px = self._tri_display_px()
         changed = set()
         drawn = getattr(self, '_tri_drawn_key', None)
         if drawn is None:
             drawn = self._tri_drawn_key = {}
         for axis, idx in (('X', xi), ('Y', yi), ('Z', zi)):
-            key = (idx, ww, wc)
+            key = (idx, ww, wc, max_px)
             if drawn.get(axis) != key:
-                sl = cache.get(axis, idx, ww, wc, max_px=MAX_TRI_DISPLAY_PX)
+                sl = cache.get(axis, idx, ww, wc, max_px=max_px)
                 self._tri_im[axis].set_data(sl)
                 changed.add(axis)
                 drawn[axis] = key
-            # Titles are non-animated (rendered only on full draws); the
+            # Titles are not animated and are drawn only on full draws; the
             # sync timer below refreshes them after the drag settles.
             self._tri_title[axis].set_text(
                 {'X': f"Sagittal  X={xi}", 'Y': f"Coronal   Y={yi}",
                  'Z': f"Axial     Z={zi}"}[axis]
             )
 
-        # crosshairs track all three indices on every panel
+        # Crosshairs track all three indices on every panel.
         self._tri_hline['X'].set_ydata([zi, zi])
         self._tri_vline['X'].set_xdata([yi, yi])
         self._tri_hline['Y'].set_ydata([zi, zi])
@@ -1054,6 +1079,7 @@ class TriplanarMixin:
             self._tri_bg_valid = False
             self._refresh_triplanar()
             return
+        self._note_tri_refresh_cost(t0)
         # Full-fidelity draw (titles, measurements) once dragging pauses.
         self._tri_sync_timer.start(300)
 
@@ -1084,8 +1110,8 @@ class TriplanarMixin:
         self._tri_hline.clear()
         self._tri_vline.clear()
         self._tri_compass.clear()
-        # Measurement artists live on the axes that are about to be cleared;
-        # drop our dict references so we don't hold onto dead objects.
+        # Measurement artists live on the axes about to be cleared; drop the
+        # references so no dead objects are kept.
         for axis in ('X', 'Y', 'Z'):
             self._dist_artists[axis] = []
             self._dist_points[axis] = []
@@ -1095,8 +1121,388 @@ class TriplanarMixin:
             self._profile_points[axis] = []
         if hasattr(self, '_tri_measure_status'):
             self._tri_measure_status.setText("")
+        self._tri_cursor = {}
+        self._tri_cursor_axis = None
+        self._tri_probe_ok = True
 
-    # per-axis PNG export
+    # Layout, scale bar and pointer probe
+
+    def _init_tri_probe(self):
+        """Set up the live voxel readout and the guide crosshair."""
+        self._tri_cursor: dict = {}
+        self._tri_cursor_axis = None
+        self._tri_hover_t = 0.0
+        self._tri_probe_ok = True
+        self._tri_px_budget = None
+        self._tri_refresh_cost_ms = 0.0
+        self._tri_canvas.mpl_connect('motion_notify_event', self._on_tri_hover)
+        self._tri_canvas.mpl_connect(
+            'axes_leave_event', self._on_tri_hover_leave
+        )
+
+    def _note_tri_refresh_cost(self, t0):
+        """Track what one blit refresh costs on this machine, in ms."""
+        cost = (time.perf_counter() - t0) * 1000.0
+        prev = getattr(self, '_tri_refresh_cost_ms', cost)
+        self._tri_refresh_cost_ms = prev * 0.7 + cost * 0.3
+
+    def _tri_debounce_ms(self):
+        """Slider debounce, widened where a refresh is measurably slow."""
+        cost = getattr(self, '_tri_refresh_cost_ms', 0.0)
+        return int(max(SLIDER_DEBOUNCE_MS, min(cost * 1.2, 120.0)))
+
+    def _tri_display_px(self):
+        """Longest side, in pixels, a decimated slice is rendered at."""
+        return getattr(self, '_tri_px_budget', None) or MAX_TRI_DISPLAY_PX
+
+    def _update_tri_px_budget(self):
+        """Match the decimation budget to the on-screen panel size.
+
+        Quantised to 64 px so resizing does not churn the slice-cache keys.
+        """
+        try:
+            bbox = self._ax_axi.get_window_extent()
+            longest = max(float(bbox.width), float(bbox.height))
+            ratio = float(self._tri_canvas.devicePixelRatioF())
+        except Exception:
+            return
+        if longest <= 0:
+            return
+        px = int(longest * max(1.0, ratio))
+        px = max(192, min(px, MAX_TRI_DISPLAY_PX))
+        # Round up: rendering below the panel's own resolution is visible.
+        self._tri_px_budget = max(192, math.ceil(px / 64.0) * 64)
+
+    def _voxel_sizes(self):
+        """(dx, dy, dz) in mm, falling back to unit spacing."""
+        try:
+            dx, dy, dz = (float(v) for v in self._img.header.get_zooms()[:3])
+        except Exception:
+            return 1.0, 1.0, 1.0
+        if not all(math.isfinite(v) and v > 0 for v in (dx, dy, dz)):
+            return 1.0, 1.0, 1.0
+        return dx, dy, dz
+
+    def _on_tri_resize(self, _event):
+        if self._gray is None:
+            return
+        self._layout_tri_panels()
+        self._fit_tri_panels()
+        self._tri_bg_valid = False
+
+    def _tri_view_window(self):
+        """Physical window, in mm, containing all three views.
+
+        Sagittal spans ny*dy by nz*dz, coronal nx*dx by nz*dz and axial
+        nx*dx by ny*dy, so this box holds the largest extent in each
+        direction. Giving every panel the same window puts the three views
+        at one scale, so a feature has the same on-screen size in all of
+        them and a single scale bar applies to all three.
+        """
+        g = self._gray
+        if g is None:
+            return 1.0, 1.0
+        nx, ny, nz = (int(v) for v in g.shape[:3])
+        dx, dy, dz = self._voxel_sizes()
+        width = max(nx * dx, ny * dy)
+        height = max(nz * dz, ny * dy)
+        if not (width > 0 and height > 0):
+            return 1.0, 1.0
+        return float(width), float(height)
+
+    def _layout_tri_panels(self):
+        """Position the three panels.
+
+        Two arrangements, selected by the "Same scale in all views" switch.
+
+        Same scale on
+            Every box is identical and shaped like the physical window that
+            contains all three views. One millimetre is the same number of
+            pixels everywhere, so the views can be compared directly.
+
+        Same scale off
+            Each box takes the shape of its own slice and all three share
+            one height. Panels are no longer comparable, but each view is as
+            large as the space allows. This matters on a tall scan, where a
+            common window shrinks the axial view into a narrow box.
+
+        In both cases the axes aspect keeps the geometry true; a slice is
+        never stretched to fill its panel.
+        """
+        g = self._gray
+        if not HAS_MPL or g is None:
+            return
+        fig_w, fig_h = (float(v) for v in self._tri_fig.get_size_inches())
+        if fig_w <= 0 or fig_h <= 0:
+            return
+        m = TRI_MARGINS
+        avail_w = (m['right'] - m['left']) - 2 * m['gap']
+        avail_h = m['top'] - m['bottom']
+        if avail_w <= 0 or avail_h <= 0:
+            return
+
+        nx, ny, nz = (int(v) for v in g.shape[:3])
+        dx, dy, dz = self._voxel_sizes()
+        size_mm = {
+            'X': (ny * dy, nz * dz),
+            'Y': (nx * dx, nz * dz),
+            'Z': (nx * dx, ny * dy),
+        }
+
+        if self._tri_same_scale():
+            w_mm, h_mm = self._tri_view_window()
+            shapes = {axis: (w_mm, h_mm) for axis in ('X', 'Y', 'Z')}
+        else:
+            shapes = size_mm
+
+        # Figure-fraction height per unit width, for a box of each panel
+        # shape.
+        ks = {}
+        for axis in ('X', 'Y', 'Z'):
+            w_mm, h_mm = shapes[axis]
+            k = (h_mm / w_mm) * (fig_w / fig_h) if w_mm > 0 else 1.0
+            ks[axis] = k if (math.isfinite(k) and k > 0) else 1.0
+
+        # One height for all three; each width follows from its own shape.
+        height = min(avail_h, avail_w / sum(1.0 / k for k in ks.values()))
+        widths = {axis: height / ks[axis] for axis in ('X', 'Y', 'Z')}
+        total_w = sum(widths.values())
+        if height <= 0 or total_w <= 0:
+            return
+
+        x = m['left'] + (avail_w - total_w) / 2.0
+        y = m['bottom'] + (avail_h - height) / 2.0
+        self._tri_box_frac = {}
+        for axis in ('X', 'Y', 'Z'):
+            width = widths[axis]
+            try:
+                self._panel_ax_obj(axis).set_position([x, y, width, height])
+            except Exception:
+                return
+            self._tri_box_frac[axis] = (width, height)
+            x += width + m['gap']
+
+    def _tri_same_scale(self) -> bool:
+        check = getattr(self, '_tri_same_scale_check', None)
+        return True if check is None else bool(check.isChecked())
+
+    def _fit_tri_panels(self):
+        """Frame each panel's slice inside its box, undistorted.
+
+        The limits already satisfy the panel aspect against its own box.
+        Otherwise matplotlib widens one of them on the next draw, with the
+        same result but a warning on every frame.
+        """
+        g = self._gray
+        if not HAS_MPL or g is None:
+            return
+        nx, ny, nz = (int(v) for v in g.shape[:3])
+        counts = {'X': (ny, nz), 'Y': (nx, nz), 'Z': (nx, ny)}
+        same_scale = self._tri_same_scale()
+        win_w_mm, win_h_mm = self._tri_view_window()
+        fig_w, fig_h = (float(v) for v in self._tri_fig.get_size_inches())
+        boxes = getattr(self, '_tri_box_frac', {})
+
+        for axis in ('X', 'Y', 'Z'):
+            ax_obj = self._panel_ax_obj(axis)
+            if ax_obj is None:
+                continue
+            h_mm, v_mm = self._panel_spacings(axis)
+            n_h, n_v = counts[axis]
+            if h_mm <= 0 or v_mm <= 0:
+                continue
+
+            if same_scale:
+                span_h = win_w_mm / h_mm
+                span_v = win_h_mm / v_mm
+            else:
+                span_h, span_v = float(n_h), float(n_v)
+            span_h = max(span_h, 1.0)
+            span_v = max(span_v, 1.0)
+
+            # Widen whichever direction is short of the box shape, so the
+            # slice sits centred in the spare room.
+            box = boxes.get(axis)
+            if box and fig_w > 0 and fig_h > 0:
+                box_w_px = box[0] * fig_w
+                box_h_px = box[1] * fig_h
+                aspect = v_mm / h_mm
+                if box_w_px > 0 and box_h_px > 0 and aspect > 0:
+                    # Undistorted requires box_h/box_w == aspect*span_v/span_h.
+                    need_h = span_v * aspect * box_w_px / box_h_px
+                    if need_h > span_h:
+                        span_h = need_h
+                    else:
+                        span_v = span_h * (box_h_px / box_w_px) / aspect
+
+            cx = (n_h - 1) / 2.0
+            cy = (n_v - 1) / 2.0
+            try:
+                ax_obj.set_xlim(cx - span_h / 2.0, cx + span_h / 2.0)
+                ax_obj.set_ylim(cy - span_v / 2.0, cy + span_v / 2.0)
+            except Exception:
+                continue
+        self._tri_bg_valid = False
+
+    def _on_tri_scale_mode_changed(self, _checked=False):
+        """Re-frame the panels after the scale mode is switched."""
+        if self._gray is None:
+            return
+        self._layout_tri_panels()
+        self._fit_tri_panels()
+        self._tri_canvas.draw_idle()
+
+    def _add_tri_scale_bar(self, ax_obj, axis, extent):
+        """Draw a millimetre scale bar snapped to a 1-2-5 step.
+
+        The length follows the panel visible width, so when the three views
+        share one scale they also share one bar length.
+        """
+        h_mm, _ = self._panel_spacings(axis)
+        span = abs(float(extent[1]) - float(extent[0]))
+        try:
+            lo, hi = ax_obj.get_xlim()
+            view_span = abs(float(hi) - float(lo))
+        except Exception:
+            view_span = span
+        target = max(view_span, span) * h_mm * 0.25
+        if h_mm <= 0 or span <= 0 or not math.isfinite(target) or target <= 0:
+            return
+        exponent = math.floor(math.log10(target))
+        length_mm = 10.0 ** exponent
+        for mult in (1.0, 2.0, 5.0):
+            candidate = mult * 10.0 ** exponent
+            if candidate <= target:
+                length_mm = candidate
+        y_span = abs(float(extent[3]) - float(extent[2]))
+        x0 = float(extent[0]) + span * 0.04
+        y0 = float(extent[2]) + y_span * 0.05
+        ax_obj.plot([x0, x0 + length_mm / h_mm], [y0, y0],
+                    color=TEXT, lw=2.0, solid_capstyle='butt')
+        label = (f"{length_mm:g} mm" if length_mm >= 1.0
+                 else f"{length_mm * 1000.0:g} µm")
+        ax_obj.text(x0 + (length_mm / h_mm) / 2.0, y0 + y_span * 0.015,
+                    label, color=TEXT, fontsize=6, ha='center', va='bottom')
+
+    def _tri_voxel_at(self, axis, xdata, ydata):
+        """Panel coordinates to a clamped (ix, iy, iz) voxel index."""
+        g = self._gray
+        if g is None or xdata is None or ydata is None:
+            return None
+        ex, ey = int(round(float(xdata))), int(round(float(ydata)))
+        xi, yi, zi = self._tri_idx['X'], self._tri_idx['Y'], self._tri_idx['Z']
+        if axis == 'Z':
+            ix, iy, iz = ex, ey, zi
+        elif axis == 'Y':
+            ix, iy, iz = ex, yi, ey
+        else:
+            ix, iy, iz = xi, ex, ey
+        return (max(0, min(ix, g.shape[0] - 1)),
+                max(0, min(iy, g.shape[1] - 1)),
+                max(0, min(iz, g.shape[2] - 1)))
+
+    def _tri_sample_values(self, ix, iy, iz):
+        """Grey value at a voxel, or ``None`` once sampling proves slow.
+
+        A compressed proxy may decode a whole plane per read, so live
+        sampling disables itself rather than stalling the pointer.
+        """
+        if not getattr(self, '_tri_probe_ok', True) or self._gray is None:
+            return None
+        try:
+            t0 = time.perf_counter()
+            raw = float(self._gray[ix, iy, iz])
+            if time.perf_counter() - t0 > TRI_SAMPLE_BUDGET:
+                self._tri_probe_ok = False
+        except Exception:
+            return None
+        return raw
+
+    def _tri_probe_text(self, axis, ix, iy, iz):
+        """Status-line text for one voxel: index, position and values."""
+        name = {'X': 'Sagittal', 'Y': 'Coronal', 'Z': 'Axial'}[axis]
+        dx, dy, dz = self._voxel_sizes()
+        text = (f"{name}  voxel ({ix}, {iy}, {iz})  "
+                f"mm ({ix * dx:.3f}, {iy * dy:.3f}, {iz * dz:.3f})")
+        raw = self._tri_sample_values(ix, iy, iz)
+        if raw is not None:
+            text += f"  value={raw:.4g}"
+        return text
+
+    def _on_tri_hover(self, event):
+        """Refresh the readout and guide crosshair as the pointer moves."""
+        if self._gray is None or self._roi_drag_axis is not None:
+            return
+        ax_map = {self._ax_sag: 'X', self._ax_cor: 'Y', self._ax_axi: 'Z'}
+        axis = ax_map.get(event.inaxes)
+        if axis is None:
+            self._hide_tri_cursor()
+            return
+        now = time.perf_counter()
+        if now - getattr(self, '_tri_hover_t', 0.0) < TRI_HOVER_INTERVAL:
+            return
+        self._tri_hover_t = now
+        vox = self._tri_voxel_at(axis, event.xdata, event.ydata)
+        if vox is None:
+            return
+        self._probe_var.set(self._tri_probe_text(axis, *vox))
+        self._move_tri_cursor(axis, event.xdata, event.ydata)
+
+    def _on_tri_hover_leave(self, _event):
+        self._hide_tri_cursor()
+
+    def _tri_cursor_lines(self, axis):
+        """Guide lines for a panel, created on first use."""
+        ax_obj = self._panel_ax_obj(axis)
+        pair = getattr(self, '_tri_cursor', {}).get(axis)
+        if pair is None or pair[0].axes is not ax_obj:
+            pair = (ax_obj.axhline(0.0, color=TEAL, lw=0.7, ls=':', alpha=0.9),
+                    ax_obj.axvline(0.0, color=TEAL, lw=0.7, ls=':', alpha=0.9))
+            for art in pair:
+                art.set_visible(False)
+                art.set_animated(True)
+            self._tri_cursor[axis] = pair
+        return pair
+
+    def _tri_hover_artists(self, axis):
+        """Animated guide artists for the blit compositor."""
+        return getattr(self, '_tri_cursor', {}).get(axis, ())
+
+    def _move_tri_cursor(self, axis, xdata, ydata):
+        """Position the guide lines and blit only the panels affected."""
+        if not self._tri_bg_valid:
+            return
+        try:
+            h_line, v_line = self._tri_cursor_lines(axis)
+            h_line.set_ydata([ydata, ydata])
+            v_line.set_xdata([xdata, xdata])
+            h_line.set_visible(True)
+            v_line.set_visible(True)
+            panels = {axis}
+            prev = self._tri_cursor_axis
+            if prev is not None and prev != axis:
+                for art in self._tri_cursor.get(prev, ()):
+                    art.set_visible(False)
+                panels.add(prev)
+            self._tri_cursor_axis = axis
+            self._blit_panels(set(), only=panels)
+        except Exception:
+            self._tri_bg_valid = False
+
+    def _hide_tri_cursor(self):
+        prev = getattr(self, '_tri_cursor_axis', None)
+        if prev is None:
+            return
+        self._tri_cursor_axis = None
+        for art in getattr(self, '_tri_cursor', {}).get(prev, ()):
+            art.set_visible(False)
+        if self._tri_bg_valid:
+            try:
+                self._blit_panels(set(), only={prev})
+            except Exception:
+                self._tri_bg_valid = False
+
+    # Per-axis PNG export
 
     def _export_slice(self, axis):
         if self._gray is None:
@@ -1121,27 +1527,35 @@ class TriplanarMixin:
         else:
             sl = g[:, :, idx].T
         sl_win = apply_window(sl.astype(np.float32, copy=False), ww, wc)
-        # Use Figure + Agg canvas directly rather than pyplot: deps.py sets
-        # the global backend to TkAgg for the legacy tk UI, and switching
-        # backends while Qt owns the main loop raises ImportError.
+        # Figure plus Agg canvas directly rather than pyplot: deps.py sets
+        # the global backend to TkAgg and switching it while Qt owns the main
+        # loop raises ImportError.
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         fig = Figure(figsize=(6, 6), facecolor='white')
         FigureCanvasAgg(fig)
         ax = fig.add_subplot(111)
-        ax.imshow(sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1)
+        # Physical aspect, so exported figures are not stretched.
+        h_mm, v_mm = self._panel_spacings(axis)
+        aspect = (v_mm / h_mm) if h_mm > 0 and v_mm > 0 else 'equal'
+        ax.imshow(sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1,
+                  aspect=aspect)
         ax.axis('off')
+        self._add_tri_scale_bar(
+            ax, axis,
+            (-0.5, sl_win.shape[1] - 0.5, -0.5, sl_win.shape[0] - 0.5),
+        )
         self._draw_measurements_on(ax, axis)
         fig.tight_layout(pad=0)
         fig.savefig(path, dpi=200, bbox_inches='tight')
         self._append_log(f"  Exported {axis} slice → {Path(path).name}", 'ok')
 
     def _draw_measurements_on(self, ax, axis):
-        """Re-render any distance / ROI overlays for `axis` onto `ax`.
+        """Re-render distance, profile and ROI overlays for `axis` onto `ax`.
 
-        The live overlay artists belong to the on-screen canvas; PNG export
-        builds a fresh Figure, so we replay the measurements from stored
-        coordinates.
+        The live overlay artists belong to the on-screen canvas while PNG
+        export builds a new Figure, so measurements are replayed from their
+        stored coordinates.
         """
         # Distance overlay
         pts = getattr(self, '_dist_points', {}).get(axis, [])

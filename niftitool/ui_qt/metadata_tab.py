@@ -1,5 +1,5 @@
-"""Metadata viewer tab — shows a rendered version of the log-pane
-metadata report as a scrollable column of titled cards."""
+"""Metadata viewer tab: renders the log-pane metadata report as a
+scrollable column of titled cards."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class MetadataTabMixin:
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Scroll host — metadata easily overflows on large files.
+        # Scroll host, metadata easily overflows on large files.
         scroll = QScrollArea(parent)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -35,7 +35,6 @@ class MetadataTabMixin:
         self._meta_host_lay.setSpacing(12)
         scroll.setWidget(host)
 
-        # Placeholder shown until the user triggers "View metadata".
         self._meta_placeholder = QLabel(
             "Load a NIfTI file and click “View metadata” to see a "
             "structured report here.",
@@ -54,7 +53,7 @@ class MetadataTabMixin:
         :func:`niftitool.core.metadata.collect_metadata`."""
         lay = self._meta_host_lay
 
-        # Drop everything that's there (placeholder, old cards, trailing stretch).
+        # Clear the placeholder, previous cards and the trailing stretch.
         while lay.count():
             item = lay.takeAt(0)
             w = item.widget()

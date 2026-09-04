@@ -1,8 +1,4 @@
-"""PyQt6 + VTK front-end for NIfTI Tool Suite.
-
-Mirrors niftitool.ui (tkinter) using the same mixin layout and method
-names, so niftitool.core logic can be reused without changes.
-"""
+"""PyQt6 and VTK front-end for the NIfTI tool suite."""
 
 from .app import NiftiApp
 
