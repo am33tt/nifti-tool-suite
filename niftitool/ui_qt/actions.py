@@ -86,7 +86,7 @@ class ActionsMixin:
 
         self._status_var.set(f"Opening {Path(path).name}...")
         self._prog.begin_staged()
-        threading.Thread(target=self._staged_load, args=(path,), daemon=True).start()
+        self._run_task("Load volume", lambda: self._staged_load(path))
 
     # Large-file pre-crop
 
@@ -229,6 +229,11 @@ class ActionsMixin:
     def _staged_load(self, path):
         try:
             img = load_nifti(path)
+            if self.cancel_requested():
+                self._append_log("  Load cancelled.", 'warn')
+                self.after(0, self._prog.stop)
+                self.after(0, lambda: self._status_var.set("Stopped."))
+                return
             self.after(0, self._prog.advance)
 
             gray = LazyGrayVolume(img.dataobj)
@@ -240,6 +245,10 @@ class ActionsMixin:
             self._ww = None; self._wc = None
             self._axis_labels = get_axis_labels(img.affine)
             self._slice_cache.set_volume(gray)
+            # Start the interactive preview once the volume is bound. It
+            # runs in the background: dragging works from the first frame,
+            # it just gets faster when this lands.
+            self.after(0, self.start_tri_preview)
             self.after(0, self._prog.advance)
 
             shape_str = str(img.shape)
@@ -268,9 +277,8 @@ class ActionsMixin:
             self.after(300, self._prog.done)
             self.after(300, lambda: self._status_var.set(f"Loaded: {Path(path).name}"))
 
-            threading.Thread(
-                target=self._materialise_full_volume_bg, daemon=True,
-            ).start()
+            self._run_task("Materialise volume",
+                           self._materialise_full_volume_bg)
         except Exception as ex:
             self._append_log(f"  Error loading: {ex}", 'err')
             self.after(0, lambda: self._status_var.set("Error loading file."))
@@ -285,6 +293,9 @@ class ActionsMixin:
             # Skip eager materialisation above 60% of free RAM. The lazy
             # proxy still serves slices from the file mmap and compute
             # actions materialise on demand.
+            if self.cancel_requested():
+                return
+
             est_mb = g.size * 4 / (1024 ** 2)
             free_mb = available_ram_mb()
             if free_mb is not None and est_mb > 0.60 * free_mb:
@@ -323,6 +334,7 @@ class ActionsMixin:
         if self._gray is None and self._img is not None:
             self._gray = LazyGrayVolume(self._img.dataobj)
             self._slice_cache.set_volume(self._gray)
+            self.after(0, self.start_tri_preview)
             self.after(0, self._update_tri_sliders)
         if isinstance(self._gray, LazyGrayVolume):
             return self._gray.to_array()
@@ -338,44 +350,9 @@ class ActionsMixin:
         if self._gray is None and self._img is not None:
             self._gray = LazyGrayVolume(self._img.dataobj)
             self._slice_cache.set_volume(self._gray)
+            self.after(0, self.start_tri_preview)
             self.after(0, self._update_tri_sliders)
         return self._gray
-
-    def _ram_guard(self, bytes_per_voxel: float, what: str) -> bool:
-        """Return True if a full-resolution *what* fits in RAM, else warn.
-
-        Compares voxels * bytes_per_voxel against available memory and shows
-        a dialog instead of raising MemoryError.
-        """
-        if self._img is None:
-            return False
-        vox = 1
-        for s in self._img.shape[:3]:
-            vox *= int(s)
-        needed_mb = vox * bytes_per_voxel / 1024 ** 2
-        avail_mb = available_ram_mb()
-        if avail_mb is not None and needed_mb > avail_mb * 0.85:
-            msg = (
-                f"{what} needs ~{needed_mb / 1024:.1f} GiB at full "
-                f"resolution, but only {avail_mb / 1024:.1f} GiB RAM is "
-                f"free.\n\n"
-                f"Options:\n"
-                f"  •  Crop the volume first (Crop tool); a region of "
-                f"interest is usually enough.\n"
-                f"  •  Use the Porosity tab / histogram / report; those "
-                f"work at any size (they stream and downsample "
-                f"automatically)."
-            )
-            self.after(0, lambda: QMessageBox.warning(
-                self, "Not enough RAM", msg,
-            ))
-            self._append_log(
-                f"  {what}: needs ~{needed_mb / 1024:.1f} GiB, "
-                f"{avail_mb / 1024:.1f} GiB free, aborted. "
-                f"Crop first or use the streaming tools.", 'warn',
-            )
-            return False
-        return True
 
     def _resolve_void_thresh(self):
         """Current void threshold as a float, using Otsu when set to ``'auto'``.
@@ -514,6 +491,8 @@ class ActionsMixin:
                 self._log_sep(f"Gunzip: {Path(path).name}")
                 self._set_status("Decompressing...", busy=True)
                 out = run_gunzip(path)
+                if self._abort_if_stopped("Decompression"):
+                    return
                 self._append_log(f"  → {out}", 'ok')
                 self._set_status("Gunzip complete.", busy=False)
                 self.after(0, lambda: self._ask_and_load_gunzip(out))
@@ -521,15 +500,10 @@ class ActionsMixin:
                 self._append_log(f"  {ex}", 'err')
                 self._set_status("Gunzip failed.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Decompress", _run)
 
     def _ask_and_load_gunzip(self, out):
-        reply = QMessageBox.question(
-            self, "Done", f"Decompressed to:\n{out}\n\nLoad now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self._load_path(str(out))
+        self._ask_load_after_save("File decompressed.", out)
 
     def _do_metadata(self):
         if not self._require_img():
@@ -542,6 +516,8 @@ class ActionsMixin:
                 gray_lazy = self._get_gray_lazy() if self._gray is not None else None
                 sections = collect_metadata(self._img, gray_lazy)
                 txt = read_metadata(self._img, gray_lazy)
+                if self._abort_if_stopped("Metadata"):
+                    return
                 self._append_log(txt, 'dim')
                 self.after(0, self.show_metadata_sections, sections)
                 self.after(0, self._show_tab, 'metadata')
@@ -550,7 +526,7 @@ class ActionsMixin:
                 self._append_log(f"  {ex}", 'err')
                 self._set_status("Metadata error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Read metadata", _run)
 
     def _do_histogram(self):
         if not self._require_img():
@@ -566,6 +542,8 @@ class ActionsMixin:
                 except Exception:
                     n_bins = 256
                 zidx, means, counts, edges, mn, mx = compute_histogram(gray, n_bins)
+                if self._abort_if_stopped("Histogram"):
+                    return
                 self._append_log(f"  Shape: {gray.shape}  range: {mn:.2f}-{mx:.2f}", 'dim')
                 self._append_log(
                     f"  Mean: {float(gray.mean()):.4f}  "
@@ -579,7 +557,7 @@ class ActionsMixin:
                 self._append_log(f"  {ex}", 'err')
                 self._set_status("Histogram error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Histogram", _run)
 
     def _do_reorient(self):
         if not self._require_img():
@@ -600,6 +578,8 @@ class ActionsMixin:
                 self._log_sep(f"Reorientation → {target}")
                 self._set_status(f"Reorienting to {target}...", busy=True)
                 result = run_reorientation(self._img, target)
+                if self._abort_if_stopped("Reorientation"):
+                    return
                 self._append_log(f"  New shape: {result.shape}", 'ok')
                 self._rotation_history.append({
                     "operation": "reorient",
@@ -613,7 +593,7 @@ class ActionsMixin:
                     self._append_log(f"  Saved → {Path(out_path).name}", 'ok')
                     self._set_status("Reorientation saved.", busy=False)
                     self.after(0, lambda: self._ask_load_after_save(
-                        "Load reoriented file now?", out_path))
+                        "Reoriented volume saved.", out_path))
                 else:
                     self._img = result
                     self._gray = None
@@ -625,15 +605,65 @@ class ActionsMixin:
                 self._append_log(f"  {ex}", 'err')
                 self._set_status("Reorientation error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Reorient", _run)
 
-    def _ask_load_after_save(self, prompt: str, out_path):
-        reply = QMessageBox.question(
-            self, "Saved", prompt,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self._load_path(str(out_path))
+    def _ask_load_after_save(self, summary: str, out_path):
+        """Report a saved file and offer to load it.
+
+        *summary* says what was done, in one sentence ("Background
+        removed."); the destination is taken from *out_path* and rendered
+        here. Callers must not put the path in *summary* -- an earlier
+        version left one caller passing a sentence ending in "saved to:"
+        with the path supplied separately and never displayed, so the
+        dialog asked a question it had not finished writing.
+
+        The file name and its folder go on separate lines, because a
+        Windows path is long enough to wrap mid-directory and the name is
+        the part being looked for. A minimum width is forced through the
+        layout, since QMessageBox otherwise shrinks to the title and
+        squeezes the path into a column a few words wide.
+        """
+        from PyQt6.QtWidgets import QSizePolicy, QSpacerItem
+        from PyQt6.QtCore import Qt
+
+        out_path = Path(out_path)
+        while True:
+            box = QMessageBox(self)
+            box.setWindowTitle("Saved")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(summary)
+            box.setInformativeText(
+                f"{out_path.name}\nin {out_path.parent}\n\nLoad it now?")
+            # The path is the reason this dialog exists; let it be selected.
+            box.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+
+            load = box.addButton("Load", QMessageBox.ButtonRole.AcceptRole)
+            copy = box.addButton("Copy path", QMessageBox.ButtonRole.ActionRole)
+            close = box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(load)
+            box.setEscapeButton(close)
+
+            layout = box.layout()
+            if layout is not None:
+                layout.addItem(
+                    QSpacerItem(520, 0, QSizePolicy.Policy.Minimum,
+                                QSizePolicy.Policy.Expanding),
+                    layout.rowCount(), 0, 1, layout.columnCount(),
+                )
+
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is copy:
+                # Copying should not dismiss the offer to load, so the
+                # dialog is rebuilt rather than closed.
+                self.clipboard_clear()
+                self.clipboard_append(str(out_path))
+                self._append_log(f"  Path copied: {out_path}", 'dim')
+                continue
+            if clicked is load:
+                self._load_path(str(out_path))
+            return
 
     def _do_rotate(self):
         if not self._require_img():
@@ -656,6 +686,8 @@ class ActionsMixin:
                 self._log_sep(f"Rotation  axis={axis}  angle={angle}°")
                 self._set_status(f"Rotating {angle}° around {axis.upper()}...", busy=True)
                 result = run_angle_rotation(self._img, axis, angle)
+                if self._abort_if_stopped("Rotation"):
+                    return
                 self._append_log(f"  New shape: {result.shape}", 'ok')
                 self._rotation_history.append({
                     "operation": "rotate",
@@ -669,7 +701,7 @@ class ActionsMixin:
                     nib.save(result, str(out_path))
                     self._set_status("Rotation saved.", busy=False)
                     self.after(0, lambda: self._ask_load_after_save(
-                        "Load rotated file now?", out_path))
+                        "Rotated volume saved.", out_path))
                 else:
                     self._img = result
                     self._gray = None
@@ -680,7 +712,7 @@ class ActionsMixin:
                 self._append_log(f"  {ex}", 'err')
                 self._set_status("Rotation error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Rotate", _run)
 
     def _do_crop(self):
         if not self._require_img():
@@ -709,12 +741,14 @@ class ActionsMixin:
                 )
                 self._set_status("Cropping...", busy=True)
                 result = run_cropper(self._img, ranges['X'], ranges['Y'], ranges['Z'])
+                if self._abort_if_stopped("Crop"):
+                    return
                 self._append_log(f"  Cropped shape: {result.shape}", 'ok')
                 if out_path:
                     nib.save(result, str(out_path))
                     self._set_status("Crop saved.", busy=False)
                     self.after(0, lambda: self._ask_load_after_save(
-                        "Load cropped file now?", out_path))
+                        "Cropped volume saved.", out_path))
                 else:
                     self._img = result
                     self._gray = None
@@ -725,14 +759,19 @@ class ActionsMixin:
                 self._append_log(f"  {ex}", 'err')
                 self._set_status("Crop error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Crop", _run)
 
     # Material mapping actions
 
     # Background removal
 
     def _do_remove_background(self):
-        """Detect the specimen, strip the exterior background, save NIfTI."""
+        """Detect the specimen, strip the exterior background, save NIfTI.
+
+        The volume is streamed: it is read in slabs and the result is
+        written as it is produced, so the run needs a working set of about
+        a quarter byte per voxel plus one slab, whatever the file size.
+        """
         if not self._require_img():
             return
         thresh = self._resolve_void_thresh()
@@ -740,20 +779,21 @@ class ActionsMixin:
             QMessageBox.critical(self, "No threshold",
                                  "Could not determine a threshold.")
             return
-        # raw copy + masks + labels ≈ dtype size + 8 B/voxel.
-        itemsize = 2
-        try:
-            itemsize = np.dtype(self._img.get_data_dtype()).itemsize
-        except Exception:
-            pass
-        if not self._ram_guard(float(itemsize * 2 + 8),
-                               "Background removal (full resolution)"):
-            return
         try:
             margin = max(0, int(float(self._bg_margin_widget.text())))
         except Exception:
             margin = 10
         crop = self._bg_crop_widget.isChecked()
+        boundary = self._bg_boundary_combo.currentData()
+        fill_mode = self._bg_fill_combo.currentData()
+        fill_value = None
+        if fill_mode == "value":
+            try:
+                fill_value = float(self._bg_fill_widget.text())
+            except ValueError:
+                QMessageBox.critical(self, "Bad input",
+                                     "The fill grey level must be a number.")
+                return
 
         stem = self._path.name.replace('.nii.gz', '').replace('.nii', '') \
             if self._path else "volume"
@@ -762,40 +802,100 @@ class ActionsMixin:
             return
 
         def _run():
+            from ..core.background import (
+                estimate_memory_bytes, remove_background,
+            )
+            from ..utils import OperationCancelled
+
             try:
-                from ..core.background import remove_background
-
                 self._log_sep("Background Removal")
-                self._set_status("Detecting specimen...", busy=True)
-                new_img, info = remove_background(
-                    self._img, thresh, margin=margin, crop=crop,
-                    progress=lambda st: self._set_status(
-                        f"Background: {st}...", busy=True,
+                self._log_memory_budget(estimate_memory_bytes)
+                info = remove_background(
+                    self._img, thresh, out,
+                    margin=margin, crop=crop, boundary=boundary,
+                    fill_mode=fill_mode, fill_value=fill_value,
+                    progress=lambda stage, done: self._set_status(
+                        f"Background: {stage} {done:.0%}", busy=True,
                     ),
+                    cancel=self.cancel_requested,
                 )
-                self._set_status("Saving NIfTI...", busy=True)
-                nib.save(new_img, str(out))
-
                 self._append_log(
                     f"  Threshold          : {info['threshold']:.1f}", 'dim')
+                self._log_envelope(info.get('envelope'))
                 self._append_log(
                     f"  Solid components   : {info['solid_components']} "
                     f"(largest kept)", 'dim')
                 self._append_log(
+                    f"  Cavities filled    : {info['cavity_voxels']:,} voxels",
+                    'dim')
+                self._append_log(
                     f"  Background removed : {info['background_pct']:.1f}% "
-                    f"of voxels  (fill = {info['fill_value']:.0f})", 'teal')
+                    f"of voxels  (fill = {info['fill_value']:g}, "
+                    f"{info['fill_mode']})", 'teal')
                 if info['bbox'] is not None:
                     self._append_log(
                         f"  Cropped to         : {info['out_shape']}", 'teal')
+                self._append_log(
+                    f"  Voxels kept as     : {info['dtype']}, unchanged", 'dim')
                 self._append_log(f"  Saved → {Path(out).name}", 'ok')
                 self._set_status("Background removed.", busy=False)
                 self.after(0, self._ask_load_after_save,
-                           "Background removed and saved to:", Path(out))
+                           "Background removed.", Path(out))
+            except OperationCancelled:
+                if not self._abort_if_stopped("Background removal"):
+                    self._append_log("  Background removal cancelled.", 'warn')
+                    self._set_status("Stopped.", busy=False)
             except Exception as ex:
                 self._append_log(f"  Background removal error: {ex}", 'err')
                 self._set_status("Background removal error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Remove background", _run)
+
+    def _log_envelope(self, envelope):
+        """Report the fitted specimen boundary, and what it cut.
+
+        The cut figure is the check worth reading: it should account for the
+        sleeve or mould and nothing else. A large one means the fit has
+        clipped the specimen, and the run should be repeated with the
+        largest-solid-body boundary or a wider margin.
+        """
+        if not envelope:
+            return
+        radius = envelope['radius_px']
+        self._append_log(
+            f"  Envelope radius    : {radius['median']:.1f} px "
+            f"(p5 {radius['p5']:.1f}, p95 {radius['p95']:.1f}); "
+            f"mean diameter {envelope['diameter_px']['median']:.1f} px",
+            'teal',
+        )
+        drift = envelope['axis_drift_px']
+        self._append_log(
+            f"  Axis drift         : {drift[0]:.1f} x {drift[1]:.1f} px "
+            f"over the volume; {envelope['rays_replaced']:,} of "
+            f"{envelope['rays_total']:,} rays crossed a contact and were "
+            f"fitted", 'dim',
+        )
+        self._append_log(
+            f"  Envelope removed   : {envelope['cut_solid_voxels']:,} solid "
+            f"voxels ({envelope['cut_pct_of_solid']:.1f}% of the material "
+            f"found) — check this is the sleeve and not the specimen",
+            'teal',
+        )
+
+    def _log_memory_budget(self, estimator):
+        """Log what the streaming run will need against what is free."""
+        itemsize = 2
+        try:
+            itemsize = np.dtype(self._img.get_data_dtype()).itemsize
+        except Exception:
+            pass
+        needed_gb = estimator(self._img.shape, itemsize) / 1024 ** 3
+        free_mb = available_ram_mb()
+        free = "unknown" if free_mb is None else f"{free_mb / 1024:.1f} GiB"
+        self._append_log(
+            f"  Working set        : ~{needed_gb:.2f} GiB "
+            f"({free} free); the volume is streamed, not loaded.", 'dim',
+        )
 
     # PDF report
 
@@ -828,7 +928,6 @@ class ActionsMixin:
                 from ..core.report import generate_pdf_report
                 from ..utils import OperationCancelled
 
-                self._begin_cancellable()
                 self._log_sep("PDF Report")
                 self._set_status("Generating PDF report...", busy=True)
 
@@ -897,4 +996,4 @@ class ActionsMixin:
                     self._append_log(f"  Report error: {ex}", 'err')
                     self._set_status("Report error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("PDF report", _run)

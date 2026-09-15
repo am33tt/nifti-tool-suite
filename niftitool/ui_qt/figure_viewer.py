@@ -320,8 +320,6 @@ def enable_click_to_enlarge(canvas, fig, parent, name: str = "Plot"):
     canvas.mpl_connect("button_release_event", _on_release)
     try:
         canvas.setCursor(Qt.CursorShape.PointingHandCursor)
-        canvas.setToolTip(
-            "Click a plot to open it on its own, full size and zoomable.")
     except Exception:
         pass
     return canvas

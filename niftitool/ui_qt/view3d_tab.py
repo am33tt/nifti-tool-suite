@@ -15,9 +15,16 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from .. import config
 from ..config import (
     ACCENT, AXIS_COLOR, BG, BORDER, ENTRY_BG, PANEL2, TEXT, TEXT_DIM, WARN,
 )
+from ..core import accel
+
+# See the note in core/accel.py: read through getattr so a config.py that
+# predates this setting degrades to the default instead of taking the whole
+# 3-D tab down with an ImportError.
+VIEWER_VRAM_FRACTION = getattr(config, "VIEWER_VRAM_FRACTION", 0.45)
 from ..core.io import LazyGrayVolume
 from ..core.windowing import auto_window
 from ..deps import HAS_VTK, np
@@ -112,7 +119,6 @@ class View3DMixin:
         self._3d_view_combo = QComboBox(ctrl)
         self._3d_view_combo.setFont(base_font)
         self._3d_view_combo.setFixedHeight(BAR_H)
-        self._3d_view_combo.setToolTip("Jump the camera to a preset angle.")
         for label, preset in (
             ("Select view", None),
             ("Superior (top)",      "superior"),
@@ -136,10 +142,6 @@ class View3DMixin:
         self._3d_axes_cb.setChecked(False)
         self._3d_axes_cb.setFont(base_font)
         self._3d_axes_cb.setFixedHeight(BAR_H)
-        self._3d_axes_cb.setToolTip(
-            "Show the labelled bounding-box axes on the volume. "
-            "The small XYZ gizmo in the corner is always visible."
-        )
         self._3d_axes_cb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
         self._3d_axes_cb.toggled.connect(self._on_3d_axes_toggled)
         ctrl_lay.addWidget(self._3d_axes_cb, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -148,11 +150,6 @@ class View3DMixin:
         self._3d_move_cb.setChecked(False)
         self._3d_move_cb.setFont(base_font)
         self._3d_move_cb.setFixedHeight(BAR_H)
-        self._3d_move_cb.setToolTip(
-            "When on, click-drag translates the picked volume or STL "
-            "instead of rotating the view, useful for aligning an STL "
-            "overlay with the volume."
-        )
         self._3d_move_cb.setStyleSheet(f"color: {TEXT}; background-color: transparent;")
         self._3d_move_cb.toggled.connect(self._on_3d_move_toggled)
         ctrl_lay.addWidget(self._3d_move_cb, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -198,7 +195,6 @@ class View3DMixin:
             # Per-axis visibility toggle.
             vis_cb = QCheckBox(title_row)
             vis_cb.setChecked(True)
-            vis_cb.setToolTip(f"Show / hide the {labels[ax]} slice plane.")
             vis_cb.setStyleSheet("background-color: transparent;")
             vis_cb.toggled.connect(
                 lambda on, a=ax: self._on_3d_plane_visibility_toggled(a, on)
@@ -227,7 +223,6 @@ class View3DMixin:
             idx_edit.setFixedWidth(50)
             idx_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
             idx_edit.setValidator(QIntValidator(0, 10_000, idx_edit))
-            idx_edit.setToolTip("Type a slice index and press Enter to jump.")
             row_lay.addWidget(idx_edit)
             cf_lay.addWidget(row_w)
 
@@ -249,6 +244,18 @@ class View3DMixin:
         self._3d_idx_var = {
             ax: _QLabelVar(lbl) for ax, lbl in self._3d_idx_widgets.items()
         }
+
+        # A banner directly above the render area, not an overlay on top of
+        # it: QVTKRenderWindowInteractor draws into a native window, and a
+        # Qt widget placed over one is not reliably composited above it.
+        # A sibling in the same layout always paints.
+        self._3d_banner = QLabel("", parent)
+        self._3d_banner.setFont(QFont("Segoe UI", 9))
+        self._3d_banner.setStyleSheet(
+            f"color: {ACCENT}; background-color: {PANEL2}; padding: 5px 10px;"
+        )
+        self._3d_banner.setVisible(False)
+        root.addWidget(self._3d_banner)
 
         # VTK render widget
         self._vtk_widget = QVTKRenderWindowInteractor(parent)
@@ -402,7 +409,6 @@ class View3DMixin:
 
         focus = QPushButton("Focus", row)
         focus.setFlat(True)
-        focus.setToolTip("Zoom the camera to this STL's bounds.")
         focus.setStyleSheet(
             f"color: {TEXT_DIM}; background-color: transparent; border: none;"
         )
@@ -708,22 +714,61 @@ class View3DMixin:
 
     # render
 
-    def _pick_downsample(self, shape) -> int:
-        """Pick an isotropic stride so the GPU copy fits the free RAM budget.
+    def _volume_budget_mb(self) -> tuple[float | None, str]:
+        """How many MiB the scalar volume may occupy, and where that came from.
 
-        Returns 1 (no downsample) when there is headroom or when psutil is
-        unavailable."""
+        The volume the mapper renders lives in *video* memory, so the
+        budget has to come from the GPU when there is one. Earlier this
+        used free system RAM as a stand-in, which is wrong in both
+        directions: a 4 GB card in a 64 GB workstation was handed a budget
+        it could not honour (the driver then either thrashes or the mapper
+        silently drops to its CPU ray-caster), while a card with more VRAM
+        than the machine had free RAM was downsampled for no reason.
+
+        Returns ``(budget_mb, source)``; ``budget_mb`` is ``None`` when
+        nothing could be established, which means "do not downsample".
+        """
+        free_mb, total_mb, source = accel.video_memory_mb()
+        if free_mb is not None:
+            # Budget against what is free right now: the desktop compositor
+            # and any other application already hold part of the card.
+            return max(256.0, VIEWER_VRAM_FRACTION * free_mb), source
+        if total_mb is not None:
+            # No free-memory figure. Assume the rest of the system is
+            # already using some of the card and budget more cautiously.
+            return max(256.0, 0.5 * VIEWER_VRAM_FRACTION * total_mb), source
+        # Integrated graphics or no probe: video memory is system RAM, so
+        # the old RAM-based budget is the right model here.
+        ram_mb = available_ram_mb()
+        if ram_mb is None:
+            return None, "unknown"
+        return max(256.0, 0.25 * ram_mb), "ram"
+
+    def _pick_downsample(self, shape, quiet: bool = False) -> int:
+        """Pick an isotropic stride so the volume fits the video-memory budget.
+
+        Returns 1 (no downsample) when the volume fits, or when neither a
+        GPU nor psutil could be queried.
+        """
         nx, ny, nz = shape
         voxels = float(nx) * float(ny) * float(nz)
-        # float32 scalars on the GPU side
+        # vtkSmartVolumeMapper uploads the scalars as float32.
         est_full_mb = voxels * 4.0 / (1024.0 ** 2)
-        free_mb = available_ram_mb()
-        if free_mb is None or est_full_mb <= 0.35 * free_mb:
+
+        budget_mb, source = self._volume_budget_mb()
+        if budget_mb is None:
             return 1
-        budget_mb = max(256.0, 0.25 * free_mb)
+
         ds = 1
         while est_full_mb / (ds ** 3) > budget_mb and ds < 8:
             ds += 1
+        if ds > 1 and not quiet:
+            self._append_log(
+                f"  3-D: {est_full_mb / 1024:.1f} GiB volume vs "
+                f"{budget_mb / 1024:.1f} GiB budget ({source}); "
+                f"rendering at 1/{ds}.",
+                'dim',
+            )
         return ds
 
     def _get_3d_array(self):
@@ -759,16 +804,89 @@ class View3DMixin:
         )
         return np.ascontiguousarray(arr[::ds, ::ds, ::ds]), ds
 
+    def _set_3d_banner(self, message: str | None):
+        """Show *message* above the render area, or hide the banner."""
+        banner = getattr(self, '_3d_banner', None)
+        if banner is None:
+            return
+        if message:
+            banner.setText(message)
+            banner.setVisible(True)
+        else:
+            banner.setVisible(False)
+
+    def _array_is_ready(self) -> bool:
+        """Whether :meth:`_get_3d_array` would return without heavy work.
+
+        True only when the volume is already a real array in memory and no
+        striding is needed. Anything else means materialising a proxy or
+        copying a strided view -- gigabytes either way, which is what must
+        not happen on the GUI thread.
+        """
+        if self._gray is None or isinstance(self._gray, LazyGrayVolume):
+            return False
+        try:
+            # quiet: this is a probe, not the decision. Logging here would
+            # print the stride twice for every render.
+            return self._pick_downsample(self._gray.shape, quiet=True) == 1
+        except Exception:
+            return False
+
     def _do_3d_render(self):
+        """Render the 3-D view, preparing the array off the GUI thread.
+
+        Preparing the array can mean materialising a multi-gigabyte proxy
+        or copying a strided view of one. Doing that inline froze the event
+        loop for as long as it took, so switching to this tab left the
+        window unable to repaint: the render area showed its empty
+        background with fragments of the previous tab still painted across
+        it, and nothing said why. The work now runs on a worker thread with
+        a banner explaining the wait, and only the VTK calls -- which must
+        be on the GUI thread -- happen here.
+        """
         if not HAS_VTK or not self._require_img():
             return
+        if getattr(self, '_3d_render_busy', False):
+            # A render is already in flight. Mode toggles and slider drags
+            # can arrive faster than a large volume can be prepared, and
+            # queueing them would render the same thing several times over.
+            return
 
+        if self._array_is_ready():
+            # Cheap: the array is in hand. Going through a thread here
+            # would add latency to every mode toggle and slider release.
+            try:
+                arr, ds = self._get_3d_array()
+            except Exception as ex:
+                self._fail_3d_render(ex)
+                return
+            self._finish_3d_render(arr, ds)
+            return
+
+        self._3d_render_busy = True
+        self._set_3d_banner("Preparing the 3-D view - reading the volume. "
+                            "The window stays usable while this runs.")
+        self._set_status("Preparing 3-D view...", busy=True)
+
+        def _prepare():
+            try:
+                arr, ds = self._get_3d_array()
+            except Exception as ex:                   # noqa: BLE001
+                self.after(0, lambda ex=ex: self._fail_3d_render(ex))
+                return
+            self.after(0, lambda: self._finish_3d_render(arr, ds))
+
+        self._run_task("3-D prepare", _prepare)
+
+    def _finish_3d_render(self, arr, ds):
+        """Upload and render. Must run on the GUI thread: these are VTK calls."""
         try:
-            arr, ds = self._get_3d_array()
             if arr is None:
                 return
-
-            if id(arr) != self._vtk_built_for_id or arr.shape != self._vtk_built_shape:
+            if (id(arr) != self._vtk_built_for_id
+                    or arr.shape != self._vtk_built_shape):
+                self._set_3d_banner("Uploading the volume to the graphics "
+                                    "card...")
                 self._set_status("Uploading volume to GPU...", busy=True)
                 self._upload_volume(arr, downsample=ds)
                 self._init_3d_sliders(arr.shape)
@@ -784,9 +902,17 @@ class View3DMixin:
                 self._vtk_first_render_done = True
             self._vtk_widget.GetRenderWindow().Render()
             self._set_status("3-D ready.", busy=False)
-        except Exception as ex:
-            self._append_log(f"  3-D render error: {ex}", 'err')
-            self._set_status("3-D render error.", busy=False)
+        except Exception as ex:                       # noqa: BLE001
+            self._fail_3d_render(ex)
+        finally:
+            self._3d_render_busy = False
+            self._set_3d_banner(None)
+
+    def _fail_3d_render(self, ex: Exception):
+        self._3d_render_busy = False
+        self._set_3d_banner(None)
+        self._append_log(f"  3-D render error: {ex}", 'err')
+        self._set_status("3-D render error.", busy=False)
 
     # VTK helpers
 

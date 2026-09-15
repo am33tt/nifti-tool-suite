@@ -19,6 +19,8 @@ from typing import Iterable, Optional
 
 import numpy as np
 
+from . import accel
+
 try:
     import scipy.ndimage as ndi
 except Exception:
@@ -283,7 +285,7 @@ def _clean_material_mask(
     structure = ndi.generate_binary_structure(rank=3, connectivity=1)
 
     if keep_largest_component:
-        labels, num = ndi.label(clean, structure=structure)
+        labels, num = accel.label(clean, structure=structure)
         if num > 1:
             counts = np.bincount(labels.ravel())
             counts[0] = 0
@@ -291,14 +293,14 @@ def _clean_material_mask(
             clean = labels == largest_label
 
     if close_iterations > 0:
-        clean = ndi.binary_closing(
+        clean = accel.binary_closing(
             clean,
             structure=structure,
             iterations=int(close_iterations),
         )
 
     if keep_largest_component:
-        labels, num = ndi.label(clean, structure=structure)
+        labels, num = accel.label(clean, structure=structure)
         if num > 1:
             counts = np.bincount(labels.ravel())
             counts[0] = 0

@@ -110,10 +110,6 @@ class ExportTabMixin:
         r1l.addWidget(QLabel("Simulation NIfTI file:", r1))
         self._sim_nifti_filename_edit = QLineEdit("filename.nii", r1)
         self._sim_nifti_filename_edit.setMinimumWidth(240)
-        self._sim_nifti_filename_edit.setToolTip(
-            "File name only, the C++ pipeline resolves it next to "
-            "simulation_input.json."
-        )
         r1l.addWidget(self._sim_nifti_filename_edit)
 
         r1l.addWidget(QLabel("Load direction:", r1))
@@ -163,10 +159,6 @@ class ExportTabMixin:
         self._sim_void_threshold_spin.setValue(0.47)
         self._sim_void_threshold_spin.setMinimumWidth(100)
         self._sim_void_threshold_spin.setKeyboardTracking(False)
-        self._sim_void_threshold_spin.setToolTip(
-            "Normalised to [0, 1] against the data range. Filled in "
-            "automatically from the Otsu split when a file is loaded."
-        )
         r2l.addWidget(self._sim_void_threshold_spin)
         r2l.addStretch(1)
         meta_lay.addWidget(r2)
@@ -233,10 +225,6 @@ class ExportTabMixin:
             "selected_boundary_surface.stl", sr1
         )
         self._bc_surface_name_edit.setMinimumWidth(240)
-        self._bc_surface_name_edit.setToolTip(
-            "A name containing 'load', 'support', 'roller', 'fixed' or 'grip' "
-            "pre-selects the matching boundary-condition preset below."
-        )
         sr1l.addWidget(self._bc_surface_name_edit)
 
         sr1l.addWidget(QLabel("Face direction:", sr1))
@@ -245,10 +233,6 @@ class ExportTabMixin:
             ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]
         )
         self._bc_surface_direction_combo.setCurrentText("+Y")
-        self._bc_surface_direction_combo.setToolTip(
-            "Physical outward normal of the wanted face, in world "
-            "coordinates, not a voxel-index direction."
-        )
         sr1l.addWidget(self._bc_surface_direction_combo)
         sr1l.addStretch(1)
         s_lay.addWidget(sr1)
@@ -295,10 +279,6 @@ class ExportTabMixin:
 
         self._bc_surface_auto_threshold_check = QCheckBox("Auto threshold", sr3)
         self._bc_surface_auto_threshold_check.setChecked(True)
-        self._bc_surface_auto_threshold_check.setToolTip(
-            "Estimate the material/background split from the loaded volume "
-            "with Otsu, instead of typing grey values."
-        )
         sr3l.addWidget(self._bc_surface_auto_threshold_check)
 
         def _toggle_manual_threshold(auto_enabled: bool):
@@ -321,11 +301,6 @@ class ExportTabMixin:
         self._bc_surface_band_spin.setValue(0.5)
         self._bc_surface_band_spin.setSuffix(" mm")
         self._bc_surface_band_spin.setKeyboardTracking(False)
-        self._bc_surface_band_spin.setToolTip(
-            "Keep only faces within this distance of the outermost face in "
-            "the chosen direction. Set 0 to keep every exposed face in the "
-            "region, including pore walls."
-        )
         sr4l.addWidget(self._bc_surface_band_spin)
 
         sr4l.addWidget(QLabel("Normal offset:", sr4))
@@ -336,20 +311,12 @@ class ExportTabMixin:
         self._bc_surface_normal_offset_spin.setValue(0.0)
         self._bc_surface_normal_offset_spin.setSuffix(" mm")
         self._bc_surface_normal_offset_spin.setKeyboardTracking(False)
-        self._bc_surface_normal_offset_spin.setToolTip(
-            "Moves the finished STL along the selected face direction. "
-            "Positive moves outward, negative moves inward."
-        )
         sr4l.addWidget(self._bc_surface_normal_offset_spin)
 
         self._bc_surface_keep_largest_check = QCheckBox(
             "Keep largest connected surface", sr4,
         )
         self._bc_surface_keep_largest_check.setChecked(True)
-        self._bc_surface_keep_largest_check.setToolTip(
-            "Drop speckles left by threshold noise, keeping only the largest "
-            "vertex-connected patch."
-        )
         sr4l.addWidget(self._bc_surface_keep_largest_check)
 
         sr4l.addWidget(styled_btn(

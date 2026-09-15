@@ -57,6 +57,22 @@ MAX_HIST_VOXELS = 10_000_000
 STATS_SUBSAMPLE_VOXELS = 5_000_000
 # Triplanar slider debounce in milliseconds (caps matplotlib redraws).
 SLIDER_DEBOUNCE_MS = 16
+# GPU acceleration
+# Startup mode for niftitool.core.accel: "auto", "on" or "off". The
+# NIFTITOOL_GPU environment variable overrides this, and the GUI toggle
+# overrides both for the running session. See core/accel.py for what each
+# mode means and for the numerical caveats of the GPU kernels.
+GPU_MODE_DEFAULT = "auto"
+# Fraction of *free* VRAM one kernel call may claim. The remainder is left
+# for the display driver and for the VTK 3-D viewer, which renders on the
+# same device.
+GPU_VRAM_FRACTION = 0.6
+# Fraction of total VRAM the 3-D viewer may fill with its float32 copy of
+# the volume before it starts striding the volume down. Deliberately lower
+# than GPU_VRAM_FRACTION: the mapper needs room for its own textures and
+# for the transfer functions on top of the scalar array.
+VIEWER_VRAM_FRACTION = 0.45
+
 # Longest displayed side of a triplanar slice, in pixels. Slices are
 # downsampled to this before windowing, bounding the per-frame cost at
 # roughly 15-20 ms. Coordinates stay in voxel units via the imshow extent,

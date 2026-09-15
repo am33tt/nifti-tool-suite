@@ -143,7 +143,6 @@ class BeamHardeningTabMixin:
                 from ..core import pore_threshold as pt
                 from ..utils import available_ram_mb, OperationCancelled
 
-                self._begin_cancellable()
                 self._log_sep("Beam Hardening: measure cupping")
                 self._set_status("Reading the analysis grid...", busy=True)
 
@@ -257,7 +256,7 @@ class BeamHardeningTabMixin:
                     self._append_log(f"  Beam hardening error: {ex}", 'err')
                     self._set_status("Beam hardening error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Measure cupping", _run)
 
     # --- apply ---------------------------------------------------------
 
@@ -286,7 +285,6 @@ class BeamHardeningTabMixin:
             try:
                 from ..core import beam_hardening as bh
 
-                self._begin_cancellable()
                 self._log_sep("Beam Hardening: apply correction")
                 self._set_status("Writing corrected volume...", busy=True)
 
@@ -337,7 +335,7 @@ class BeamHardeningTabMixin:
                     self._append_log(f"  Correction error: {ex}", 'err')
                     self._set_status("Correction error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Apply beam-hardening correction", _run)
 
     def _export_beam_hardening_json(self):
         """Save the fit so the same correction can be reapplied elsewhere."""

@@ -79,53 +79,24 @@ class PorosityTabMixin:
 
         self._poro_excl_border = QCheckBox("Exclude border air", opts)
         self._poro_excl_border.setChecked(True)
-        self._poro_excl_border.setToolTip(
-            "Discard components touching the volume boundary\n"
-            "(the exterior air around the specimen)."
-        )
         opts_lay.addWidget(self._poro_excl_border)
 
         self._poro_specimen_only = QCheckBox("Specimen basis", opts)
         self._poro_specimen_only.setChecked(True)
-        self._poro_specimen_only.setToolTip(
-            "Report porosity as a fraction of the specimen rather than of "
-            "the whole array, and ignore voids outside it.\n"
-            "Without this, air around the specimen counts towards the "
-            "denominator and the same specimen scanned with a wider field "
-            "of view would report a lower porosity."
-        )
         opts_lay.addWidget(self._poro_specimen_only)
 
         self._poro_sphericity = QCheckBox("Sphericity (slower)", opts)
         self._poro_sphericity.setChecked(True)
-        self._poro_sphericity.setToolTip(
-            "Mesh each void with marching cubes to measure surface area.\n"
-            "Disable for a much faster first pass on huge volumes."
-        )
         opts_lay.addWidget(self._poro_sphericity)
 
         opts_lay.addWidget(_opt_label("Threshold:"))
         self._poro_thresh_method = QComboBox(opts)
         self._poro_thresh_method.addItems(["auto", "sigma", "otsu", "valley"])
-        self._poro_thresh_method.setToolTip(
-            "auto    histogram valley when a real pore peak exists, "
-            "otherwise the noise-referenced sigma threshold\n"
-            "sigma   mode - k x sigma of the solid peak (conservative, "
-            "always defined)\n"
-            "otsu    maximum between-class variance (biased when the "
-            "porosity is small)\n"
-            "valley  minimum between the pore and solid peaks (most "
-            "physical, needs two resolved peaks)"
-        )
         opts_lay.addWidget(self._poro_thresh_method)
 
         opts_lay.addWidget(_opt_label("k:"))
         self._poro_k_sigma = styled_entry(opts, width=4)
         self._poro_k_sigma.setText("3.0")
-        self._poro_k_sigma.setToolTip(
-            "Noise widths below the solid peak used by the sigma "
-            "threshold."
-        )
         opts_lay.addWidget(self._poro_k_sigma)
 
         opts_lay.addWidget(styled_btn(
@@ -276,7 +247,6 @@ class PorosityTabMixin:
                 from ..core import pore_threshold as pt
                 from ..utils import OperationCancelled
 
-                self._begin_cancellable()
                 self._log_sep("Automatic pore threshold")
                 self._set_status("Sampling the specimen interior...", busy=True)
 
@@ -337,7 +307,7 @@ class PorosityTabMixin:
                     self._append_log(f"  Pore threshold error: {ex}", 'err')
                     self._set_status("Pore threshold error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Auto pore threshold", _run)
 
     def _show_pore_threshold(self, result, sample, sensitivity):
         """Draw the interior histogram with every candidate threshold."""
@@ -456,7 +426,6 @@ class PorosityTabMixin:
                 )
                 from ..utils import available_ram_mb, OperationCancelled
 
-                self._begin_cancellable()
                 self._log_sep("Porosity / Void Analysis")
                 self._set_status("Analyzing voids...", busy=True)
 
@@ -562,7 +531,7 @@ class PorosityTabMixin:
                     self._append_log(f"  Void analysis error: {ex}", 'err')
                     self._set_status("Void analysis error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Analyse voids", _run)
 
     # Drawing
 
@@ -716,6 +685,8 @@ class PorosityTabMixin:
                 from ..core.porosity import voids_to_csv
 
                 self._log_sep("Export voids CSV")
+                if self._abort_if_stopped("CSV export"):
+                    return
                 voids_to_csv(self._void_result, out)
                 self._append_log(
                     f"  {len(self._void_result.voids)} voids → {out}", 'ok',
@@ -725,4 +696,4 @@ class PorosityTabMixin:
                 self._append_log(f"  {ex}", 'err')
                 self._set_status("Export error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Export voids CSV", _run)

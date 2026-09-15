@@ -115,6 +115,28 @@ class LazyGrayVolume:
         raw = self._proxy[key]
         return self._convert(raw, channel_axis=self._is_4d)
 
+    def read_scalar(self, key, step: int = 1):
+        """A scalar float32 slice, decimated **before** the RGB conversion.
+
+        ``__getitem__`` converts everything it reads. For an RGB8 volume
+        that is three ``astype(float32)`` allocations and two adds over the
+        whole slice -- and the viewer then throws away the great majority
+        of it, because a panel is only a few hundred pixels across.
+        Decimating first does the same arithmetic on the pixels that will
+        actually be drawn, which for a 1000x1825 sagittal slice at a
+        display step of 3 is about a ninth of the work.
+
+        *step* decimates the first two axes of the slice, which are the
+        image axes for every orientation the viewer requests.
+        """
+        if self._is_4d:
+            key = key + (slice(None),) if isinstance(key, tuple) else (
+                key, slice(None), slice(None), slice(None))
+        raw = self._proxy[key]
+        if step > 1 and raw.ndim >= 2:
+            raw = raw[::step, ::step]
+        return self._convert(raw, channel_axis=self._is_4d)
+
     def to_array(self):
         """Materialise the full float32 scalar volume, cached after the first
         call.

@@ -188,6 +188,8 @@ class BinarizeTabMixin:
                 if envelope is not None and envelope.any():
                     inside = sample[envelope]
                 mode, sigma, rows = bz.porosity_sweep(inside)
+                if self._abort_if_stopped("Threshold sweep"):
+                    return
                 if not rows:
                     self._append_log(
                         "  The sample has no spread, so no sweep is "
@@ -216,7 +218,7 @@ class BinarizeTabMixin:
                 self._append_log(f"  Sweep error: {ex}", 'err')
                 self._set_status("Sweep error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Threshold sweep", _run)
 
     def _do_binarize_preview(self):
         """Choose the threshold and show it, without writing a volume."""
@@ -239,6 +241,8 @@ class BinarizeTabMixin:
                 threshold, global_t, env_frac, smoothed, inside = \
                     self._bin_threshold(opts, sample)
 
+                if self._abort_if_stopped("Binarisation preview"):
+                    return
                 warning, mode, sigma = bz.separability_note(inside, threshold)
                 below = float((smoothed < threshold).mean())
 
@@ -277,7 +281,7 @@ class BinarizeTabMixin:
                 self._append_log(f"  Binarise error: {ex}", 'err')
                 self._set_status("Binarise error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Binarise preview", _run)
 
     def _do_binarize_write(self):
         """Stream the indicator field to a uint8 NIfTI."""
@@ -300,7 +304,6 @@ class BinarizeTabMixin:
                 from ..core import binarize as bz
                 from ..utils import OperationCancelled
 
-                self._begin_cancellable()
                 self._log_sep("Binarise: write indicator field")
                 self._set_status("Sampling the volume...", busy=True)
                 vol = self._get_gray_lazy()
@@ -394,7 +397,7 @@ class BinarizeTabMixin:
                     self._append_log(f"  Binarise error: {ex}", 'err')
                     self._set_status("Binarise error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Write indicator field", _run)
 
     def _rewrite_binary_mask(self, path, mask, info):
         """Save a post-processed mask back over the streamed file."""

@@ -17,7 +17,8 @@ qform/sform.
 
 from __future__ import annotations
 
-from ..deps import np, nib, nio, ndimage
+from ..deps import np, nib, nio
+from . import accel
 from .io import raw_array
 
 
@@ -76,13 +77,13 @@ def run_angle_rotation(img, axis: str, angle_deg: float):
         # Structured RGB: rotate each channel, then reassemble.
         channels = {}
         for ch in data.dtype.names:
-            rot = ndimage.rotate(data[ch].astype(np.float32), **kw)
+            rot = accel.rotate(data[ch].astype(np.float32), **kw)
             channels[ch] = np.clip(rot, 0, 255).astype(data.dtype[ch])
         rot_data = np.zeros(channels[data.dtype.names[0]].shape, dtype=data.dtype)
         for ch in data.dtype.names:
             rot_data[ch] = channels[ch]
     else:
-        rot_data = ndimage.rotate(data, **kw)
+        rot_data = accel.rotate(data, **kw)
 
     # Update the affine so the rotation is about the volume centre.
     center  = np.array(data.shape[:3]) / 2.0

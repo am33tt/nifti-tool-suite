@@ -7,17 +7,19 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QKeySequence, QShortcut, QFont
 from PyQt6.QtWidgets import (
     QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
-    QScrollArea, QSplitter, QStackedWidget, QStatusBar, QTabWidget,
+    QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStatusBar,
+    QTabWidget,
     QVBoxLayout, QWidget,
 )
 
 from ..config import (
     ACCENT, BG, BORDER, BTN_BG, BTN_HOV, ENTRY_BG, PANEL, PANEL2, TEXT, TEXT_DIM,
 )
+from ..core import accel
 from ..core.slice_cache import SliceCache
 from ..deps import missing_report
 from ..utils import process_rss_mb
@@ -34,6 +36,47 @@ from .sim_export_actions import SimExportActionsMixin
 from .triplanar_tab import TriplanarMixin
 from .view3d_tab import View3DMixin
 from .widgets import StageProgressBar, hline, styled_btn
+
+
+#: The tooltip's look, kept separate because it has to be applied twice:
+#: once in the application stylesheet, for tooltips on widgets that have no
+#: stylesheet of their own, and once directly onto the tooltip window by
+#: :class:`_ToolTipStyler` for the rest. See that class for why.
+TOOLTIP_QSS = f"""
+    QToolTip {{
+        background-color: {PANEL}; color: {TEXT};
+        border: 1px solid {BORDER};
+        padding: 4px 6px;
+    }}
+"""
+
+
+class _ToolTipSuppressor(QObject):
+    """Stop hover tooltips appearing anywhere in the application.
+
+    Every explanation that used to live in a tooltip is now in Help. A
+    tooltip is a poor place for one: it is unreadable on a dark-themed
+    desktop unless every widget stylesheet remembers to restyle it, it
+    disappears the moment the pointer moves, several of these ran to a
+    paragraph or more, and none of them could be searched, selected or
+    copied.
+
+    This filter swallows the tooltip event itself rather than relying on
+    every ``setToolTip`` call having been removed, so a tooltip Qt raises
+    on its own -- an elided item in a tree, a truncated header -- does not
+    reintroduce one either.
+
+    The ``QToolTip`` rule in the stylesheet is kept as a fallback: if this
+    filter is ever taken out, tooltips come back styled rather than black.
+    """
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.Type.ToolTip:
+                return True                    # handled: show nothing
+        except Exception:
+            pass
+        return False
 
 
 def _build_qss() -> str:
@@ -131,16 +174,79 @@ def _build_qss() -> str:
         background-color: {PANEL2}; color: {TEXT};
         border: 1px solid {BORDER}; padding: 2px 6px;
     }}
+    QMenuBar {{
+        background-color: {PANEL2}; color: {TEXT};
+        border-bottom: 1px solid {BORDER};
+    }}
+    QMenuBar::item {{ background: transparent; padding: 4px 10px; }}
+    QMenuBar::item:selected {{ background-color: {BORDER}; }}
+    QMenuBar::item:pressed {{ background-color: {ACCENT}; color: #FFFFFF; }}
     QMenu {{
         background-color: {PANEL}; color: {TEXT};
         border: 1px solid {BORDER};
     }}
+    QMenu::item {{ padding: 4px 24px 4px 20px; }}
     QMenu::item:selected {{ background-color: {ACCENT}; color: #FFFFFF; }}
-    QToolTip {{
-        background-color: {PANEL}; color: {TEXT};
-        border: 1px solid {BORDER};
-    }}
+    QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 8px; }}
+    """ + TOOLTIP_QSS
+
+
+def _apply_theme(qapp) -> None:
+    """Give *qapp* this application's light theme, three ways over.
+
+    The stylesheet alone is not enough for tooltips. A tooltip is a native
+    top-level window whose colours come from the palette, and on Windows
+    Qt follows the *system* colour scheme for those: with Windows in dark
+    mode the tooltip is painted from the dark palette -- black on dark grey
+    -- while every widget the stylesheet reaches stays light. That is why
+    only the tooltip looked wrong.
+
+    So all three are set, cheapest first, and each is harmless if another
+    already did the job:
+
+    1. the colour-scheme hint, so Qt stops pulling dark system colours in
+       (Qt 6.8 and newer; ignored silently on older builds);
+    2. the palette's tooltip roles, which is what a natively drawn tooltip
+       actually reads;
+    3. the stylesheet, which covers everything else.
     """
+    from PyQt6.QtGui import QColor, QPalette
+
+    # 1. Do not follow a dark Windows into a dark palette: this app has one
+    #    theme, defined in config.py, and it is a light one.
+    try:
+        from PyQt6.QtCore import Qt
+        hints = qapp.styleHints()
+        if hasattr(hints, "setColorScheme"):
+            hints.setColorScheme(Qt.ColorScheme.Light)
+    except Exception:
+        pass
+
+    # 2. Palette roles. ToolTipBase and ToolTipText are the two a tooltip
+    #    reads when the platform style draws it itself.
+    try:
+        palette = qapp.palette()
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(PANEL))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor(TEXT))
+        palette.setColor(QPalette.ColorRole.Window, QColor(BG))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(TEXT))
+        palette.setColor(QPalette.ColorRole.Base, QColor(ENTRY_BG))
+        palette.setColor(QPalette.ColorRole.Text, QColor(TEXT))
+        qapp.setPalette(palette)
+    except Exception:
+        pass
+
+    # 3. The stylesheet, applied at application level so top-level dialogs
+    #    pick it up too.
+    qapp.setStyleSheet(_build_qss())
+
+    # 4. And no hover tooltips at all: the explanations they carried are in
+    #    Help now. Kept on the application so it is not garbage collected --
+    #    an event filter is not owned by the object it filters.
+    if getattr(qapp, "_niftitool_tooltip_filter", None) is None:
+        suppressor = _ToolTipSuppressor(qapp)
+        qapp.installEventFilter(suppressor)
+        qapp._niftitool_tooltip_filter = suppressor
 
 
 class NiftiApp(
@@ -172,6 +278,9 @@ class NiftiApp(
     _post_status_signal = pyqtSignal(str, bool)
     _post_call_signal = pyqtSignal(object)  # carries a zero-arg callable
     _post_delayed_signal = pyqtSignal(int, object)  # (ms, callable)
+    _post_tasks_signal = pyqtSignal(int)  # number of running background tasks
+
+    _STOP_LABEL = "■  Stop"
 
     def __init__(self) -> None:
         super().__init__()
@@ -179,11 +288,12 @@ class NiftiApp(
         self.resize(1600, 1000)
         self.setMinimumSize(1200, 750)
 
-        # Application-level QSS so top-level dialogs pick it up too.
+        # Application-level theme so top-level dialogs and tooltips pick it
+        # up too. See _apply_theme for why the stylesheet is not enough.
         from PyQt6.QtWidgets import QApplication
         qapp = QApplication.instance()
         if qapp is not None:
-            qapp.setStyleSheet(_build_qss())
+            _apply_theme(qapp)
         else:
             self.setStyleSheet(_build_qss())
 
@@ -213,19 +323,112 @@ class NiftiApp(
         # perf aids
         self._slice_cache = SliceCache()
 
-        # Cooperative cancellation for worker threads: the status-bar Stop
-        # button sets this and the loops poll it.
+        # Background task registry. Every worker thread started through
+        # _run_task is listed here while it runs, which is what shows the
+        # status-bar Stop button. The Stop button sets _cancel_event and the
+        # workers poll it at their own checkpoints.
+        self._active_tasks: list[str] = []
+        self._task_lock = threading.Lock()
         self._cancel_event = threading.Event()
 
         # build
+        self._build_menubar()
         self._build_ui()
         self._connect_thread_signals()
         self._check_deps()
         self._setup_dnd()
 
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._open_file)
+        QShortcut(QKeySequence("F1"), self).activated.connect(self.show_help)
 
         self._start_ram_monitor()
+
+    # help
+
+    def _build_menubar(self):
+        """The menu bar. Help lives here rather than in hover tooltips.
+
+        Every control used to carry a tooltip. They were unreadable on a
+        dark-themed desktop, they vanished the moment the pointer moved,
+        several were far too long to read that way, and none of them could
+        be searched or copied. The same text now lives in
+        :mod:`niftitool.ui_qt.help_content` and is shown in a window that
+        stays open beside the controls it describes.
+        """
+        from PyQt6.QtGui import QAction
+        from PyQt6.QtWidgets import QMenuBar
+
+        # Not self.menuBar(): a menu bar holding one menu wastes a whole
+        # band across the top of the window. This one is built detached and
+        # placed inside the application bar in _build_ui, so the menu, the
+        # product name and the file actions share a single row.
+        menubar = QMenuBar(self)
+        menubar.setNativeMenuBar(False)
+        self._menubar = menubar
+        help_menu = menubar.addMenu("&Help")
+
+        contents = QAction("&Contents", self)
+        contents.setShortcut(QKeySequence("F1"))
+        contents.triggered.connect(self.show_help)
+        help_menu.addAction(contents)
+
+        search = QAction("&Search help...", self)
+        search.setShortcut(QKeySequence("Ctrl+F1"))
+        search.triggered.connect(self.search_help)
+        help_menu.addAction(search)
+
+        help_menu.addSeparator()
+        # Direct routes to the topics people look for by name rather than
+        # by browsing, so the menu answers the question without a search.
+        for label, section in (
+            ("&Getting started", "Getting started"),
+            ("&Volumes larger than RAM", "Getting started"),
+            ("&GPU and reproducibility", "Performance and reproducibility"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda _checked=False, name=section: self.show_help(name))
+            help_menu.addAction(action)
+
+        help_menu.addSeparator()
+        about = QAction("&About", self)
+        about.triggered.connect(self._show_about)
+        help_menu.addAction(about)
+
+    def show_help(self, section: str | None = None):
+        """Open the Help window, optionally on a named section."""
+        from .help_dialog import HelpDialog
+
+        if getattr(self, "_help_dialog", None) is None:
+            self._help_dialog = HelpDialog(self)
+        dialog = self._help_dialog
+        if isinstance(section, str) and section:
+            dialog.show_section(section)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        return dialog
+
+    def search_help(self):
+        self.show_help().focus_search()
+
+    def _show_about(self):
+        from PyQt6.QtWidgets import QMessageBox
+        from ..core import accel
+
+        box = QMessageBox(self)
+        box.setWindowTitle("About")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("NIfTI Tool Suite")
+        box.setInformativeText(
+            "Preprocessing and inspection for industrial and research CT "
+            "volumes.\n\n"
+            f"{accel.gpu_status_line()}\n\n"
+            "Press F1 for help."
+        )
+        box.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.exec()
 
     # thread-safe plumbing
 
@@ -233,6 +436,7 @@ class NiftiApp(
         self._post_log_signal.connect(self._do_append_log)
         self._post_status_signal.connect(self._do_set_status)
         self._post_call_signal.connect(self._do_call)
+        self._post_tasks_signal.connect(self._do_tasks_changed)
         self._post_delayed_signal.connect(self._do_delayed_call)
         # Lets the cross-thread schedulers short-circuit during shutdown.
         # Late callbacks from daemon threads would otherwise re-enter QTimer
@@ -315,20 +519,124 @@ class NiftiApp(
             if callable(fn):
                 fn()
 
-    # cooperative cancellation
+    # background tasks and cooperative cancellation
+
+    def _run_task(self, label: str, fn):
+        """Run ``fn`` on a daemon thread and track it in the status bar.
+
+        The Stop button is shown as soon as the first task starts and hidden
+        when the last one finishes, so any long action can be interrupted.
+        ``fn`` polls :meth:`cancel_requested` at its own checkpoints; a step
+        already inside a library call finishes before the task gives up.
+        """
+        def _wrapped():
+            try:
+                fn()
+            finally:
+                self._task_finished(label)
+
+        self._task_started(label)
+        thread = threading.Thread(target=_wrapped, name=label, daemon=True)
+        thread.start()
+        return thread
 
     def _begin_cancellable(self):
-        """Arm a fresh cancellation token at the start of a long task."""
+        """Arm a fresh cancellation token.
+
+        :meth:`_run_task` does this for the first task of a batch; the method
+        stays for code that starts a thread of its own.
+        """
         self._cancel_event.clear()
 
+    def _task_started(self, label: str):
+        with self._task_lock:
+            if not self._active_tasks:
+                self._cancel_event.clear()
+            self._active_tasks.append(label)
+            count = len(self._active_tasks)
+        self._post_tasks_signal.emit(count)
+
+    def _task_finished(self, label: str):
+        with self._task_lock:
+            if label in self._active_tasks:
+                self._active_tasks.remove(label)
+            count = len(self._active_tasks)
+        self._post_tasks_signal.emit(count)
+        if count == 0:
+            self._report_gpu_fallbacks()
+
+    def _report_gpu_fallbacks(self):
+        """Say once which kernels could not use the GPU and why.
+
+        A silent fallback leaves a run correct but slow with nothing to
+        explain it. Reported only in 'on' mode, where the user asked for
+        the GPU explicitly; in 'auto' a fallback is the expected behaviour
+        and not worth interrupting the log for.
+        """
+        if accel.get_mode() != "on":
+            return
+        notes = accel.fallback_notes()
+        new = {k: v for k, v in notes.items()
+               if k not in getattr(self, '_gpu_notes_shown', set())}
+        if not new:
+            return
+        self._gpu_notes_shown = set(notes)
+        for kernel, reason in new.items():
+            self._append_log(
+                f"  GPU: {kernel} ran on the CPU ({reason}).", 'warn')
+
+    def tasks_running(self) -> bool:
+        with self._task_lock:
+            return bool(self._active_tasks)
+
+    def _do_tasks_changed(self, count: int):
+        """Show or hide the Stop button as tasks come and go."""
+        running = count > 0
+        button = getattr(self, '_stop_btn', None)
+        if button is not None:
+            button.setVisible(running)
+            if running and not self.cancel_requested():
+                button.setEnabled(True)
+                button.setText(self._STOP_LABEL)
+        if running:
+            self._prog.start()
+        else:
+            self._prog.stop()
+            if self.cancel_requested():
+                self._status_var.set("Stopped.")
+            self._cancel_event.clear()
+            if button is not None:
+                button.setEnabled(True)
+                button.setText(self._STOP_LABEL)
+
     def cancel_requested(self) -> bool:
+        """True once the user has pressed Stop, until the last task ends."""
         return self._cancel_event.is_set()
 
+    def _abort_if_stopped(self, what: str) -> bool:
+        """True when Stop was pressed; logs it and clears the status bar.
+
+        Call this at the point where a task is about to commit its result, so
+        a cancelled run leaves the loaded volume and the analysis state as
+        they were.
+        """
+        if not self.cancel_requested():
+            return False
+        self._append_log(f"  {what} cancelled.", 'warn')
+        self._set_status("Stopped.", busy=False)
+        return True
+
     def _request_stop(self):
+        if not self._cancel_event.is_set():
+            self._append_log(
+                "  Stop requested, finishing the current step...", 'warn',
+            )
         self._cancel_event.set()
-        self._append_log(
-            "  Stop requested, finishing the current step...", 'warn',
-        )
+        button = getattr(self, '_stop_btn', None)
+        if button is not None:
+            button.setEnabled(False)
+            button.setText("■  Stopping")
+        self._status_var.set("Stopping...")
 
     def _show_tab(self, name: str):
         """Jump the right-hand tab widget to the named tab."""
@@ -409,6 +717,9 @@ class NiftiApp(
                 f"  Install: pip install nibabel numpy scipy matplotlib psutil scikit-image\n",
                 'warn',
             )
+        # State the compute backend once at startup, so a session log says
+        # what produced its numbers rather than what was configured.
+        self._append_log(f"  {accel.gpu_status_line()}", 'teal')
 
     # RAM monitor
 
@@ -420,10 +731,17 @@ class NiftiApp(
 
     def _update_ram(self):
         mb = process_rss_mb()
-        if mb is not None:
-            self._ram_label.setText(f"RAM  {mb:.0f} MiB")
-        else:
-            self._ram_label.setText("RAM  - (pip install psutil)")
+        text = f"RAM  {mb:.0f} MiB" if mb is not None else "RAM  - (pip install psutil)"
+        # Video memory sits next to it: the 3-D viewer and the filter
+        # kernels are budgeted against this number, not against RAM, so it
+        # is the one to watch when a render is being downsampled.
+        free_mb, total_mb, source = accel.video_memory_mb()
+        if total_mb is not None:
+            if free_mb is not None:
+                text += f"   VRAM  {(total_mb - free_mb):.0f} / {total_mb:.0f} MiB"
+            else:
+                text += f"   VRAM  {total_mb:.0f} MiB ({source})"
+        self._ram_label.setText(text)
 
     # clipboard helpers
 
@@ -449,76 +767,87 @@ class NiftiApp(
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # The left and right containers share a stretch factor so the centre
-        # group lands at the true window centre.
-        top = QFrame(self)
-        top.setStyleSheet(f"background-color: {BG};")
-        top_lay = QHBoxLayout(top)
-        top_lay.setContentsMargins(14, 8, 14, 8)
-
-        top_lay.addStretch(1)
-
-        center = QWidget(top)
-        center.setStyleSheet(f"background-color: {BG};")
-        center_lay = QHBoxLayout(center)
-        center_lay.setContentsMargins(0, 0, 0, 0)
-        center_lay.setSpacing(8)
-        center_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # One application bar instead of three stacked strips. The window
+        # used to open with four bands of chrome -- a menu bar holding a
+        # single menu, a centred wordmark with the file actions pushed to
+        # the far right, a file-info strip, and the tool nav -- roughly
+        # 170 px before any data. Brand, menu and actions belong on one
+        # row, and the file summary reads better beside the tool nav than
+        # on a band of its own.
+        appbar = QFrame(self)
+        appbar.setStyleSheet(f"background-color: {BG};")
+        bar_lay = QHBoxLayout(appbar)
+        bar_lay.setContentsMargins(12, 4, 12, 4)
+        bar_lay.setSpacing(8)
 
         from .. import LOGO_PATH
-        logo_lbl = QLabel(center)
-        logo_pm = QIcon(str(LOGO_PATH)).pixmap(26, 26)
+        logo_lbl = QLabel(appbar)
+        logo_pm = QIcon(str(LOGO_PATH)).pixmap(22, 22)
         if not logo_pm.isNull():
             logo_lbl.setPixmap(logo_pm)
         logo_lbl.setStyleSheet(f"background-color: {BG}; border: none;")
-        center_lay.addWidget(logo_lbl)
+        bar_lay.addWidget(logo_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        title = QLabel("NIfTI Tool Suite", center)
-        title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        title = QLabel("NIfTI Tool Suite", appbar)
+        title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {TEXT}; background-color: {BG};")
-        center_lay.addWidget(title)
+        bar_lay.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        sub = QLabel("v6  SimReady  |  Ctrl+O to open", center)
+        # The version is a detail, not a heading: same row, quieter. The
+        # "Ctrl+O to open" hint that used to sit here is gone -- it labelled
+        # a button standing right beside it. Help lists the shortcuts.
+        sub = QLabel("v6 \u00b7 SimReady", appbar)
         sub.setFont(QFont("Segoe UI", 9))
         sub.setStyleSheet(f"color: {TEXT_DIM}; background-color: {BG};")
-        center_lay.addWidget(sub)
+        bar_lay.addWidget(sub, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        top_lay.addWidget(center, 0)
+        menubar = getattr(self, "_menubar", None)
+        if menubar is not None:
+            menubar.setStyleSheet("QMenuBar { background: transparent; "
+                                  "border: none; }")
+            menubar.setSizePolicy(QSizePolicy.Policy.Maximum,
+                                  QSizePolicy.Policy.Preferred)
+            bar_lay.addSpacing(6)
+            bar_lay.addWidget(menubar, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        right = QWidget(top)
-        right.setStyleSheet(f"background-color: {BG};")
-        right_lay = QHBoxLayout(right)
-        right_lay.setContentsMargins(0, 0, 0, 0)
-        right_lay.setSpacing(6)
-        right_lay.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        # The file summary lives here, in the widest free space the window
+        # has, rather than on a band of its own or crowded onto the end of
+        # the tool nav -- at the 1200 px minimum width the nav row leaves
+        # it about a hundred pixels, which elides away everything but the
+        # first few characters. It elides from the middle, so the name and
+        # the voxel size both survive whatever room is left.
+        bar_lay.addSpacing(10)
+        self._info_label = _ElidingLabel(
+            "No file loaded  \u2500  open a .nii or .nii.gz file", appbar,
         )
-        open_btn = styled_btn(right, "Open NIfTI...", self._open_file, accent=True)
-        right_lay.addWidget(open_btn)
-        gz_btn = styled_btn(right, "Gunzip .gz...", self._do_gunzip)
-        right_lay.addWidget(gz_btn)
-        top_lay.addWidget(right, 1)
+        self._info_label.setFont(QFont("Consolas", 9))
+        self._info_label.set_color(TEXT_DIM)
+        self._info_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._info_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                       QSizePolicy.Policy.Preferred)
+        bar_lay.addWidget(self._info_label, 1)
+        bar_lay.addSpacing(10)
 
-        root.addWidget(top)
+        # Stop sits with the file actions rather than in the status bar.
+        # It is the one control a user reaches for under time pressure, and
+        # the status bar is the furthest corner of the window from where
+        # they started the task. Hidden until a task is running, so it
+        # costs nothing the rest of the time; _do_tasks_changed shows it.
+        self._stop_btn = styled_btn(appbar, self._STOP_LABEL,
+                                    self._request_stop, danger=True)
+        self._stop_btn.setVisible(False)
+        bar_lay.addWidget(self._stop_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # Separator
-        root.addWidget(hline(self))
+        open_btn = styled_btn(appbar, "Open NIfTI...", self._open_file,
+                              accent=True)
+        bar_lay.addWidget(open_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        gz_btn = styled_btn(appbar, "Gunzip .gz...", self._do_gunzip)
+        bar_lay.addWidget(gz_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # File info bar
-        inf = QFrame(self)
-        inf.setStyleSheet(f"background-color: {PANEL2};")
-        inf_lay = QHBoxLayout(inf)
-        inf_lay.setContentsMargins(10, 5, 10, 5)
-        self._info_label = QLabel(
-            "No file loaded  ─  open a .nii or .nii.gz file", inf,
-        )
-        self._info_label.setFont(QFont("Consolas", 10))
-        self._info_label.setStyleSheet(
-            f"color: {TEXT_DIM}; background-color: {PANEL2};"
-        )
-        inf_lay.addWidget(self._info_label)
-        inf_lay.addStretch(1)
-        root.addWidget(inf)
+        # setMenuWidget puts this in the window's menu-bar slot, above the
+        # central widget, so it reads as one bar rather than as content.
+        self.setMenuWidget(appbar)
 
         # Build all tool panels (populates self._tool_panels)
         self._build_controls()
@@ -540,8 +869,8 @@ class NiftiApp(
         nav = QFrame(self)
         nav.setStyleSheet(f"background-color: {PANEL2};")
         nav_lay = QHBoxLayout(nav)
-        nav_lay.setContentsMargins(10, 4, 10, 4)
-        nav_lay.setSpacing(4)
+        nav_lay.setContentsMargins(10, 2, 10, 2)
+        nav_lay.setSpacing(2)
 
         self._tool_nav_group = QButtonGroup(self)
         self._tool_nav_group.setExclusive(True)
@@ -569,6 +898,7 @@ class NiftiApp(
             nav_lay.addWidget(btn)
             self._tool_nav_group.addButton(btn)
             self._tool_nav_buttons[key] = btn
+
         nav_lay.addStretch(1)
         root.addWidget(nav)
         root.addWidget(hline(self))
@@ -721,14 +1051,9 @@ class NiftiApp(
 
         sb_lay.addStretch(1)
 
-        # Stop button, visible only while a background task is running.
-        self._stop_btn = styled_btn(status_bar, "■  Stop",
-                                    self._request_stop, danger=True,
-                                    small=True)
-        self._stop_btn.setVisible(False)
-        sb_lay.addWidget(self._stop_btn)
-        sb_lay.addSpacing(8)
-
+        # The Stop button used to live here. It moved to the application
+        # bar, beside Open; the progress bar stays, since that is status
+        # rather than an action.
         self._prog = StageProgressBar(status_bar)
         sb_lay.addWidget(self._prog)
 
@@ -766,6 +1091,47 @@ class NiftiApp(
     @property
     def _ram_var(self):
         return _LabelVar(self._ram_label)
+
+
+class _ElidingLabel(QLabel):
+    """A label that shortens its text from the middle instead of clipping.
+
+    The file summary is "name | shape | dtype | spacing". A plain QLabel
+    either forces the row as wide as that string -- pushing the tool
+    buttons off a narrow window -- or clips the end, losing the voxel size.
+    Eliding from the middle keeps both ends, which are the parts worth
+    reading at a glance.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._full_text = text
+        self._color = TEXT_DIM
+
+    def set_color(self, color: str):
+        self._color = color
+        self.update()
+
+    def setText(self, text: str):
+        self._full_text = text or ""
+        super().setText(self._full_text)
+        self.update()
+
+    def full_text(self) -> str:
+        return self._full_text
+
+    def minimumSizeHint(self):
+        from PyQt6.QtCore import QSize
+        return QSize(80, super().minimumSizeHint().height())
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QFontMetrics, QPainter
+        painter = QPainter(self)
+        metrics = QFontMetrics(self.font())
+        elided = metrics.elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle, self.width())
+        painter.setPen(QColor(self._color))
+        painter.drawText(self.rect(), int(self.alignment()), elided)
 
 
 class _LabelVar:

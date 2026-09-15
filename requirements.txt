@@ -6,3 +6,11 @@ matplotlib
 scikit-image
 vtk
 psutil
+
+# Optional: NVIDIA GPU acceleration for the filter kernels.
+# Install the wheel matching the CUDA version the driver reports in the
+# header of `nvidia-smi` -- cupy-cuda13x for CUDA 13.x, cupy-cuda12x for
+# CUDA 12.x. The [ctk] extra pulls NVIDIA's CUDA component wheels so no
+# system-wide CUDA Toolkit is needed, only the driver:
+#   pip install "cupy-cuda13x[ctk]"
+# Nothing here requires it; without it every kernel runs on the CPU.

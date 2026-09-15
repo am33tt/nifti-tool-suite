@@ -194,12 +194,14 @@ class SimExportActionsMixin:
         def _run():
             try:
                 lower, _upper, info = self._auto_bc_surface_threshold()
+                if self.cancel_requested():
+                    return
                 self._set_void_threshold_from_otsu_result(lower, info)
             except Exception as ex:
                 self.after(0, lambda err=str(ex): self._append_log(
                     f"  Could not auto-fill void_threshold: {err}", 'warn'))
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Auto material threshold", _run)
 
     # --- boundary surface STL -----------------------------------------
 
@@ -328,6 +330,8 @@ class SimExportActionsMixin:
                     mask_cleanup_iterations=0,
                 )
 
+                if self._abort_if_stopped("Boundary surface export"):
+                    return
                 if not hasattr(self, "_bc_surface_exports"):
                     self._bc_surface_exports = []
 
@@ -393,7 +397,7 @@ class SimExportActionsMixin:
                 self._append_log(f"  Boundary surface export error: {ex}", 'err')
                 self._set_status("Boundary surface export error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Boundary surface STL", _run)
 
     # --- boundary-condition bookkeeping -------------------------------
 

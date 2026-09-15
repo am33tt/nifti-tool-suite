@@ -79,6 +79,20 @@ except ImportError:
     psutil = None  # type: ignore
     HAS_PSUTIL = False
 
+# CuPy: optional GPU backend for the filter kernels.
+#
+# This flag only says the package imported. It does NOT mean a device is
+# usable -- CuPy imports fine on a machine whose CUDA driver is missing or
+# too old, and the failure then surfaces at the first kernel launch. The
+# authoritative check is niftitool.core.accel.gpu_available(), which runs a
+# real kernel; this flag exists so missing_report() can name the package.
+try:
+    import cupy  # noqa: F401
+    HAS_CUPY = True
+except Exception:
+    cupy = None  # type: ignore
+    HAS_CUPY = False
+
 
 def missing_report() -> list[str]:
     """List of human-readable missing-package labels (empty if all present)."""
@@ -89,4 +103,6 @@ def missing_report() -> list[str]:
     if not HAS_3D:      missing.append("mpl_toolkits  (optional)")
     if not HAS_SKIMAGE: missing.append("scikit-image  (optional, for 3-D surface)")
     if not HAS_VTK:     missing.append("vtk  (recommended, GPU 3-D viewer)")
+    if not HAS_CUPY:    missing.append(
+        "cupy  (optional, NVIDIA GPU acceleration; needs CUDA)")
     return missing

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..deps import np, nib, ndimage
+from . import accel
 
 
 #: Default polynomial degree of the cupping fit.
@@ -156,14 +157,14 @@ def specimen_mask(coarse, threshold: float, *, fill_holes: bool = True,
         return mask
     structure = ndimage.generate_binary_structure(3, 1)
     if largest_only:
-        lab, n = ndimage.label(mask, structure=structure)
+        lab, n = accel.label(mask, structure=structure)
         if n > 1:
             counts = np.bincount(lab.ravel())
             counts[0] = 0
             mask = lab == int(counts.argmax())
         del lab
     if fill_holes:
-        mask = ndimage.binary_fill_holes(mask)
+        mask = accel.binary_fill_holes(mask)
     return np.asarray(mask, dtype=bool)
 
 
@@ -183,13 +184,13 @@ def depth_field_mm(mask, spacing_mm, *, border_is_surface: bool = True):
         # One layer of background around the volume, so material touching
         # the array edge sits at zero depth.
         padded = np.pad(mask, 1, mode="constant", constant_values=False)
-        dist = ndimage.distance_transform_edt(padded, sampling=spacing)
+        dist = accel.distance_transform_edt(padded, sampling=spacing)
         dist = dist[1:-1, 1:-1, 1:-1]
     else:
         # The array edge is an arbitrary cut, not a surface: extend the
         # material outward so no depth is measured from it.
         padded = np.pad(mask, 1, mode="edge")
-        dist = ndimage.distance_transform_edt(padded, sampling=spacing)
+        dist = accel.distance_transform_edt(padded, sampling=spacing)
         dist = dist[1:-1, 1:-1, 1:-1]
 
     # The transform returns the distance to the nearest background *centre*;
@@ -482,10 +483,16 @@ def apply_correction(
     with open(out_path, "r+b") as fh:
         fh.truncate(hdr_bytes + sx * sy * sz * itemsize)
 
-    # Full-resolution index grid mapped onto the coarse grid.
+    # Full-resolution index grid mapped onto the coarse grid. The x and y
+    # rows are the same for every slice, so the (3, sx, sy) coordinate
+    # array is built once and only its z row is rewritten per slice. That
+    # saves two full-size allocations and copies per slice, and -- when the
+    # call runs on the GPU -- lets the buffer be reused rather than rebuilt
+    # before each upload.
     gx = (np.arange(sx, dtype=np.float32) / float(stride))
     gy = (np.arange(sy, dtype=np.float32) / float(stride))
-    cx, cy = np.meshgrid(gx, gy, indexing="ij")
+    coords = np.empty((3, sx, sy), dtype=np.float32)
+    coords[0], coords[1] = np.meshgrid(gx, gy, indexing="ij")
 
     slice_bytes = sx * sy * itemsize
     demo_z = sz // 2
@@ -498,16 +505,15 @@ def apply_correction(
                 from ..utils import OperationCancelled
                 raise OperationCancelled()
             raw = np.asarray(volume[:, :, z], dtype=np.float32)
-            cz = np.full_like(cx, z / float(stride))
-            coords = np.stack([cx, cy, cz], axis=0)
+            coords[2] = z / float(stride)
 
-            factor = ndimage.map_coordinates(
+            factor = accel.map_coordinates(
                 factor_coarse, coords, order=1, mode="nearest",
             ).astype(np.float32)
             out_sl = raw * factor
 
             if remove_background:
-                m = ndimage.map_coordinates(
+                m = accel.map_coordinates(
                     mask_coarse, coords, order=1, mode="nearest",
                 ) >= 0.5
                 out_sl = np.where(m, out_sl, np.float32(background_value))

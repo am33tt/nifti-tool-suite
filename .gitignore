@@ -5,3 +5,5 @@ docs/
 niftitool/__pycache__/
 niftitool/ui_qt/__pycache__/
 niftitool/core/__pycache__/
+scripts/
+tests/

@@ -251,10 +251,6 @@ class ControlsMixin:
 
         self._void_thresh_widget = styled_entry(sec.content, width=9)
         self._void_thresh_widget.setText("auto")
-        self._void_thresh_widget.setToolTip(
-            "'auto' finds the void/solid split with Otsu on a subsample.\n"
-            "Or type a grey value directly."
-        )
         sec.content_layout.addWidget(
             _field_row(sec.content, "Threshold", self._void_thresh_widget))
         self._void_thresh_var = _WidgetVar(self._void_thresh_widget)
@@ -279,13 +275,43 @@ class ControlsMixin:
             "Finds the specimen as the largest connected solid region with "
             "its internal pores kept, removes everything outside it and "
             "saves a clean new NIfTI. Uses the grey level from the Threshold "
-            "panel.", sec.content,
+            "panel. The volume is streamed slab by slab and the result is "
+            "written as it is computed, so the file size is not limited by "
+            "the machine's RAM, and every voxel that survives is copied "
+            "unchanged.", sec.content,
         ))
+
+        self._bg_boundary_combo = QComboBox(sec.content)
+        for label, mode in (
+            ("largest solid body", "component"),
+            ("radial envelope", "envelope"),
+        ):
+            self._bg_boundary_combo.addItem(label, mode)
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Outer boundary", self._bg_boundary_combo))
+
+        self._bg_fill_combo = QComboBox(sec.content)
+        for label, mode in (
+            ("zero", "zero"),
+            ("air median", "air-median"),
+            ("grey level...", "value"),
+        ):
+            self._bg_fill_combo.addItem(label, mode)
+        sec.content_layout.addWidget(
+            _field_row(sec.content, "Fill outside", self._bg_fill_combo))
+
+        self._bg_fill_widget = styled_entry(sec.content, width=9)
+        self._bg_fill_widget.setText("0")
+        self._bg_fill_row = _field_row(
+            sec.content, "Grey level", self._bg_fill_widget)
+        self._bg_fill_row.setVisible(False)
+        sec.content_layout.addWidget(self._bg_fill_row)
+        self._bg_fill_combo.currentIndexChanged.connect(
+            lambda _index: self._bg_fill_row.setVisible(
+                self._bg_fill_combo.currentData() == "value"))
 
         self._bg_margin_widget = styled_entry(sec.content, width=6)
         self._bg_margin_widget.setText("10")
-        self._bg_margin_widget.setToolTip(
-            "Voxels of padding kept around the specimen bounding box.")
         sec.content_layout.addWidget(
             _field_row(sec.content, "Margin", self._bg_margin_widget))
 
@@ -320,58 +346,31 @@ class ControlsMixin:
         self._bin_method_combo = QComboBox(sec.content)
         self._bin_method_combo.addItems(
             ["otsu", "isodata", "valley", "sigma", "triangle", "manual"])
-        self._bin_method_combo.setToolTip(
-            "otsu      between-class variance, refined by isodata "
-            "(the same rule the porosity uses, so the numbers agree)\n"
-            "isodata   Ridler-Calvard iterative intermeans\n"
-            "valley    minimum of the smoothed histogram on the material "
-            "peak's lower flank\n"
-            "sigma     material mode minus k standard deviations; robust "
-            "when the pore peak is too small for Otsu\n"
-            "triangle  Zack's rule; suits a dominant material peak with a "
-            "long tail\n"
-            "manual    the value typed below"
-        )
         sec.content_layout.addWidget(
             _field_row(sec.content, "Method", self._bin_method_combo))
 
         self._bin_k_widget = styled_entry(sec.content, width=6)
         self._bin_k_widget.setText("3.0")
-        self._bin_k_widget.setToolTip("k for the sigma method.")
         sec.content_layout.addWidget(
             _field_row(sec.content, "sigma k", self._bin_k_widget))
 
         self._bin_manual_widget = styled_entry(sec.content, width=10)
         self._bin_manual_widget.setPlaceholderText("grey value")
-        self._bin_manual_widget.setToolTip(
-            "Threshold used by the manual method.")
         sec.content_layout.addWidget(
             _field_row(sec.content, "Manual value", self._bin_manual_widget))
 
         self._bin_smooth_widget = styled_entry(sec.content, width=6)
         self._bin_smooth_widget.setText("0")
-        self._bin_smooth_widget.setToolTip(
-            "Gaussian sigma in voxels applied before thresholding. Smooths "
-            "speckle, but also rounds thin features \u2014 keep it below "
-            "one voxel unless the scan is very noisy."
-        )
         sec.content_layout.addWidget(
             _field_row(sec.content, "Smooth", self._bin_smooth_widget))
 
         self._bin_downsample_widget = styled_entry(sec.content, width=6)
         self._bin_downsample_widget.setText("1")
-        self._bin_downsample_widget.setToolTip(
-            "Block-average by this factor before writing. A block becomes "
-            "material when at least half of it is, which preserves the "
-            "material fraction far better than taking every n-th voxel."
-        )
         sec.content_layout.addWidget(
             _field_row(sec.content, "Downsample", self._bin_downsample_widget))
 
         self._bin_minvoid_widget = styled_entry(sec.content, width=6)
         self._bin_minvoid_widget.setText("0")
-        self._bin_minvoid_widget.setToolTip(
-            "Fill pores smaller than this many voxels. 0 keeps every pore.")
         sec.content_layout.addWidget(
             _field_row(sec.content, "Min void", self._bin_minvoid_widget))
 
@@ -380,10 +379,6 @@ class ControlsMixin:
         self._bin_largest_check.setFont(QFont("Segoe UI", 9))
         self._bin_largest_check.setStyleSheet(
             f"color: {TEXT}; background-color: transparent;")
-        self._bin_largest_check.setToolTip(
-            "Material not connected to the main body is an unconstrained "
-            "rigid body in the analysis. The islands are counted either way."
-        )
         sec.content_layout.addWidget(self._bin_largest_check)
 
         self._bin_refine_check = QCheckBox(
@@ -392,11 +387,6 @@ class ControlsMixin:
         self._bin_refine_check.setFont(QFont("Segoe UI", 9))
         self._bin_refine_check.setStyleSheet(
             f"color: {TEXT}; background-color: transparent;")
-        self._bin_refine_check.setToolTip(
-            "Recompute the threshold using only voxels inside the specimen "
-            "envelope, so surrounding air cannot pull it away from the "
-            "pore/material boundary."
-        )
         sec.content_layout.addWidget(self._bin_refine_check)
 
         bin_btns = QWidget(sec.content); bbl = QHBoxLayout(bin_btns)
@@ -438,23 +428,16 @@ class ControlsMixin:
 
         self._bh_poly_deg = styled_entry(sec.content, width=6)
         self._bh_poly_deg.setText("4")
-        self._bh_poly_deg.setToolTip(
-            "Degree of the depth fit. 4 is a good default; above 6 starts "
-            "fitting noise in the sparse deep bins."
-        )
         sec.content_layout.addWidget(
             _field_row(sec.content, "Poly degree", self._bh_poly_deg))
 
         self._bh_bin_mm = styled_entry(sec.content, width=6)
         self._bh_bin_mm.setText("0.25")
-        self._bh_bin_mm.setToolTip("Depth bin width in mm.")
         sec.content_layout.addWidget(
             _field_row(sec.content, "Bin width", self._bh_bin_mm))
 
         self._bh_stride_widget = styled_entry(sec.content, width=6)
         self._bh_stride_widget.setText("0")
-        self._bh_stride_widget.setToolTip(
-            "Analysis grid step. 0 chooses one from the free memory.")
         sec.content_layout.addWidget(
             _field_row(sec.content, "Stride", self._bh_stride_widget))
 
@@ -465,12 +448,6 @@ class ControlsMixin:
         self._bh_border_check.setFont(QFont("Segoe UI", 9))
         self._bh_border_check.setStyleSheet(
             f"color: {TEXT}; background-color: transparent;"
-        )
-        self._bh_border_check.setToolTip(
-            "On: the specimen was cropped flush to its bounding box, so the "
-            "edge of the volume is a real surface.\n"
-            "Off: the volume is an arbitrary cut through a larger part, so "
-            "depth is measured only from real material/air interfaces."
         )
         sec.content_layout.addWidget(self._bh_border_check)
 
@@ -485,10 +462,6 @@ class ControlsMixin:
 
         self._bh_dtype_combo = QComboBox(sec.content)
         self._bh_dtype_combo.addItems(["float32", "int16"])
-        self._bh_dtype_combo.setToolTip(
-            "float32 keeps the corrected values exactly; int16 halves the "
-            "file size but rounds and clips them."
-        )
         sec.content_layout.addWidget(
             _field_row(sec.content, "Output dtype", self._bh_dtype_combo))
 
@@ -652,6 +625,8 @@ class ControlsMixin:
                     if flat.size > 2_000_000:
                         flat = flat[:: flat.size // 2_000_000]
                 t = otsu_threshold(flat)
+                if self._abort_if_stopped("Auto threshold"):
+                    return
                 self.after(0, self._void_thresh_var.set, f"{t:.1f}")
                 self._append_log(
                     f"  Auto void threshold (Otsu): {t:.1f}", 'teal')
@@ -660,7 +635,7 @@ class ControlsMixin:
                 self._append_log(f"  Auto threshold error: {ex}", 'err')
                 self._set_status("Auto threshold error.", busy=False)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._run_task("Auto threshold", _run)
 
     # Windowing helpers
 

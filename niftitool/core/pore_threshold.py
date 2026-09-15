@@ -24,7 +24,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..deps import np, ndimage
+from ..deps import np
+from . import accel
 
 
 #: k values reported in the porosity sensitivity sweep.
@@ -108,14 +109,14 @@ def specimen_mask_2d(slice_2d, already_masked: bool = False, erode: int = 1):
     else:
         if float(sl.max() - sl.min()) < 1e-9:
             return np.zeros(sl.shape, dtype=bool)
-        m = ndimage.binary_fill_holes(sl >= otsu_on_slice(sl))
-        lab, n = ndimage.label(m)
+        m = accel.binary_fill_holes(sl >= otsu_on_slice(sl))
+        lab, n = accel.label(m)
         if n > 1:
             counts = np.bincount(lab.ravel())
             counts[0] = 0
             m = lab == int(counts.argmax())
     if erode and m.any():
-        m = ndimage.binary_erosion(m, iterations=int(erode))
+        m = accel.binary_erosion(m, iterations=int(erode))
     return np.asarray(m, dtype=bool)
 
 

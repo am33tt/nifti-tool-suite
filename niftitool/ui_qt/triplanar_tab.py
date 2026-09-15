@@ -7,6 +7,7 @@ panel size and cached; slider drags are blitted instead of redrawn.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -38,6 +39,27 @@ TRI_SAMPLE_BUDGET = 0.15
 # Panel placement, as figure fractions.
 TRI_MARGINS = {'left': 0.02, 'right': 0.98, 'bottom': 0.06, 'top': 0.92,
                'gap': 0.025}
+
+
+class _AspectLimitNoticeFilter(logging.Filter):
+    """Drop matplotlib's note that it re-fitted a panel's view limits.
+
+    The panels pin their own limits (see :meth:`_fit_tri_panels`) while
+    holding a fixed data aspect, so whenever matplotlib nudges one it says
+    so on its own logger. The nudge is the intended behaviour -- the view is
+    being kept undistorted -- but the note is emitted once per panel per
+    frame, which floods the console during a window resize or a toolbar
+    zoom. Only this one message is dropped; every other matplotlib message
+    still comes through.
+    """
+
+    PREFIX = "Ignoring fixed"
+
+    def filter(self, record) -> bool:
+        return not record.getMessage().startswith(self.PREFIX)
+
+
+logging.getLogger("matplotlib.axes._base").addFilter(_AspectLimitNoticeFilter())
 
 
 def _disable_layout_engine(fig):
@@ -130,17 +152,6 @@ class TriplanarMixin:
         self._tri_same_scale_check.setFont(QFont("Segoe UI", 9))
         self._tri_same_scale_check.setStyleSheet(
             f"color: {TEXT}; background-color: transparent;")
-        self._tri_same_scale_check.setToolTip(
-            "Off (default): each view frames its own slice and fills its "
-            "panel. Best use of the space, and the only sensible choice when "
-            "the specimen is much taller than it is wide.\n"
-            "On: every view shows the same physical window, so a feature is "
-            "the same size in all three and one scale bar reads for all of "
-            "them, at the cost of the smaller views being framed in a lot "
-            "of empty space.\n"
-            "The geometry is true either way: a slice is never stretched to "
-            "fill a panel."
-        )
         self._tri_same_scale_check.toggled.connect(
             self._on_tri_scale_mode_changed)
         tb_lay.addWidget(self._tri_same_scale_check)
@@ -195,7 +206,6 @@ class TriplanarMixin:
             idx_edit.setFixedWidth(50)
             idx_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
             idx_edit.setValidator(QIntValidator(0, 10_000, idx_edit))
-            idx_edit.setToolTip("Type a slice index and press Enter to jump.")
             row_lay.addWidget(idx_edit)
             col_lay.addWidget(row_w)
 
@@ -246,7 +256,7 @@ class TriplanarMixin:
         # measurement overlays.
         self._tri_sync_timer = QTimer(self)
         self._tri_sync_timer.setSingleShot(True)
-        self._tri_sync_timer.timeout.connect(self._tri_canvas.draw_idle)
+        self._tri_sync_timer.timeout.connect(self._tri_settle_refresh)
 
         # Tk-compat shim for ``_tri_idx_vars['X'].set(...)`` usage elsewhere.
         self._tri_idx_vars = {
@@ -800,6 +810,13 @@ class TriplanarMixin:
         dim = {'X': g.shape[0], 'Y': g.shape[1], 'Z': g.shape[2]}[axis]
         self._tri_prefetch_busy = True
 
+        if self._slice_cache.has_preview():
+            # Preview reads are memory reads; warming them costs more in
+            # thread churn than it saves, and reading the *file* ahead is
+            # exactly the I/O the preview exists to avoid.
+            self._tri_prefetch_busy = False
+            return
+
         cost = getattr(self, '_tri_refresh_cost_ms', 0.0)
         if cost > 80.0:
             self._tri_prefetch_busy = False
@@ -842,9 +859,9 @@ class TriplanarMixin:
 
         cache = self._slice_cache
         max_px = self._tri_display_px()
-        sl_X = cache.get('X', xi, ww, wc, max_px=max_px)
-        sl_Y = cache.get('Y', yi, ww, wc, max_px=max_px)
-        sl_Z = cache.get('Z', zi, ww, wc, max_px=max_px)
+        sl_X, from_preview = self._display_slice('X', xi, ww, wc, max_px)
+        sl_Y, _ = self._display_slice('Y', yi, ww, wc, max_px)
+        sl_Z, _ = self._display_slice('Z', zi, ww, wc, max_px)
 
         # Decimated arrays keep the original extent, so crosshairs, probe
         # clicks and measurements stay in voxel units.
@@ -882,7 +899,9 @@ class TriplanarMixin:
         rebuilt = False
         for ax_obj, axis, idx, sl_win, title in panels:
             im = self._tri_im[axis]
-            if im is None or im.get_array().shape != sl_win.shape:
+            # Compare the image extent only: the artist holds RGBA, so its
+            # array has a trailing channel axis the slice does not.
+            if im is None or im.get_array().shape[:2] != sl_win.shape:
                 rebuilt = True
                 ax_obj.clear()
                 ax_obj.set_facecolor(PANEL2)
@@ -897,7 +916,7 @@ class TriplanarMixin:
                     ax_obj.spines[side].set_color(BORDER)
                     ax_obj.spines[side].set_linewidth(0.5)
                 im = ax_obj.imshow(
-                    sl_win, cmap=cmap, origin='lower', vmin=0, vmax=1,
+                    self._tri_rgba(sl_win, cmap), origin='lower',
                     interpolation='nearest', extent=extents[axis],
                 )
                 # The slice is drawn in voxel indices, so one index step is
@@ -944,8 +963,7 @@ class TriplanarMixin:
                 self._tri_hline[axis].set_animated(True)
                 self._tri_vline[axis].set_animated(True)
             else:
-                im.set_data(sl_win)
-                im.set_cmap(cmap)
+                im.set_data(self._tri_rgba(sl_win, cmap))
                 self._tri_title[axis].set_text(title)
                 h_pos, v_pos = crosshair_pos[axis]
                 self._tri_hline[axis].set_ydata([h_pos, h_pos])
@@ -957,10 +975,15 @@ class TriplanarMixin:
 
         # What each panel shows, so the fast path can skip unchanged ones.
         self._tri_drawn_key = {
-            'X': (xi, ww, wc, max_px),
-            'Y': (yi, ww, wc, max_px),
-            'Z': (zi, ww, wc, max_px),
+            'X': (xi, ww, wc, max_px, from_preview),
+            'Y': (yi, ww, wc, max_px, from_preview),
+            'Z': (zi, ww, wc, max_px, from_preview),
         }
+        # A rebuild drew from the preview; ask for the finer read if one
+        # would actually show more, on a worker as always.
+        timer = getattr(self, '_tri_sync_timer', None)
+        if from_preview and timer is not None:
+            timer.start(300)
         if rebuilt:
             self._layout_tri_panels()
             self._fit_tri_panels()
@@ -1046,16 +1069,22 @@ class TriplanarMixin:
         ww, wc = self._effective_window()
 
         cache = self._slice_cache
+        cmap_name = self._cmap_var.get()
         max_px = self._tri_display_px()
         changed = set()
         drawn = getattr(self, '_tri_drawn_key', None)
         if drawn is None:
             drawn = self._tri_drawn_key = {}
+        # Drags read the resident preview when there is one. A slice along
+        # X or Y is strided across the whole file; from the preview it is a
+        # memory read, which is the difference between a slider that
+        # follows the pointer and one that lags behind it.
+        use_preview = cache.has_preview()
         for axis, idx in (('X', xi), ('Y', yi), ('Z', zi)):
-            key = (idx, ww, wc, max_px)
+            key = (idx, ww, wc, max_px, use_preview)
             if drawn.get(axis) != key:
-                sl = cache.get(axis, idx, ww, wc, max_px=max_px)
-                self._tri_im[axis].set_data(sl)
+                sl, _ = self._display_slice(axis, idx, ww, wc, max_px)
+                self._tri_im[axis].set_data(self._tri_rgba(sl, cmap_name))
                 changed.add(axis)
                 drawn[axis] = key
             # Titles are not animated and are drawn only on full draws; the
@@ -1139,6 +1168,210 @@ class TriplanarMixin:
         self._tri_canvas.mpl_connect(
             'axes_leave_event', self._on_tri_hover_leave
         )
+
+    def _tri_lut(self, cmap_name: str):
+        """A 256-entry RGBA table for *cmap_name*, built once and reused.
+
+        Matplotlib normally maps a float array through the norm and the
+        colormap on every draw. That is measurable: on a panel-sized slice
+        it is about half the cost of a frame, and it is the same mapping
+        every time. Doing it as a lookup on pre-quantised values and
+        handing matplotlib finished RGBA bytes skips it entirely.
+
+        256 levels is what the display has, so nothing visible is lost --
+        the window has already mapped the interesting grey range onto
+        [0, 1] before this point.
+        """
+        cache = getattr(self, '_tri_lut_cache', None)
+        if cache is None:
+            cache = self._tri_lut_cache = {}
+        lut = cache.get(cmap_name)
+        if lut is None:
+            import matplotlib.cm as mcm
+            lut = (mcm.get_cmap(cmap_name)(np.linspace(0.0, 1.0, 256))
+                   * 255.0).astype(np.uint8)
+            cache[cmap_name] = lut
+        return lut
+
+    def _tri_rgba(self, windowed, cmap_name: str):
+        """Windowed float in [0, 1] -> RGBA uint8, through the table."""
+        idx = np.multiply(windowed, 255.0).clip(0, 255).astype(np.uint8)
+        return self._tri_lut(cmap_name)[idx]
+
+    def _display_slice(self, axis: str, idx: int, ww: float, wc: float,
+                       max_px: int | None):
+        """The slice to draw for *axis*, and whether it came from the preview.
+
+        Every read that ends up on screen goes through here, so there is
+        one rule rather than three: use the preview whenever it exists, and
+        let :meth:`_tri_settle_refresh` upgrade the panel afterwards if the
+        preview is genuinely coarser than the panel can show. The point is
+        that no path reachable from a slider, a resize or a colormap change
+        can ever read the file on the GUI thread.
+        """
+        use_preview = self._slice_cache.has_preview()
+        return self._slice_cache.get(axis, idx, ww, wc, max_px=max_px,
+                                     preview=use_preview), use_preview
+
+    def _refine_step(self, axis: str) -> int:
+        """How much finer than the preview this panel could actually draw.
+
+        The panels decimate to their own pixel budget anyway. When the
+        preview is already at least that fine, a full-resolution read
+        produces the *same* samples -- measurably identical, not merely
+        similar -- so there is nothing to refine and the read would be pure
+        cost. Returns 1 when refinement would not change the picture.
+        """
+        cache = self._slice_cache
+        if not cache.has_preview() or self._gray is None:
+            return 1
+        max_px = self._tri_display_px()
+        if not max_px:
+            return cache.preview_step
+        shape = tuple(int(d) for d in self._gray.shape[:3])
+        plane = {'X': (shape[1], shape[2]), 'Y': (shape[0], shape[2]),
+                 'Z': (shape[0], shape[1])}[axis]
+        display_step = max(1, int(math.ceil(max(plane) / max_px)))
+        return 1 if cache.preview_step <= display_step else cache.preview_step
+
+    def _tri_settle_refresh(self):
+        """Once dragging pauses, redraw -- reading the file only if it helps.
+
+        This used to re-read all three panels at full resolution inline. On
+        a volume that is not resident, a sagittal read is tens to hundreds
+        of milliseconds, and dragging back and forth fires this timer after
+        every pause, so the window locked up repeatedly. That is the exact
+        cost the preview exists to keep off the interaction path, and it
+        had no business running on the GUI thread.
+
+        Two rules now, both borrowed from how a dedicated slice viewer
+        behaves: never read during interaction, and never read at all
+        unless the result would differ from what is already on screen.
+        """
+        if not HAS_MPL or self._gray is None:
+            self._tri_canvas.draw_idle()
+            return
+
+        axes_to_refine = [a for a in ('X', 'Y', 'Z') if self._refine_step(a) > 1]
+        if not axes_to_refine or getattr(self, '_tri_refine_busy', False):
+            # Nothing finer to show, or a refinement is already running.
+            self._tri_canvas.draw_idle()
+            return
+
+        g = self._gray
+        window = self._effective_window()
+        if window is None:
+            self._tri_canvas.draw_idle()
+            return
+        ww, wc = window
+        max_px = self._tri_display_px()
+        limits = {'X': g.shape[0], 'Y': g.shape[1], 'Z': g.shape[2]}
+        wanted = {
+            axis: max(0, min(self._tri_idx[axis], limits[axis] - 1))
+            for axis in axes_to_refine
+        }
+        drawn = getattr(self, '_tri_drawn_key', None) or {}
+        wanted = {a: i for a, i in wanted.items()
+                  if drawn.get(a) != (i, ww, wc, max_px, False)}
+        if not wanted:
+            self._tri_canvas.draw_idle()
+            return
+
+        self._tri_refine_busy = True
+        self._tri_canvas.draw_idle()          # show the preview frame now
+
+        def _work():
+            results = {}
+            try:
+                for axis, idx in wanted.items():
+                    results[axis] = self._slice_cache.get(
+                        axis, idx, ww, wc, max_px=max_px, preview=False)
+            except Exception:
+                results = {}
+
+            def _install():
+                self._tri_refine_busy = False
+                # The volume or the position may have moved on while this
+                # ran; a stale slice must never be painted over a fresh one.
+                if self._gray is not g:
+                    return
+                keys = getattr(self, '_tri_drawn_key', None) or {}
+                cmap_name = self._cmap_var.get()
+                for axis, sl in results.items():
+                    if self._tri_idx[axis] != wanted[axis]:
+                        continue
+                    try:
+                        self._tri_im[axis].set_data(
+                            self._tri_rgba(sl, cmap_name))
+                        keys[axis] = (wanted[axis], ww, wc, max_px, False)
+                    except Exception:
+                        pass
+                self._tri_drawn_key = keys
+                self._tri_canvas.draw_idle()
+            self.after(0, _install)
+
+        self._run_task("Refine slices", _work)
+
+    def start_tri_preview(self):
+        """Build the interactive preview for the loaded volume, in background.
+
+        Called after a volume is bound. Until it finishes, dragging reads
+        the file exactly as before, so this is an improvement that arrives
+        rather than a step the user waits on.
+        """
+        if self._gray is None or getattr(self, '_tri_preview_busy', False):
+            return
+        from ..core import preview as preview_mod
+        from ..core.io import LazyGrayVolume
+
+        if not isinstance(self._gray, LazyGrayVolume):
+            # Already a real array in memory: a slice along any axis is a
+            # memory read, which is what the preview exists to provide. The
+            # background materialiser promotes small volumes to this state,
+            # and building a preview for one would be pure waste.
+            return
+
+        shape = tuple(int(d) for d in self._gray.shape[:3])
+        step = preview_mod.choose_step(shape)
+        if step == 1:
+            return                       # already small enough to read directly
+
+        self._tri_preview_busy = True
+        mb = preview_mod.estimate_bytes(shape, step) / 1024 ** 2
+        self._append_log(
+            f"  Building the interactive preview at 1/{step} "
+            f"({mb:.0f} MiB) so slider drags do not re-read the file.", 'dim')
+
+        gray = self._gray
+
+        def _work():
+            try:
+                array, built_step = preview_mod.build_preview(
+                    gray, cancel=lambda: bool(self.cancel_requested()))
+            except Exception as ex:                   # noqa: BLE001
+                self._tri_preview_busy = False
+                self._append_log(f"  Preview not built: {ex}", 'dim')
+                return
+
+            def _install():
+                self._tri_preview_busy = False
+                # The volume may have been replaced while this was running.
+                if array is None or self._gray is not gray:
+                    return
+                self._slice_cache.set_preview(array, built_step)
+                self._tri_drawn_key = {}
+                # The debounce widens itself when refreshes measure slow.
+                # Those measurements were taken against file reads; keeping
+                # them would pace the slider to a cost that no longer
+                # exists.
+                self._tri_refresh_cost_ms = 0.0
+                self._append_log(
+                    f"  Interactive preview ready: {array.shape} at "
+                    f"1/{built_step}. Dragging now reads memory; the panels "
+                    f"return to full resolution when you stop.", 'ok')
+            self.after(0, _install)
+
+        self._run_task("Preview", _work)
 
     def _note_tri_refresh_cost(self, t0):
         """Track what one blit refresh costs on this machine, in ms."""
@@ -1272,14 +1505,12 @@ class TriplanarMixin:
 
         x = m['left'] + (avail_w - total_w) / 2.0
         y = m['bottom'] + (avail_h - height) / 2.0
-        self._tri_box_frac = {}
         for axis in ('X', 'Y', 'Z'):
             width = widths[axis]
             try:
                 self._panel_ax_obj(axis).set_position([x, y, width, height])
             except Exception:
                 return
-            self._tri_box_frac[axis] = (width, height)
             x += width + m['gap']
 
     def _tri_same_scale(self) -> bool:
@@ -1289,9 +1520,17 @@ class TriplanarMixin:
     def _fit_tri_panels(self):
         """Frame each panel's slice inside its box, undistorted.
 
-        The limits already satisfy the panel aspect against its own box.
-        Otherwise matplotlib widens one of them on the next draw, with the
-        same result but a warning on every frame.
+        The view is widened in whichever direction is short of the box
+        shape, so the limits already satisfy the panel aspect and the spare
+        room becomes padding around a centred slice. Getting this exactly
+        right is what keeps matplotlib quiet: on the next draw it would
+        otherwise widen a limit itself to honour the aspect and warn that it
+        is ignoring the fixed limits, once per panel per frame.
+
+        The box is read back from the axes rather than remembered from the
+        layout pass. During a window resize the layout can bail out on a
+        transient zero-sized figure, and a remembered box then belongs to
+        the previous size while the figure has already moved on.
         """
         g = self._gray
         if not HAS_MPL or g is None:
@@ -1301,7 +1540,8 @@ class TriplanarMixin:
         same_scale = self._tri_same_scale()
         win_w_mm, win_h_mm = self._tri_view_window()
         fig_w, fig_h = (float(v) for v in self._tri_fig.get_size_inches())
-        boxes = getattr(self, '_tri_box_frac', {})
+        if fig_w <= 0 or fig_h <= 0:
+            return
 
         for axis in ('X', 'Y', 'Z'):
             ax_obj = self._panel_ax_obj(axis)
@@ -1320,20 +1560,19 @@ class TriplanarMixin:
             span_h = max(span_h, 1.0)
             span_v = max(span_v, 1.0)
 
-            # Widen whichever direction is short of the box shape, so the
-            # slice sits centred in the spare room.
-            box = boxes.get(axis)
-            if box and fig_w > 0 and fig_h > 0:
-                box_w_px = box[0] * fig_w
-                box_h_px = box[1] * fig_h
-                aspect = v_mm / h_mm
-                if box_w_px > 0 and box_h_px > 0 and aspect > 0:
-                    # Undistorted requires box_h/box_w == aspect*span_v/span_h.
-                    need_h = span_v * aspect * box_w_px / box_h_px
-                    if need_h > span_h:
-                        span_h = need_h
-                    else:
-                        span_v = span_h * (box_h_px / box_w_px) / aspect
+            # The box the layout gave this panel, read back from the axes so
+            # the limits always match the box actually in force.
+            box = ax_obj.get_position()
+            box_w_px = box.width * fig_w
+            box_h_px = box.height * fig_h
+            aspect = v_mm / h_mm
+            if box_w_px > 0 and box_h_px > 0 and aspect > 0:
+                # Undistorted requires box_h/box_w == aspect*span_v/span_h.
+                need_h = span_v * aspect * box_w_px / box_h_px
+                if need_h > span_h:
+                    span_h = need_h
+                else:
+                    span_v = span_h * (box_h_px / box_w_px) / aspect
 
             cx = (n_h - 1) / 2.0
             cy = (n_v - 1) / 2.0

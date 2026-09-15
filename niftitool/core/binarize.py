@@ -27,12 +27,14 @@ standard deviations, for pore populations too small for Otsu), triangle
 
 from __future__ import annotations
 
+import contextlib
 import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..deps import np, nib, ndimage
+from . import accel, fcm_field
 
 
 HEADER_BYTES = 352
@@ -160,7 +162,7 @@ def _smoothed_histogram(values, nbins: int, smooth: float):
     if smooth <= 0:
         return counts, centres
     if ndimage is not None:
-        counts = ndimage.gaussian_filter1d(counts, smooth, mode="nearest")
+        counts = accel.gaussian_filter1d(counts, smooth, mode="nearest")
     else:
         width = max(3, int(smooth * 2) | 1)
         counts = np.convolve(counts, np.ones(width) / width, mode="same")
@@ -389,8 +391,8 @@ def specimen_envelope(sample, threshold):
         return None
     # Close before filling, so a pore breaking the surface cannot let the
     # fill leak out into the surrounding air.
-    closed = ndimage.binary_closing(mask, iterations=2, border_value=0)
-    return ndimage.binary_fill_holes(closed)
+    closed = accel.binary_closing(mask, iterations=2, border_value=0)
+    return accel.binary_fill_holes(closed)
 
 
 # ---------------------------------------------------------------------------
@@ -408,29 +410,30 @@ def _downsampled_affine(affine, factor: int):
 
 
 def _block_reduce(mask, factor: int):
-    """Volume fraction downsample: a block is material if at least half is.
+    """Majority-vote downsample. See :func:`fcm_field.block_reduce_binary`.
 
-    Averaging and re-thresholding preserves the material fraction, unlike
-    taking every n-th voxel, which drops thin features.
+    Kept as a thin alias so there is exactly one implementation of the
+    reduction in the project: this module and ``scripts/binarize_for_fcm``
+    each had their own copy, which is how two code paths in one paper end
+    up disagreeing.
     """
-    nx, ny, nz = (s - s % factor for s in mask.shape)
-    if min(nx, ny, nz) == 0:
-        return np.zeros((0, 0, 0), dtype=np.uint8)
-    trimmed = mask[:nx, :ny, :nz].astype(np.float32)
-    blocks = trimmed.reshape(nx // factor, factor,
-                             ny // factor, factor,
-                             nz // factor, factor)
-    return (blocks.mean(axis=(1, 3, 5)) >= 0.5).astype(np.uint8)
+    return fcm_field.block_reduce_binary(mask, factor)
 
 
-def _write_header(path, img, out_shape, zooms, affine) -> int:
-    """Write a uint8 NIfTI-1 header carrying the source orientation."""
+def _write_header(path, img, out_shape, zooms, affine, *,
+                  dtype=np.uint8, descrip=b'FCM indicator: 1=material 0=void') -> int:
+    """Write a NIfTI-1 header carrying the source orientation.
+
+    *dtype* and *descrip* let the same writer emit the uint8 indicator and
+    the float32 volume-fraction field, which must share an affine, zooms
+    and grid or the solver would read them in different frames.
+    """
     import io as _io
     import struct
 
     header = nib.Nifti1Header()
     header.set_data_shape(tuple(int(s) for s in out_shape))
-    header.set_data_dtype(np.uint8)
+    header.set_data_dtype(dtype)
     try:
         header.set_qform(affine, code=int(img.header['qform_code']) or 1)
     except Exception:
@@ -439,7 +442,7 @@ def _write_header(path, img, out_shape, zooms, affine) -> int:
     header.set_zooms(tuple(float(z) for z in zooms))
     header['cal_min'] = 0.0
     header['cal_max'] = 1.0
-    header['descrip'] = b'FCM indicator: 1=material 0=void'
+    header['descrip'] = descrip
 
     buf = _io.BytesIO()
     header.write_to(buf)
@@ -460,11 +463,20 @@ def _write_header(path, img, out_shape, zooms, affine) -> int:
 
 def binarize_stream(img, volume, threshold: float, out_path, *,
                     smooth: float = 0.0, downsample: int = 1,
-                    slab: int = 64, progress=None, cancelled=None):
+                    slab: int = 64, progress=None, cancelled=None,
+                    fraction_path=None):
     """Threshold the volume slab by slab, writing a uint8 NIfTI.
 
     The header is written first and the voxels stream after it, so peak
     memory is one slab.
+
+    When *fraction_path* is given and the export is downsampled, a second
+    float32 NIfTI is written on the same grid holding the material volume
+    fraction of each coarse voxel. That fraction is counted from the fine
+    mask, so it is exact, and it is what the majority vote in the uint8
+    file discards -- see :mod:`niftitool.core.fcm_field`. At a downsample
+    of 1 there is no sub-voxel information to record and no fraction file
+    is written; the returned dictionary says so.
     """
     out_path = Path(out_path)
     nx, ny, nz = (int(s) for s in volume.shape[:3])
@@ -492,8 +504,23 @@ def binarize_stream(img, volume, threshold: float, out_path, *,
     preview_z = out_shape[2] // 2
     t0 = time.time()
 
-    with open(out_path, "r+b") as fh:
+    write_fraction = fraction_path is not None and factor > 1
+    frac_fh = None
+    frac_hdr_bytes = 0
+    if write_fraction:
+        frac_hdr_bytes = _write_header(
+            fraction_path, img, out_shape, zooms, affine,
+            dtype=np.float32,
+            descrip=b'FCM material volume fraction, 0..1',
+        )
+
+    # ExitStack, not a bare open(): a cancelled run raises out of the loop
+    # and the fraction file must still be closed.
+    with open(out_path, "r+b") as fh, contextlib.ExitStack() as stack:
         fh.truncate(hdr_bytes + int(np.prod(out_shape)))
+        if write_fraction:
+            frac_fh = stack.enter_context(open(fraction_path, "r+b"))
+            frac_fh.truncate(frac_hdr_bytes + int(np.prod(out_shape)) * 4)
         for z0 in range(0, out_shape[2] * factor, step):
             if cancelled is not None and cancelled():
                 from ..utils import OperationCancelled
@@ -503,11 +530,15 @@ def binarize_stream(img, volume, threshold: float, out_path, *,
             hi = min(nz, z1 + halo)
             block = np.asarray(volume[:, :, lo:hi], dtype=np.float32)
             if smooth > 0:
-                block = ndimage.gaussian_filter(block, smooth, mode="nearest")
+                block = accel.gaussian_filter(block, smooth, mode="nearest")
             block = block[:, :, z0 - lo:z1 - lo]
             mask = (block >= threshold).astype(np.uint8)
+            fraction = None
             if factor > 1:
-                mask = _block_reduce(mask, factor)
+                # Compute the fraction first; the binary mask is a threshold
+                # of it, so this cannot make the two disagree.
+                fraction = fcm_field.block_volume_fraction(mask, factor)
+                mask = (fraction >= 0.5).astype(np.uint8)
             material += int(mask.sum())
 
             out_z0 = z0 // factor
@@ -520,12 +551,21 @@ def binarize_stream(img, volume, threshold: float, out_path, *,
             # NIfTI stores i fastest, k slowest, so a z slab is contiguous.
             fh.seek(hdr_bytes + out_z0 * slice_bytes)
             fh.write(mask.tobytes(order="F"))
+            if frac_fh is not None and fraction is not None:
+                frac_fh.seek(frac_hdr_bytes + out_z0 * slice_bytes * 4)
+                frac_fh.write(
+                    np.ascontiguousarray(fraction, dtype="<f4")
+                    .tobytes(order="F"))
             if progress is not None:
                 progress(min(z1, out_shape[2] * factor), out_shape[2] * factor)
 
     return {
         "shape": out_shape, "affine": affine, "zooms": zooms,
         "material_voxels": int(material),
+        "fraction_path": str(fraction_path) if write_fraction else None,
+        "fraction_skipped": (
+            "downsample is 1, so a coarse voxel has no sub-voxel fraction"
+            if fraction_path is not None and factor == 1 else None),
         "preview_mask": preview_mask, "preview_slice": preview_slice,
         "preview_z": int(preview_z), "seconds": time.time() - t0,
     }
@@ -544,7 +584,7 @@ def component_report(mask, largest_only: bool):
     if ndimage is None:
         return mask, {"material_components": 0, "removed_voxels": 0}
     structure = ndimage.generate_binary_structure(3, 1)   # face connectivity
-    labels, count = ndimage.label(mask, structure=structure)
+    labels, count = accel.label(mask, structure=structure)
     if count <= 1:
         return mask, {"material_components": int(count), "removed_voxels": 0}
     sizes = np.bincount(labels.ravel())
@@ -565,7 +605,7 @@ def remove_small_voids(mask, min_size: int):
     """Fill pores smaller than *min_size* voxels (noise speckle)."""
     if ndimage is None or min_size <= 1:
         return mask, 0
-    labels, count = ndimage.label(mask == 0)
+    labels, count = accel.label(mask == 0)
     if count == 0:
         return mask, 0
     sizes = np.bincount(labels.ravel())
@@ -591,7 +631,7 @@ def porosity_inside_specimen(mask, max_voxels: int = 40_000_000):
     while mask[::stride, ::stride, ::stride].size > max_voxels:
         stride += 1
     small = mask[::stride, ::stride, ::stride]
-    envelope = ndimage.binary_fill_holes(small.astype(bool))
+    envelope = accel.binary_fill_holes(small.astype(bool))
     envelope_voxels = int(envelope.sum())
     if envelope_voxels == 0:
         return None

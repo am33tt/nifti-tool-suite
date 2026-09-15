@@ -5,12 +5,13 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget,
+    QComboBox, QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget,
 )
 
 from ..config import (
     ACCENT, ACCENT2, BG, ENTRY_BG, ERR, TEAL, TEXT, TEXT_DIM, WARN,
 )
+from ..core import accel
 from .widgets import styled_btn
 
 
@@ -41,6 +42,18 @@ class LogTabMixin:
         title.setStyleSheet(f"color: {TEXT}; background-color: {BG};")
         tr_lay.addWidget(title)
         tr_lay.addStretch(1)
+
+        gpu_lbl = QLabel("GPU:", top_row)
+        gpu_lbl.setStyleSheet(f"color: {TEXT_DIM}; background-color: {BG};")
+        tr_lay.addWidget(gpu_lbl)
+
+        self._gpu_combo = QComboBox(top_row)
+        for mode in accel.MODES:
+            self._gpu_combo.addItem(mode)
+        self._gpu_combo.setCurrentText(accel.get_mode())
+        self._gpu_combo.currentTextChanged.connect(self._on_gpu_mode_changed)
+        tr_lay.addWidget(self._gpu_combo)
+
         tr_lay.addWidget(styled_btn(top_row, "Clear",
                                     self._clear_log, small=True))
         root.addWidget(top_row)
@@ -54,6 +67,15 @@ class LogTabMixin:
         self._log_widget.setFont(QFont("Consolas", 10))
         self._log_widget.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         root.addWidget(self._log_widget, 1)
+
+    def _on_gpu_mode_changed(self, mode: str):
+        """Switch the acceleration backend and record it in the log.
+
+        Every run that follows is logged, so a session transcript states
+        which backend produced its numbers.
+        """
+        accel.set_mode(mode)
+        self._append_log(f"  {accel.gpu_status_line()}", 'teal')
 
     # thread-safe public API
 
@@ -93,10 +115,9 @@ class LogTabMixin:
 
     def _do_set_status(self, msg: str, busy: bool):
         self._status_var.set(msg)
-        stop_btn = getattr(self, '_stop_btn', None)
-        if stop_btn is not None:
-            stop_btn.setVisible(bool(busy))
-        if busy:
+        # The Stop button follows the task registry in app.py, not this flag,
+        # so it stays up for the whole task rather than for one message.
+        if busy or self.tasks_running():
             self._prog.start()
         else:
             self._prog.stop()

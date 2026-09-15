@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..deps import np, ndimage, marching_cubes, HAS_SKIMAGE
+from . import accel
 
 
 # Voids smaller than this get NaN sphericity (mesh too coarse).
@@ -84,15 +85,15 @@ def specimen_from_void_mask(void_mask, erode: int = 0):
     if not solid.any():
         return np.zeros(solid.shape, dtype=bool)
     structure = ndimage.generate_binary_structure(3, 1)
-    lab, n = ndimage.label(solid, structure=structure)
+    lab, n = accel.label(solid, structure=structure)
     if n > 1:
         counts = np.bincount(lab.ravel())
         counts[0] = 0
         solid = lab == int(counts.argmax())
     del lab
-    spec = ndimage.binary_fill_holes(solid)
+    spec = accel.binary_fill_holes(solid)
     if erode:
-        eroded = ndimage.binary_erosion(spec, iterations=int(erode))
+        eroded = accel.binary_erosion(spec, iterations=int(erode))
         if eroded.any():
             spec = eroded
     return np.asarray(spec, dtype=bool)
@@ -214,7 +215,7 @@ def analyze_voids(
     raw_void_voxels = int(void_mask.sum())
 
     structure = ndimage.generate_binary_structure(3, connectivity)
-    lab, n = ndimage.label(void_mask, structure=structure)
+    lab, n = accel.label(void_mask, structure=structure)
 
     border_void_voxels = 0
     if exclude_border and n:
