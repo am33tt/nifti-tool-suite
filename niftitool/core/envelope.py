@@ -1,29 +1,15 @@
 """Outer boundary of a cylindrical specimen, as a radial envelope.
 
-A specimen scanned inside a sleeve, a mould or a wrapping shares its
-attenuation with that shell, and the two touch somewhere over the height of
-almost any scan. One contact is enough: the largest connected component
-then holds specimen and shell together, and filling the specimen's cavities
-fills the air gap between them as well, so the shell survives the
-background removal untouched.
+A specimen scanned inside a sleeve/mould/wrapping that touches it
+somewhere along the scan would keep the shell through the ordinary
+largest-component + cavity-fill path. This instead finds the surface
+direction by direction: for every slice and angle around the axis, the
+first sustained run of void outward from the axis, giving a boundary
+``R(theta, z)`` that follows the real surface (ribs included).
 
-Nor does a single cut radius separate them. On an additively manufactured
-cylinder the printed layers leave ribs, so the surface radius varies by
-several percent around the circumference, and those ribs reach past the
-inner face of the shell. Any radius that clears the shell everywhere cuts
-material somewhere.
-
-What does separate them is the air gap itself, found direction by
-direction. For every slice and every angle around the axis, the specimen's
-surface is the first sustained run of void encountered on the way out from
-the axis; the shell lies beyond it. The result is a boundary R(theta, z)
-that follows the real surface, ribs included, and owes nothing to how badly
-the shell is attached.
-
-The method assumes the specimen is star-shaped about its axis -- every ray
-from the axis leaves it exactly once -- which holds for a cylinder, a prism
-or a core, and fails for a specimen with an undercut or a surface-breaking
-cavity wider than the search band.
+Assumes the specimen is star-shaped about its axis (every ray leaves it
+exactly once): holds for a cylinder, prism or core; fails for an undercut
+or a surface-breaking cavity wider than the search band.
 """
 
 from __future__ import annotations
@@ -158,16 +144,11 @@ class RadialEnvelope:
 def _slice_centre_and_scale(mask):
     """Axis position and nominal radius of one slice.
 
-    The centroid is taken over shrinking central regions rather than over the
-    whole slice. A shell, or a contact bridging the gap to one, sits at large
-    radius and would otherwise pull the axis towards it -- by only a voxel or
-    two, but consistently over every slice where it appears, which is enough
-    to bias every radius measured from that axis. Restricting the centroid to
-    the inner part leaves it where it belongs; for a disc the inner centroid
-    and the full one coincide.
-
-    The nominal radius comes from the median distance of the solid voxels,
-    which for a disc of radius R is R/sqrt(2).
+    Centroid over shrinking central regions, not the whole slice: a shell
+    (or a contact bridging to one) sits at large radius and would bias a
+    whole-slice centroid, consistently, over every slice it appears in.
+    For a disc the inner and full centroids coincide. Nominal radius =
+    median distance of solid voxels * sqrt(2) (exact for a uniform disc).
     """
     xs, ys = np.nonzero(mask)
     if xs.size < MIN_SLICE_VOXELS:
@@ -220,15 +201,10 @@ def _surface_radii(mask, centre, nominal, *, cos_a, sin_a, band, min_gap,
 def _regularise_track(values, *, window, degree, tol_px, fallback):
     """Clean a per-slice quantity that should vary smoothly along the axis.
 
-    Used for the axis position and the slice size. Both are measured from a
-    mask that may still contain a shell, and a stretch of slices where the
-    shell touches biases them all in the same direction -- a median filter
-    would follow that bias, since inside its window the contaminated slices
-    are in the majority. So the trend is fitted first, as a low-order
-    polynomial with the outliers iteratively excluded; readings that
-    disagree with it are replaced by it, and only then is the result
-    filtered. Genuine slow wobble of the axis survives; a biased stretch
-    does not.
+    A median filter would follow a biased stretch (e.g. where a shell
+    touches), since the contaminated slices are the local majority.
+    Instead: fit a low-order polynomial with iterative outlier rejection,
+    replace disagreeing readings with the trend, then median-filter.
     """
     values = np.asarray(values, dtype=np.float64).copy()
     known = np.isfinite(values)
@@ -256,14 +232,11 @@ def _regularise_track(values, *, window, degree, tol_px, fallback):
 
 
 def _separable_model(radii):
-    """Robust model of the surface: a size per slice times a shape per ray.
+    """Robust model of the surface: ``R(theta, z) = scale(z) * shape(theta)``.
 
-    ``R(theta, z) = scale(z) * shape(theta)``. The scale is the median over
-    the rays of one slice, so it survives a minority of rays being wrong;
-    the shape is the median over the slices of the normalised radius, so it
-    survives a minority of slices being wrong. Their product is a surface
-    that keeps the ribs -- they are what ``shape`` is -- while following a
-    specimen that tapers or changes size along its axis.
+    ``scale`` = median over rays per slice (survives bad rays); ``shape`` =
+    median over slices of the normalised radius (survives bad slices).
+    Keeps the ribs (they are what ``shape`` is) while following axial taper.
     """
     with np.errstate(invalid='ignore'):
         scale = np.nanmedian(radii, axis=1)
@@ -282,13 +255,10 @@ def _separable_model(radii):
 def _inliers(radii, model, *, outlier_px, outlier_sigma):
     """Rays that agree with the fitted surface.
 
-    A ray crossing a contact between the specimen and whatever surrounds it
-    finds no void until beyond the shell, and reports a radius that is too
-    large. Those readings are not noise and a median filter will not remove
-    them: where the contact persists over neighbouring slices -- the usual
-    case, since a sleeve rests against a specimen over a stretch of its
-    length -- they outvote the correct ones inside the filter window. They
-    have to be identified against the model and excluded.
+    A ray crossing a specimen/shell contact reports too large a radius;
+    since the contact usually persists over neighbouring slices, these
+    readings would outvote a median filter, so they're excluded by
+    comparison against the fitted model instead.
     """
     residual = np.abs(radii - model)
     spread = np.nanmedian(residual)
@@ -313,16 +283,12 @@ def _fit_surface(radii, *, outlier_px, outlier_sigma, rounds=2):
 
 
 def _centre_offsets(radii, inliers, shape, cos_a, sin_a):
-    """How far the assumed axis sits from the centre of the measured surface.
+    """How far the assumed axis sits from the true surface centre.
 
-    Measured from a point offset by ``d`` from the true axis, the radius of
-    a round specimen reads ``R(theta) + dx cos(theta) + dy sin(theta)``: the
-    offset is the first angular harmonic, and nothing else in the profile
-    looks like it. Fitting it alongside the specimen's own shape -- so ribs
-    cannot leak into the estimate -- and adding it back is the standard way
-    to centre a roundness measurement, and it anchors the axis to the
-    surface rather than to the mask's centre of area, which a shell pulls
-    sideways.
+    From an offset axis, a round specimen's radius reads
+    ``R(theta) + dx cos(theta) + dy sin(theta)`` -- the offset is the first
+    angular harmonic. Fitted alongside the specimen's own shape (so ribs
+    can't leak into it); the standard way to centre a roundness measurement.
     """
     nz = radii.shape[0]
     offsets = np.zeros((nz, 2), dtype=np.float64)
@@ -383,11 +349,8 @@ def fit_envelope(
                          dtype=np.float32)
     cos_a, sin_a = np.cos(angles), np.sin(angles)
 
-    # First pass: the axis and the size of every slice. Both are measured
-    # from a mask that still holds the shell, so both are then regularised
-    # along z before they are used -- a specimen axis is a smooth curve, and
-    # a slice where the shell touches would otherwise pull it sideways and
-    # bias every radius measured from it.
+    # Axis + size per slice, from a mask that may still hold the shell;
+    # regularised along z below since a specimen axis is a smooth curve.
     raw_centres = np.full((nz, 2), np.nan, dtype=np.float64)
     nominals = np.full(nz, np.nan, dtype=np.float64)
     for z in range(nz):
@@ -414,9 +377,7 @@ def fit_envelope(
         fallback=float(np.nanmedian(nominals)),
     )
 
-    # Then the surface itself, measured along every ray. It is measured
-    # twice: the first pass tells us where the axis really is, and the
-    # second is taken about that axis.
+    # Surface measured twice: once to locate the axis, once about it.
     def measure(stage):
         radii = np.full((nz, n_angles), np.nan, dtype=np.float32)
         for z in range(nz):

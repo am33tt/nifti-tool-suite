@@ -1,20 +1,12 @@
 """Slab-wise reading and writing of NIfTI volumes.
 
-Nothing in this module ever holds a whole volume in memory, so the cost of
-an operation is set by :data:`SLAB_BUDGET_BYTES` rather than by the size of
-the file.
+Nothing here holds a whole volume in memory; cost is set by
+:data:`SLAB_BUDGET_BYTES`, not file size.
 
-* :class:`RawSliceReader` yields the voxels **exactly as they are stored on
-  disk**: the on-disk dtype, byte order and ``scl_slope``/``scl_inter`` are
-  left untouched, and the grey levels a threshold is compared against are
-  produced on a copy of one slab at a time.
-* :class:`StreamingNiftiWriter` writes a NIfTI-1 file slab by slab. The
-  header it emits is the one nibabel would write for the same shape, dtype,
-  affine and source header, and the voxels follow NIfTI storage order, so
-  the result is an ordinary NIfTI-1 file with no trace of how it was made.
-
-Together they let a filter that touches every voxel run on a volume larger
-than the machine's RAM without resampling, rescaling or re-quantising it.
+:class:`RawSliceReader` yields voxels exactly as stored on disk (dtype,
+byte order, ``scl_slope``/``scl_inter`` untouched), one slab at a time.
+:class:`StreamingNiftiWriter` writes an ordinary NIfTI-1 file slab by slab,
+indistinguishable from one nibabel wrote directly.
 """
 
 from __future__ import annotations
@@ -61,13 +53,8 @@ class RawSliceReader:
     slope, inter
         The header's intensity scaling, ``(1.0, 0.0)`` when unset.
 
-    Notes
-    -----
-    Slabs are read through a private :class:`nibabel.arrayproxy.ArrayProxy`
-    built with unit scaling, which is what keeps the returned values raw.
-    Uncompressed files are memory-mapped; compressed files are decompressed
-    on the fly, so slabs must be requested in increasing ``z`` -- going
-    backwards forces gzip to restart from the beginning of the file.
+    Uncompressed files are memory-mapped; compressed files decompress on
+    the fly, so slabs must be requested in increasing ``z``.
     """
 
     def __init__(self, img) -> None:
@@ -179,11 +166,9 @@ class RawSliceReader:
     def solid_mask(self, raw, threshold: float):
         """``raw`` at or above the grey level *threshold*, as booleans.
 
-        For the common case -- a scalar integer volume with no header
-        scaling -- the threshold is moved into stored units instead, which
-        avoids building a floating-point copy of the slab. For integers
-        ``value >= t`` and ``value >= ceil(t)`` select the same voxels, so
-        this is a shortcut and not an approximation.
+        For a plain integer volume (no header scaling), compares in stored
+        units directly -- a shortcut, not an approximation, since
+        ``value >= t`` and ``value >= ceil(t)`` select the same voxels.
         """
         plain = (
             not self.is_rgb
@@ -203,12 +188,8 @@ class RawSliceReader:
         return self.to_gray(raw) >= np.float32(threshold)
 
     def raw_value(self, scaled: float):
-        """The stored value whose scaled grey level is *scaled*.
-
-        Inverts ``scl_slope``/``scl_inter`` and rounds and clips to the
-        on-disk dtype, so writing it back reproduces *scaled* as closely as
-        the file's quantisation allows.
-        """
+        """The stored value whose scaled grey level is *scaled* (inverts
+        scl_slope/scl_inter, rounds and clips to the on-disk dtype)."""
         raw = (float(scaled) - self.inter) / (self.slope or 1.0)
         if self.is_rgb:
             field = self.dtype[0]
@@ -228,14 +209,9 @@ class RawSliceReader:
 
 
 def build_header(source_header, affine, shape, dtype, *, slope=1.0, inter=0.0):
-    """The NIfTI-1 header nibabel would write for this image.
-
-    Mirrors :meth:`nibabel.nifti1.Nifti1Pair.update_header`: the affine is
-    only pushed into the header when it differs from the one already there,
-    and then lands in the sform (code ``aligned``) with the qform marked
-    ``unknown``. The intensity scaling is carried over from the source,
-    which is what makes writing the stored voxels lossless.
-    """
+    """The NIfTI-1 header nibabel would write for this image (mirrors
+    :meth:`nibabel.nifti1.Nifti1Pair.update_header`); intensity scaling is
+    carried over from the source, keeping the write lossless."""
     header = nib.Nifti1Header.from_header(source_header)
     header.set_data_dtype(dtype)
     header.set_data_shape(tuple(int(s) for s in shape))
@@ -251,13 +227,9 @@ def build_header(source_header, affine, shape, dtype, *, slope=1.0, inter=0.0):
 class StreamingNiftiWriter:
     """Write a NIfTI-1 file one slab at a time.
 
-    Use as a context manager and feed it blocks with :meth:`write_block`, in
-    the order the format stores them: ``x`` fastest, then ``y``, then ``z``,
-    then any further dimension. For a 4-D image that means the whole first
-    volume, then the whole second, and so on.
-
-    The file is complete and self-describing; :func:`nibabel.load` cannot
-    tell it apart from one written by :func:`nibabel.save`.
+    Context manager; feed blocks to :meth:`write_block` in storage order
+    (x fastest, then y, then z, then any further dimension). The result is
+    indistinguishable from one :func:`nibabel.save` wrote directly.
     """
 
     def __init__(self, path, *, source_header, affine, shape, dtype=None,

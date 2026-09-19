@@ -1,44 +1,21 @@
 """Sub-voxel geometry fields for the finite cell method.
 
-The finite cell method does not need a mesh that conforms to the specimen.
-It needs an indicator ``alpha(x)`` it can integrate against, and its
-accuracy comes from how well the quadrature resolves the *boundary* of
-that indicator. A hard ``uint8`` mask gives the solver a staircase whose
-error is fixed by the voxel size, no matter how finely the quadrature is
-refined, so the method's main advantage is spent before the solve begins.
-
-This module produces the two fields that give the boundary back, each with
-a different standing:
+Two companion fields to the binary mask, both measured on the *export
+grid* (post-downsample), not modelled from it:
 
 :func:`block_volume_fraction`
-    The exact material fraction of a coarse voxel, when the export grid is
-    a whole-number downsample of the scan grid. This is a *measurement*:
-    the fraction is counted from the fine mask, nothing is modelled. It is
-    what the majority-vote downsample throws away.
+    Exact material fraction per coarse voxel, counted from the fine mask.
 
 :func:`signed_distance_field`
-    The distance from every voxel centre to the material surface, in
-    millimetres, positive inside. The surface is unchanged -- this is the
-    same geometry the binary mask describes, written so that a quadrature
-    rule can find the interface between voxel centres instead of snapping
-    it to a voxel face. Refining the quadrature against it converges to
-    the binary geometry rather than to something else.
+    Distance to the material surface in mm, positive inside, with a
+    half-voxel correction so the zero level sits between voxel centres.
 
-Neither field changes the boundary-value problem. A third option -- taking
-``alpha`` from the grey level itself, so a boundary voxel becomes partly
-solid -- *does* change it, into a graded-stiffness problem, and is not
-implemented here. Do not confuse the two when reporting results.
+Neither changes the boundary-value problem; grading alpha from the grey
+value would, and is not implemented here.
 
-Memory
-------
-Unlike the rest of :mod:`niftitool.core`, the distance transform is not
-streamable: an exact Euclidean transform needs the whole array, because the
-nearest surface voxel may lie anywhere. That is acceptable because these
-fields belong on the **export grid** -- the grid actually handed to the
-solver, after any downsample -- which is orders of magnitude smaller than
-the scan. :func:`estimate_sdf_bytes` gives the requirement, and
-:func:`signed_distance_field` refuses a grid that will not fit rather than
-letting the machine swap.
+The distance transform is not streamable, so these fields are sized to the
+export grid only. :func:`estimate_sdf_bytes` / :func:`signed_distance_field`
+refuse a grid too large for the available RAM rather than let it swap.
 """
 
 from __future__ import annotations
@@ -73,17 +50,10 @@ def trimmed_shape(shape, factor: int) -> tuple[int, int, int]:
 def block_volume_fraction(mask, factor: int):
     """Material volume fraction of each *factor*-cubed block, as float32.
 
-    Exact by construction: the value is the count of material voxels in the
-    block divided by ``factor ** 3``, so the total material volume is
-    preserved. ``fraction.sum() * factor ** 3 == mask.sum()`` holds to the
-    last bit for any mask that fills a whole number of blocks, which is the
-    property the majority-vote reduction below does not have -- that one
-    deletes features thinner than half a block and closes pores smaller
-    than half a block, biasing porosity low and the small end of the
-    pore-size distribution away.
-
-    Voxels past the last whole block are dropped, as they are in the binary
-    reduction, so both stay on the same grid.
+    Exact: fine-mask count / factor**3, so total material volume is
+    preserved (unlike the majority-vote reduction below, which loses
+    sub-block features). Voxels past the last whole block are dropped,
+    matching :func:`block_reduce_binary`.
     """
     factor = max(1, int(factor))
     mask = np.asarray(mask)
@@ -94,9 +64,7 @@ def block_volume_fraction(mask, factor: int):
     if min(nx, ny, nz) == 0:
         return np.zeros((0, 0, 0), dtype=np.float32)
 
-    # Summing the counts in float32 then dividing keeps the result exact:
-    # both the count and factor**3 are small integers, and every ratio of
-    # two such integers below 2**24 is representable.
+    # int counts / factor**3 stays exact in float32 below 2**24.
     blocks = mask[:nx, :ny, :nz].astype(np.float32).reshape(
         nx // factor, factor, ny // factor, factor, nz // factor, factor)
     counts = blocks.sum(axis=(1, 3, 5))
@@ -145,22 +113,11 @@ def is_isotropic(spacing) -> bool:
 
 
 def _half_step(idx, spacing, shape):
-    """Half a voxel step towards each voxel's nearest opposite-phase voxel.
-
-    On an anisotropic grid the interface does not lie half of the *smallest*
-    spacing away: it lies half a step along whichever direction the nearest
-    opposite voxel actually sits in. For a surface normal to z at 0.30 mm
-    per voxel, that is 0.15 mm, not 0.05 mm, and using the smallest spacing
-    puts every such surface 0.10 mm out -- a systematic offset over the
-    whole face, not noise.
-
-    *idx* is the nearest-opposite-voxel index array from the transform. The
-    displacement is converted to millimetres, normalised, and projected
-    back onto the spacing to give the step length in that direction, which
-    reduces exactly to ``0.5 * spacing[axis]`` for an axis-aligned surface.
-    Components are accumulated one axis at a time to keep the peak working
-    set down.
-    """
+    """Half a voxel step along the direction to each voxel's nearest
+    opposite-phase voxel -- not along the smallest spacing, which on an
+    anisotropic grid would put a surface systematically off by up to the
+    spacing difference. *idx* is the nearest-opposite-voxel index array
+    from the transform."""
     spacing = [float(s) for s in spacing]
     components = []
     norm_sq = np.zeros(shape, dtype=np.float32)
@@ -184,17 +141,10 @@ def _half_step(idx, spacing, shape):
 
 
 def _edt(binary, spacing, *, pad_value: bool):
-    """Distance from each ``True`` voxel to the material surface.
-
-    Returns the distance to the nearest ``False`` voxel *centre* minus half
-    a voxel step, so the zero level sits midway between the last voxel of
-    one phase and the first of the other -- the only defensible position
-    for a two-phase boundary with no sub-voxel information.
-
-    The array is padded by one voxel with *pad_value* before the transform
-    and cropped after, which is how the caller chooses whether the edge of
-    the array counts as a surface.
-    """
+    """Distance from each True voxel to the material surface: distance to
+    the nearest False voxel centre, minus a half-voxel correction so the
+    zero level sits midway between the two phases. *pad_value* sets
+    whether the array edge counts as a surface."""
     padded = np.pad(binary, 1, mode="constant", constant_values=bool(pad_value))
 
     if is_isotropic(spacing):
@@ -222,42 +172,18 @@ def signed_distance_field(mask, spacing_mm, *, border_is_surface: bool = False,
     mask
         Boolean or 0/1 material mask on the export grid.
     spacing_mm
-        Voxel size along each axis, in millimetres. Anisotropic spacing is
-        handled through the transform's ``sampling`` argument, so the
-        result is a physical distance and not a voxel count.
+        Voxel size per axis, in mm.
     border_is_surface
-        Whether material touching the edge of the array is bounded there.
-        ``False`` (the default) is right for a specimen cropped out of a
-        larger scan: the array edge is an arbitrary cut, the material
-        continues past it, and treating it as a free surface would carve a
-        spurious boundary layer into the model. Set ``True`` only when the
-        volume really does contain the whole specimen with air around it.
+        False (default): the array edge is a cut, not a surface (right for
+        a specimen cropped from a larger scan). True: material touching
+        the edge is bounded there.
     max_bytes
-        Refuse grids whose peak working set exceeds this. ``None`` uses the
-        free RAM reported by psutil, halved.
+        Refuse grids exceeding this working set. None uses half of free
+        RAM (see :func:`estimate_sdf_bytes`).
 
-    Notes
-    -----
-    The half-voxel convention matters and is easy to get wrong. A discrete
-    transform measures the distance to the nearest voxel *centre* of the
-    opposite phase, so the last material voxel reports 1 and the first void
-    voxel reports 1, while the interface lies midway between them. Half a
-    voxel is therefore subtracted from each side:
-
-        phi = (d_inside - h/2)  where material,  -(d_outside - h/2) elsewhere
-
-    which puts the zero level exactly on the midpoint, as it should be for
-    a two-phase boundary with no other information. ``h`` is the smallest
-    spacing; for anisotropic voxels the exact correction depends on the
-    direction to the nearest opposite voxel, so this is accurate to within
-    half the spacing *anisotropy*, not half a voxel. For the near-isotropic
-    grids these scans produce the difference is negligible; for strongly
-    anisotropic data, resample first.
-
-    The result is not better than the mask it is built from: a voxelised
-    sphere carries its own discretisation error, and this field inherits
-    it. What it removes is the *additional* error of forcing the interface
-    onto a voxel face.
+    Zero level sits midway between the last material and first void voxel
+    centre (see :func:`_edt`); exact for isotropic spacing, accurate to
+    within the spacing anisotropy otherwise.
     """
     mask = np.asarray(mask, dtype=bool)
     spacing = tuple(float(s) for s in np.asarray(spacing_mm).ravel()[:3])
@@ -279,9 +205,8 @@ def signed_distance_field(mask, spacing_mm, *, border_is_surface: bool = False,
             f"of {factor} or more, or raise max_bytes."
         )
 
-    # Degenerate volumes have no surface to measure from. Report a distance
-    # that is unambiguously outside every band a caller might use, rather
-    # than zeros, which would read as "interface everywhere".
+    # No surface in a degenerate volume: report a distance outside any
+    # band a caller might use, not zero (which reads as "interface everywhere").
     extent = float(np.hypot.reduce([n * s for n, s in zip(mask.shape, spacing)]))
     if not mask.any():
         return np.full(mask.shape, -extent, dtype=np.float32)
@@ -302,17 +227,10 @@ def write_sdf_nifti(mask_path, out_path, *, border_is_surface: bool = False,
                     max_bytes: int | None = None) -> dict:
     """Write the signed distance field of an exported binary mask.
 
-    Reads the indicator file back from the **export grid** -- not the scan
-    grid -- computes the field there, and writes it as float32 on exactly
-    the same shape, affine and zooms, so the solver reads both in one
-    frame. Doing it as a second pass rather than inside the streaming
-    threshold is deliberate: the transform is not streamable, and the
-    export grid is the smallest grid that still describes what the solver
-    will see.
-
-    Returns a summary including the surface area implied by the zero level
-    and the fraction of voxels within one voxel of it, which is the share
-    of the domain a cut-cell quadrature actually has to work on.
+    Reads the mask back from the export grid (not the scan grid), computes
+    the field there, and writes float32 on the same shape/affine/zooms so
+    the solver reads both in one frame. Returns a summary including the
+    fraction of voxels within one voxel of the zero level.
     """
     import nibabel as nib
 
@@ -347,18 +265,12 @@ def write_sdf_nifti(mask_path, out_path, *, border_is_surface: bool = False,
 def alpha_from_sdf(phi, *, width_mm: float = 0.0, alpha_min: float = 1e-8):
     """FCM indicator from a signed distance field.
 
-    With ``width_mm = 0`` this is the sharp indicator ``H(phi)``: the
-    geometry is unchanged and all the accuracy comes from the quadrature
-    finding the zero level. A positive *width_mm* replaces the step with a
-    linear ramp of that total width centred on the surface, which is
-    sometimes wanted to keep the integrand differentiable -- note that this
-    grades the stiffness across the ramp and is a modelling choice, not a
-    numerical one.
+    ``width_mm = 0`` (default): sharp indicator ``H(phi)``, geometry
+    unchanged. ``width_mm > 0``: linear ramp of that width centred on the
+    surface -- a graded-stiffness modelling choice, not a numerical one.
 
-    *alpha_min* is the fictitious-domain penalty: the void phase is given a
-    small non-zero value so the stiffness matrix stays non-singular. It
-    must match the solver's ``alpha_fcm``, and it is applied as a floor so
-    a nearly-void point can never drop below it and wreck the conditioning.
+    ``alpha_min`` is the fictitious-domain floor (must match the solver's
+    ``alpha_fcm``) so the stiffness matrix stays non-singular in the void.
     """
     phi = np.asarray(phi, dtype=np.float32)
     if width_mm <= 0:

@@ -1,31 +1,11 @@
 """Connected components and cavity filling under a fixed memory budget.
 
-The specimen in a micro-CT scan is the largest connected region of solid
-voxels, and the background is everything outside it. Finding that region
-with :func:`scipy.ndimage.label` needs an ``int32`` label volume, four
-bytes per voxel, on top of the volume itself -- which is why the operation
-used to fail on the machines the scans are actually processed on.
-
-This module computes the same result from two-dimensional labellings that
-are merged across ``z`` with a union-find, and stores the masks one bit per
-voxel. Nothing here scales with the volume except the packed masks, at
-0.125 bytes per voxel each.
-
-Equivalence with scipy
-----------------------
-A slice labelled with the 4-connected structuring element, joined to the
-next slice wherever both are foreground at the same ``(x, y)``, is exactly
-the 6-connected (``connectivity=1``) labelling of the volume: the two
-element sets are the same set of neighbours. :func:`fill_cavities`
-likewise reproduces :func:`scipy.ndimage.binary_fill_holes` with its
-default structuring element, because that too floods the background with
-6-connectivity from the array border. ``tests/test_background_streaming.py``
-asserts the equality voxel by voxel on random volumes.
-
-Six-connectivity is the right choice here regardless of the memory: under
-26-connectivity two grains touching at a single corner count as one solid
-body, so a speck of noise diagonally adjacent to the specimen would join
-it and drag the bounding box outward.
+:func:`scipy.ndimage.label` needs an int32 label volume on top of the data
+itself, which is why this used to run out of memory on real scans. This
+module gets the same 6-connected result from per-slice 2-D labellings
+merged across ``z`` with a union-find, storing masks one bit per voxel;
+nothing scales with the volume except the packed masks. :func:`fill_cavities`
+reproduces :func:`scipy.ndimage.binary_fill_holes` the same way.
 """
 
 from __future__ import annotations
@@ -126,12 +106,8 @@ class _UnionFind:
         self.n = 0
 
     def extend(self, counts) -> int:
-        """Append one set per entry of *counts*; returns the first index.
-
-        *counts* are voxel counts and stay attached to the label that was
-        added; they are never merged, so summing them per root gives the
-        size of each component exactly once.
-        """
+        """Append one set per entry of *counts* (never merged, so summing
+        per root gives each component's size); returns the first index."""
         counts = np.asarray(counts, dtype=np.int64)
         first = self.n
         self.n += counts.size
@@ -255,9 +231,7 @@ def largest_component(solid, *, progress=None, cancel=None):
     """The largest 6-connected component of *solid*, as a new packed mask.
 
     Returns ``(mask, n_components)``, or ``(None, 0)`` when *solid* is
-    empty. The input is read twice; the second pass re-derives the same
-    per-slice labelling, which is cheaper than keeping four bytes per voxel
-    of labels around.
+    empty.
     """
     nx, ny, nz = solid.shape
     finder, offsets = _label_volume(
@@ -289,11 +263,8 @@ def largest_component(solid, *, progress=None, cancel=None):
 def fill_cavities(mask, *, progress=None, cancel=None) -> int:
     """Add every void fully enclosed by *mask* to it, in place.
 
-    A void is enclosed when its connected component never reaches the edge
-    of the array. This is :func:`scipy.ndimage.binary_fill_holes` with the
-    default structuring element, and it is what keeps internal porosity
-    inside the specimen instead of counting it as background.
-
+    Enclosed = its component never reaches the array edge
+    (:func:`scipy.ndimage.binary_fill_holes`, default structuring element).
     Returns the number of voxels added.
     """
     nx, ny, nz = mask.shape

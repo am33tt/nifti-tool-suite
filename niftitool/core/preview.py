@@ -1,37 +1,13 @@
 """A resident decimated copy of the volume, for interactive viewing.
 
-Why this exists
----------------
-The tri-planar viewer draws each panel a few hundred pixels across, so it
-already decimates every slice before it reaches the screen. What it could
-not avoid was *reading* the slice: an axial slice is contiguous on disk and
-costs one sequential read, but a sagittal or coronal slice takes one row
-from every plane in the file. Collecting it touches the whole volume. On a
-scan larger than the page cache that is the entire cost of dragging a
-slider, and it is paid again at every new index, so caching windowed
-results does not help.
+A strided read of a non-axial slice touches the whole file, so a slider
+would pay a full read at every step. This module reads the volume once,
+decimated, into a resident float32 array; after that a slice along any
+axis is a memory read. Read as whole planes along the slowest axis, only
+every *step*-th one, so building it costs about 1/step of the file.
 
-This module reads the volume once, decimated, into an array that stays in
-memory. After that a slice along any axis is a memory read -- microseconds
-rather than the tens or hundreds of milliseconds a strided file read costs
--- which is what makes a slider feel continuous. It is the same trick the
-3-D view already relies on: that view is smooth because its volume is
-resident, not because rendering is cheap.
-
-Reading it cheaply
-------------------
-The pass is by whole planes along the slowest axis, which are contiguous on
-disk, and only every *step*-th plane is read at all. So building a preview
-at step 3 reads about a third of the file, sequentially, rather than
-seeking through all of it. Peak memory is one plane plus the finished
-preview.
-
-Fidelity
---------
-A preview is for interaction only. It is decimated, so it must never be the
-source of a measurement, a threshold, a histogram or an exported image; the
-viewer re-reads at full resolution once a drag settles. Nothing here writes
-to disk.
+Decimated only -- never the source of a measurement, threshold, histogram
+or export; the viewer re-reads at full resolution once a drag settles.
 """
 
 from __future__ import annotations

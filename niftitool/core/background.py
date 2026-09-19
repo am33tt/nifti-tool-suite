@@ -1,33 +1,14 @@
 """Automatic background detection and removal.
 
-The specimen is the largest connected component of the solid phase -- every
-voxel at or above the void/solid threshold -- with its internal cavities
-returned to it, so only exterior air is removed. Voxels outside the
-specimen are set to a constant, and the volume is optionally cropped to the
+The specimen is the largest connected component of the solid phase, with
+internal cavities returned to it, so only exterior air is removed. Voxels
+outside it are set to a constant; the volume can also be cropped to the
 specimen's bounding box plus a margin.
 
-Memory
-------
-The volume is never held in RAM. It is read in slabs of
-:data:`~niftitool.core.volume_stream.SLAB_BUDGET_BYTES`, the two masks the
-algorithm needs are bit-packed at 0.125 bytes per voxel, and the result is
-written slab by slab as it is produced. The working set is therefore
-
-    0.25 bytes/voxel  +  a slab  +  the union-find bookkeeping
-
-independent of the file size: a 3000^3 scan (27 x 10^9 voxels, 54 GB as
-uint16) needs about 7 GiB and runs on a 16 GB machine. See
-:func:`estimate_memory_bytes`.
-
-Fidelity
---------
-Voxels are copied from the source file in their stored dtype and byte
-order, and the header's ``scl_slope``/``scl_inter`` are carried over
-unchanged, so surviving voxels are bit-identical to the input. Nothing is
-interpolated, resampled or re-quantised. Cropping shifts the affine's
-origin so world coordinates are preserved, and the fill value is converted
-into stored units before it is written, so it means the same grey level it
-does on screen.
+Streamed slab by slab (see :func:`estimate_memory_bytes`), with two
+bit-packed masks -- working set is independent of file size. Voxels are
+copied bit-identical from the source (no resampling/re-quantising);
+cropping shifts the affine origin to keep world coordinates correct.
 """
 
 from __future__ import annotations
@@ -36,31 +17,15 @@ from ..deps import np
 from .label_stream import PackedMask, fill_cavities, largest_component
 from .volume_stream import RawSliceReader, StreamingNiftiWriter
 
-#: How the voxels outside the specimen are filled.
-#:
-#: ``zero``
-#:     Exact zero. The convention the downstream tools expect: the porosity
-#:     and threshold code recognises a background-masked volume by its large
-#:     exactly-zero region, and simulation exports treat zero as void.
-#: ``air-median``
-#:     The median grey level of the removed background, which keeps a
-#:     realistic air peak in the histogram.
-#: ``value``
-#:     A grey level given by the caller.
+#: Fill for voxels outside the specimen: ``zero`` (the convention
+#: downstream tools expect), ``air-median`` (keeps a realistic air peak),
+#: or ``value`` (caller-supplied grey level).
 FILL_MODES = ("zero", "air-median", "value")
 
-#: How the outer boundary of the specimen is decided.
-#:
-#: ``component``
-#:     The largest connected body of solid material. Right whenever the
-#:     specimen is the only thing in the scan that the threshold sees.
-#: ``envelope``
-#:     A radial boundary fitted direction by direction, from the void gap
-#:     between the specimen and whatever surrounds it. Use it when the
-#:     specimen was scanned inside a sleeve, mould or wrapping: those touch
-#:     the specimen somewhere over the height of the scan, and one contact
-#:     is enough to make the two a single connected body. See
-#:     :mod:`niftitool.core.envelope`.
+#: How the specimen's outer boundary is decided: ``component`` (largest
+#: connected solid body) or ``envelope`` (radial fit, for a specimen
+#: scanned inside a sleeve/mould that touches it -- see
+#: :mod:`niftitool.core.envelope`).
 BOUNDARY_MODES = ("component", "envelope")
 
 #: Voxels sampled to estimate the background median.
@@ -68,14 +33,9 @@ _MEDIAN_SAMPLE_VOXELS = 4_000_000
 
 
 def estimate_memory_bytes(shape, itemsize: int = 2) -> float:
-    """Peak RAM the removal needs for a volume of *shape*, in bytes.
-
-    Two bit-packed masks at 0.125 bytes per voxel, plus the working copies
-    of one slab: the stored voxels, an equally large copy of them and the
-    boolean mask of the same slab. The union-find is left out: it is
-    proportional to the number of connected components, a few thousand on a
-    real scan.
-    """
+    """Peak RAM the removal needs for a volume of *shape*, in bytes: two
+    bit-packed masks plus one slab's working copies. Excludes the
+    union-find bookkeeping (proportional to component count, negligible)."""
     from .volume_stream import SLAB_BUDGET_BYTES
 
     n_voxels = 1
@@ -103,12 +63,8 @@ def _sample_positions(shape):
 
 
 def _threshold_volume(reader, threshold, *, sample_stride, progress, cancel):
-    """First pass: the solid mask, and a strided grey-level sample.
-
-    The sample is kept so the background median can be measured later
-    against the *specimen* mask rather than the raw threshold, without
-    reading the file again.
-    """
+    """First pass: the solid mask, and a strided grey-level sample (kept so
+    the background median can be measured later without a second read)."""
     from ..utils import OperationCancelled
 
     nx, ny, nz = reader.shape
@@ -203,11 +159,10 @@ def remove_background(
     img
         The loaded :class:`nibabel.Nifti1Image`.
     threshold
-        Void/solid grey level, in the same units the viewer displays -- the
-        value from the Threshold panel.
+        Void/solid grey level (viewer units, from the Threshold panel).
     out_path
-        Destination ``.nii`` or ``.nii.gz``. It is written as the volume is
-        computed, so no copy of the result is ever held in memory.
+        Destination ``.nii``/``.nii.gz``; written as computed, no full
+        result held in memory.
     margin
         Voxels of padding kept around the specimen's bounding box.
     crop
@@ -215,23 +170,19 @@ def remove_background(
     fill_mode
         One of :data:`FILL_MODES`.
     fill_value
-        The grey level to write when *fill_mode* is ``"value"``.
+        Grey level to write when *fill_mode* is ``"value"``.
     boundary
-        One of :data:`BOUNDARY_MODES`. ``"envelope"`` fits the specimen
-        surface radially first and discards everything beyond it, which is
-        what removes a sleeve or mould that touches the specimen.
+        One of :data:`BOUNDARY_MODES`.
     envelope_options
         Keyword arguments for :func:`niftitool.core.envelope.fit_envelope`.
     progress
         Optional ``fn(stage: str, fraction: float)`` callback.
     cancel
         Optional ``fn() -> bool``; raises
-        :class:`~niftitool.utils.OperationCancelled` when it turns true.
+        :class:`~niftitool.utils.OperationCancelled` when true.
 
-    Returns a dictionary describing what was done: the threshold used, the
-    number of solid components found, the specimen and cavity voxel counts,
-    the fill value in both grey and stored units, the crop window and the
-    shape written.
+    Returns a dict of what was done: threshold, component/voxel counts,
+    fill value, crop window and output shape.
     """
     if fill_mode not in FILL_MODES:
         raise ValueError(f"fill_mode must be one of {FILL_MODES}, got {fill_mode!r}")

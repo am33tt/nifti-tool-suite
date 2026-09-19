@@ -1,70 +1,16 @@
 """Optional GPU acceleration for the filter kernels.
 
-The heavy steps of this toolkit are neighbourhood filters and morphology on
-slabs of a few tens to a few hundreds of megabytes: Gaussian smoothing
-before thresholding, the exact Euclidean distance transform behind the
-beam-hardening depth field, bilinear resampling of the coarse correction
-field back onto the full grid, and connected-component labelling. Those are
-exactly the kernels `cupyx.scipy.ndimage` implements, so this module routes
-them to the GPU when one is usable and to SciPy when it is not.
+Routes the neighbourhood-filter/morphology calls used elsewhere in this
+package (Gaussian smoothing, the EDT, resampling, connected-component
+labelling) to `cupyx.scipy.ndimage` when a CUDA device is usable and the
+operands fit in free VRAM, and to SciPy otherwise. Selection is per call
+(see :func:`would_use_gpu`); a CUDA OOM frees the pool, retries once, then
+falls back to the CPU result. The GPU never holds a whole volume, only one
+slab at a time.
 
-What this module does *not* change
-----------------------------------
-Nothing about how the volume is read, written or held. The slab-wise
-streaming in :mod:`~niftitool.core.volume_stream` stays the memory model of
-the whole toolkit, and the 16 GB target is unaffected: a slab is copied to
-the device, filtered, and copied back. The GPU is a coprocessor for one
-slab at a time, never a place a volume lives. Steps whose cost is disk I/O
--- background removal, the masked write-out, the streaming binarisation --
-are bounded by the file, not by arithmetic, and will not get much faster.
-
-Backend selection
------------------
-CuPy is the only backend. It requires an NVIDIA GPU with a CUDA driver (or
-an AMD card under ROCm on Linux); on Intel or AMD integrated graphics no
-compute backend is available, and every call here silently runs the SciPy
-path. That is the intended behaviour, not a degraded mode: on integrated
-graphics "VRAM" is system RAM behind a slower path, so offloading would
-cost time rather than save it.
-
-The choice is made per call, from three inputs:
-
-* the user's mode (:func:`set_mode`, or the ``NIFTITOOL_GPU`` environment
-  variable, one of ``auto`` / ``on`` / ``off``);
-* whether a working device was found at first use;
-* whether the operands plus a working margin fit in currently free VRAM.
-
-A CUDA out-of-memory error is caught, the memory pool is released, the call
-is retried once, and if it fails again the CPU result is returned. A caller
-therefore never has to handle a GPU-specific failure.
-
-Numerical agreement
--------------------
-The GPU kernels implement the same algorithms, but floating-point
-reductions run in a different order, so results agree to rounding rather
-than bit for bit. Measured against SciPy on float32 input:
-
-===========================  ======================================
-kernel                       agreement
-===========================  ======================================
-``gaussian_filter``          ~1e-6 relative; a voxel whose smoothed
-                             value sits exactly on a threshold can
-                             fall to the other side of it
-``map_coordinates`` order=1  ~1e-6 relative
-``distance_transform_edt``   exact algorithm both sides; differences
-                             only from the ``sampling`` multiply
-``median_filter``            exact (selection, not arithmetic)
-``binary_*`` morphology      exact
-``label``                    identical components; the *numbering*
-                             of the components is not guaranteed to
-                             match, so never compare label ids
-                             across backends, only sizes and masks
-===========================  ======================================
-
-For a published run, set ``NIFTITOOL_GPU=off`` (or the GUI toggle) if you
-want the numbers to be reproducible on any machine regardless of what
-hardware it has. ``tests/test_accel.py`` checks every routed kernel against
-SciPy and will report the observed deviation on the machine it runs on.
+Results agree with SciPy to rounding, not bit-for-bit; `label` ids are not
+stable across backends, only sizes/masks are. For reproducible numbers, set
+`NIFTITOOL_GPU=off` (or the GUI toggle).
 """
 
 from __future__ import annotations
@@ -76,18 +22,11 @@ import numpy as np
 
 from .. import config
 
-# Read through getattr rather than a from-import. A from-import makes this
-# module -- and therefore every core function that filters anything --
-# refuse to load against a config.py that predates these settings, which is
-# what a half-applied update or a stale editor buffer looks like. Falling
-# back to the defaults keeps the science working and costs only the
-# configurability.
+# getattr, not from-import: stays loadable against an older config.py.
 GPU_MODE_DEFAULT = getattr(config, "GPU_MODE_DEFAULT", "auto")
 GPU_VRAM_FRACTION = getattr(config, "GPU_VRAM_FRACTION", 0.6)
 
-# Imported directly rather than through ..deps, whose probe bundles NumPy,
-# nibabel and SciPy into one try block: a machine with SciPy but without
-# nibabel would otherwise see every kernel here refuse to run.
+# Imported directly (not via ..deps) so a missing nibabel can't disable this.
 try:
     import scipy.ndimage as _sndi
 except ImportError:                                  # pragma: no cover
@@ -103,33 +42,19 @@ __all__ = [
     "binary_closing", "binary_opening", "rotate", "last_backend",
 ]
 
-#: Modes accepted by :func:`set_mode`.
-#:
-#: ``auto``
-#:     Use the GPU when one is available and the operands fit. The default.
-#: ``on``
-#:     Same as ``auto``, but log loudly when the GPU is unusable, so a run
-#:     that was meant to be accelerated does not quietly fall back.
-#: ``off``
-#:     Never touch the GPU. Use this for runs whose numbers go into a
-#:     paper, so the result does not depend on the host's hardware.
+#: Modes for :func:`set_mode`: ``auto`` (use GPU if it fits), ``on`` (auto,
+#: but warn loudly on fallback), ``off`` (CPU only, for reproducible runs).
 MODES = ("auto", "on", "off")
 
-#: Fraction of *free* VRAM a single call may claim. The rest is left for
-#: the display driver, the VTK 3-D viewer (which shares the same device)
-#: and CuPy's own allocator fragmentation.
+#: Fraction of *free* VRAM one call may claim; the rest covers the display
+#: driver, the VTK viewer and allocator fragmentation.
 VRAM_FRACTION = GPU_VRAM_FRACTION
 
-#: Multiple of the input size assumed for a kernel's working set: the input
-#: copy, the output, and scratch. Separable filters and the EDT need the
-#: most; 4x is a deliberately pessimistic single number, because a wrong
-#: guess that is too small only costs a fallback, while one that is too
-#: large costs an out-of-memory error mid-run.
+#: Assumed working-set multiple of input size (copy + output + scratch),
+#: deliberately pessimistic so a wrong guess costs a fallback, not an OOM.
 WORKING_SET_FACTOR = 4.0
 
-#: Arrays smaller than this are not worth a round trip over PCIe: the
-#: transfer and kernel-launch overhead exceeds what SciPy takes on the
-#: host. 4 MiB is roughly the crossover measured for a 3-D Gaussian.
+#: Below this, PCIe transfer + launch overhead exceeds the SciPy CPU cost.
 MIN_GPU_BYTES = 4 * 1024 ** 2
 
 _lock = threading.Lock()
@@ -151,13 +76,8 @@ _fallback_notes: dict[str, str] = {}
 # ---------------------------------------------------------------------------
 
 def _probe() -> None:
-    """Import CuPy and confirm a device actually executes a kernel.
-
-    Importing CuPy succeeds on machines whose driver is missing, too old or
-    busy, and the failure then surfaces at the first kernel launch deep
-    inside a worker thread. So the probe runs a trivial kernel and only
-    reports success if it returns.
-    """
+    """Import CuPy and confirm a device actually runs a kernel (import alone
+    can succeed with no usable device)."""
     global _probe_done, _cp, _cndi, _probe_error
     if _probe_done:
         return
@@ -235,24 +155,9 @@ def total_vram_bytes() -> int | None:
 def video_memory_mb() -> tuple[float | None, float | None, str]:
     """Best available ``(free_mb, total_mb, source)`` for the display GPU.
 
-    Three sources, in decreasing order of accuracy:
-
-    ``"cuda"``
-        CuPy's ``mem_info``. Reports both free and total, and is what the
-        compute kernels are budgeted against.
-    ``"vtk"``
-        :class:`vtkGPUInfoList`, which reports *dedicated* video memory for
-        any vendor. There is no free-memory figure, so ``free_mb`` is
-        ``None`` and callers must budget against the total.
-    ``"none"``
-        Nothing could be queried -- no GPU, integrated graphics with no
-        dedicated memory, or a VTK build without the probe. Callers should
-        fall back to a system-RAM budget, which for integrated graphics is
-        the correct model anyway: its "VRAM" *is* system RAM.
-
-    A dedicated pool under 256 MiB is reported as ``"none"``: that is what
-    an integrated adapter reserves for the framebuffer, not a budget a
-    volume can be sized against.
+    ``source`` is ``"cuda"`` (CuPy, free+total), ``"vtk"`` (dedicated total
+    only, ``free_mb`` is ``None``), or ``"none"`` (fall back to a
+    system-RAM budget). A dedicated pool under 256 MiB counts as ``"none"``.
     """
     free = free_vram_bytes()
     total = total_vram_bytes()
@@ -416,24 +321,10 @@ _BRUTE_FORCE_KERNELS = frozenset({
 
 
 def _gpu_kwargs(name: str, kwargs: dict) -> dict:
-    """*kwargs* adjusted for the CuPy backend.
-
-    SciPy's binary morphology defaults to ``brute_force=False``, an
-    optimisation that tracks only the voxels changed by the previous
-    iteration instead of re-scanning the whole array. CuPy implements only
-    the brute-force form and raises ``NotImplementedError`` for anything
-    else once ``iterations`` exceeds one, which sent every multi-iteration
-    erosion, dilation and closing back to the CPU.
-
-    The flag selects an algorithm, not a result: SciPy's own documentation
-    describes it as a performance option, and both settings are verified
-    identical for 1 to 5 iterations in ``tests/test_accel.py``. Setting it
-    for the GPU call is therefore a backend detail, not a change to what is
-    computed. It is *not* set for the SciPy path, where the default is the
-    faster of the two.
-
-    An explicit ``brute_force`` from the caller is always respected.
-    """
+    """*kwargs* adjusted for the CuPy backend: sets ``brute_force=True`` for
+    multi-iteration binary morphology, which CuPy implements only in that
+    form (SciPy defaults to False; both give identical results, just at
+    different speed). An explicit caller ``brute_force`` is respected."""
     if (name in _BRUTE_FORCE_KERNELS
             and int(kwargs.get("iterations", 1) or 1) != 1
             and "brute_force" not in kwargs):
@@ -484,24 +375,16 @@ def _dispatch(name: str, args: tuple, kwargs: dict):
 
 
 def _note_fallback(name: str, ex: Exception) -> None:
-    """Record, once per kernel, why the GPU path was abandoned.
-
-    A silent fallback is the worst outcome here: the run is correct but
-    slow, and nothing says why. Keeping one note per kernel means an
-    unsupported keyword or a driver problem surfaces in the log instead of
-    being inferred from a stopwatch.
-    """
+    """Record, once per kernel, why the GPU path was abandoned (so a
+    silent slowdown shows up in the log instead)."""
     if name not in _fallback_notes:
         _fallback_notes[name] = f"{type(ex).__name__}: {ex}"
 
 
 def fallback_notes() -> dict[str, str]:
     """Kernels that were asked to run on the GPU and could not, and why.
-
-    Empty when everything that was attempted succeeded. Out-of-memory
-    fallbacks that a retry recovered from are not recorded; one that
-    persisted is.
-    """
+    Empty when everything attempted succeeded; a recovered OOM is not
+    recorded, one that persisted is."""
     return dict(_fallback_notes)
 
 

@@ -44,13 +44,9 @@ TRI_MARGINS = {'left': 0.02, 'right': 0.98, 'bottom': 0.06, 'top': 0.92,
 class _AspectLimitNoticeFilter(logging.Filter):
     """Drop matplotlib's note that it re-fitted a panel's view limits.
 
-    The panels pin their own limits (see :meth:`_fit_tri_panels`) while
-    holding a fixed data aspect, so whenever matplotlib nudges one it says
-    so on its own logger. The nudge is the intended behaviour -- the view is
-    being kept undistorted -- but the note is emitted once per panel per
-    frame, which floods the console during a window resize or a toolbar
-    zoom. Only this one message is dropped; every other matplotlib message
-    still comes through.
+    Expected (the panels pin their own limits, see :meth:`_fit_tri_panels`)
+    but emitted once per panel per frame, flooding the console during a
+    resize or zoom. Only this one message is dropped.
     """
 
     PREFIX = "Ignoring fixed"
@@ -996,11 +992,9 @@ class TriplanarMixin:
 
     def _on_tri_full_draw(self, _event):
         """Recapture the clean backgrounds after a full draw, then paint the
-        animated artists (images and crosshairs) on top.
-
-        No ``canvas.blit()`` here: the callback runs inside the canvas paint
-        cycle, so blitting would request a repaint while painting
-        ("Recursive repaint detected"). Drawing into the renderer suffices.
+        animated artists (images and crosshairs) on top. No canvas.blit()
+        here: the callback runs inside the paint cycle, and blitting would
+        trigger "Recursive repaint detected".
         """
         if self._tri_im.get('X') is None:
             self._tri_bg_valid = False
@@ -1172,15 +1166,10 @@ class TriplanarMixin:
     def _tri_lut(self, cmap_name: str):
         """A 256-entry RGBA table for *cmap_name*, built once and reused.
 
-        Matplotlib normally maps a float array through the norm and the
-        colormap on every draw. That is measurable: on a panel-sized slice
-        it is about half the cost of a frame, and it is the same mapping
-        every time. Doing it as a lookup on pre-quantised values and
-        handing matplotlib finished RGBA bytes skips it entirely.
-
-        256 levels is what the display has, so nothing visible is lost --
-        the window has already mapped the interesting grey range onto
-        [0, 1] before this point.
+        Skips matplotlib's per-draw norm+colormap mapping (~half a frame's
+        cost on a panel-sized slice) by doing it once as a lookup on
+        pre-quantised values. 256 levels matches the display; nothing
+        visible is lost.
         """
         cache = getattr(self, '_tri_lut_cache', None)
         if cache is None:
@@ -1202,12 +1191,10 @@ class TriplanarMixin:
                        max_px: int | None):
         """The slice to draw for *axis*, and whether it came from the preview.
 
-        Every read that ends up on screen goes through here, so there is
-        one rule rather than three: use the preview whenever it exists, and
-        let :meth:`_tri_settle_refresh` upgrade the panel afterwards if the
-        preview is genuinely coarser than the panel can show. The point is
-        that no path reachable from a slider, a resize or a colormap change
-        can ever read the file on the GUI thread.
+        One rule for every read that reaches the screen: use the preview
+        when it exists; :meth:`_tri_settle_refresh` upgrades afterwards if
+        needed. No path from a slider/resize/colormap change reads the
+        file on the GUI thread.
         """
         use_preview = self._slice_cache.has_preview()
         return self._slice_cache.get(axis, idx, ww, wc, max_px=max_px,
@@ -1216,11 +1203,9 @@ class TriplanarMixin:
     def _refine_step(self, axis: str) -> int:
         """How much finer than the preview this panel could actually draw.
 
-        The panels decimate to their own pixel budget anyway. When the
-        preview is already at least that fine, a full-resolution read
-        produces the *same* samples -- measurably identical, not merely
-        similar -- so there is nothing to refine and the read would be pure
-        cost. Returns 1 when refinement would not change the picture.
+        Returns 1 when the preview already matches the panel's own pixel
+        budget (a full-resolution read would produce the same samples), so
+        there is nothing to refine.
         """
         cache = self._slice_cache
         if not cache.has_preview() or self._gray is None:
@@ -1237,16 +1222,10 @@ class TriplanarMixin:
     def _tri_settle_refresh(self):
         """Once dragging pauses, redraw -- reading the file only if it helps.
 
-        This used to re-read all three panels at full resolution inline. On
-        a volume that is not resident, a sagittal read is tens to hundreds
-        of milliseconds, and dragging back and forth fires this timer after
-        every pause, so the window locked up repeatedly. That is the exact
-        cost the preview exists to keep off the interaction path, and it
-        had no business running on the GUI thread.
-
-        Two rules now, both borrowed from how a dedicated slice viewer
-        behaves: never read during interaction, and never read at all
-        unless the result would differ from what is already on screen.
+        Used to re-read all three panels at full resolution inline, which
+        locked up the window on a non-resident volume. Two rules now:
+        never read during interaction, and never read unless the result
+        would differ from what's already on screen.
         """
         if not HAS_MPL or self._gray is None:
             self._tri_canvas.draw_idle()
@@ -1424,13 +1403,10 @@ class TriplanarMixin:
         self._tri_bg_valid = False
 
     def _tri_view_window(self):
-        """Physical window, in mm, containing all three views.
-
-        Sagittal spans ny*dy by nz*dz, coronal nx*dx by nz*dz and axial
-        nx*dx by ny*dy, so this box holds the largest extent in each
-        direction. Giving every panel the same window puts the three views
-        at one scale, so a feature has the same on-screen size in all of
-        them and a single scale bar applies to all three.
+        """Physical window, in mm, containing all three views: holds the
+        largest extent in each direction (sagittal ny*dy x nz*dz, coronal
+        nx*dx x nz*dz, axial nx*dx x ny*dy), so one scale bar applies to
+        all three panels.
         """
         g = self._gray
         if g is None:
@@ -1446,21 +1422,11 @@ class TriplanarMixin:
     def _layout_tri_panels(self):
         """Position the three panels.
 
-        Two arrangements, selected by the "Same scale in all views" switch.
-
-        Same scale on
-            Every box is identical and shaped like the physical window that
-            contains all three views. One millimetre is the same number of
-            pixels everywhere, so the views can be compared directly.
-
-        Same scale off
-            Each box takes the shape of its own slice and all three share
-            one height. Panels are no longer comparable, but each view is as
-            large as the space allows. This matters on a tall scan, where a
-            common window shrinks the axial view into a narrow box.
-
-        In both cases the axes aspect keeps the geometry true; a slice is
-        never stretched to fill its panel.
+        "Same scale in all views" on: every box is identical, shaped like
+        the physical window containing all three views (comparable
+        directly). Off (default): each box takes its own slice's shape,
+        sharing one height -- not comparable, but each view uses the
+        available space. Either way the axes aspect keeps geometry true.
         """
         g = self._gray
         if not HAS_MPL or g is None:
@@ -1518,19 +1484,13 @@ class TriplanarMixin:
         return True if check is None else bool(check.isChecked())
 
     def _fit_tri_panels(self):
-        """Frame each panel's slice inside its box, undistorted.
+        """Frame each panel's slice inside its box, undistorted: widens
+        whichever direction is short of the box shape, so matplotlib's own
+        aspect-fixup (which would otherwise warn once per panel per frame)
+        never triggers.
 
-        The view is widened in whichever direction is short of the box
-        shape, so the limits already satisfy the panel aspect and the spare
-        room becomes padding around a centred slice. Getting this exactly
-        right is what keeps matplotlib quiet: on the next draw it would
-        otherwise widen a limit itself to honour the aspect and warn that it
-        is ignoring the fixed limits, once per panel per frame.
-
-        The box is read back from the axes rather than remembered from the
-        layout pass. During a window resize the layout can bail out on a
-        transient zero-sized figure, and a remembered box then belongs to
-        the previous size while the figure has already moved on.
+        Box is read back from the axes, not remembered from layout, since
+        a resize can leave a remembered box stale.
         """
         g = self._gray
         if not HAS_MPL or g is None:

@@ -32,6 +32,18 @@ The scientific core (`niftitool.core`) is pure NumPy and SciPy and imports
 without Qt, so it can be used from a notebook, a batch job or a cluster with
 no GUI installed.
 
+`test_object.nii` is a small (3.9 MB) synthetic specimen included for a
+first run: a 7.0 x 7.0 x 5.0 mm cylinder at 50 um isotropic voxels
+(140x140x100, int16, HU-like values so the built-in "AM Concrete" window
+preset lines up with it), air around it, mild cupping towards the surface,
+and three spherical pores of known analytic volume (0.1796, 0.0655 and
+0.0224 mm^3) placed off-centre so the Porosity tab's numbers can be checked
+against a ground truth.
+
+```bash
+python run.py   # then open test_object.nii from the Viewer panel
+```
+
 ## The tabs
 
 | Tab | Purpose |

@@ -1,28 +1,18 @@
 """Binarisation into the indicator field the finite cell method uses.
 
-Output is uint8: 1 where material, 0 where pore or background. That is
-the indicator alpha(x) of the embedding domain formulation, so the file
-can be sampled at the quadrature points of the FCM mesh.
+Output is uint8: 1 material, 0 pore/background -- the indicator alpha(x)
+sampled at the FCM quadrature points. Use alpha = eps (1e-6 to 1e-10) in
+the void, not exactly zero (a cell entirely outside the material gives a
+singular stiffness matrix); the substitution belongs in the FCM code, not
+here. Disconnected material is an unconstrained rigid body; see
+:func:`component_report`.
 
-Two notes for the solver side. Use alpha = eps (1e-6 to 1e-10) in the
-void rather than exactly zero, otherwise a cell lying entirely outside
-the material gives a singular element stiffness matrix; the file stores
-0/1 and the substitution belongs in the FCM code. Material not connected
-to the main body is an unconstrained rigid body in the analysis, so
-component_report always counts the islands and removes them on request.
+Thresholding runs on a strided sample; binarisation streams slab by slab.
+The threshold is recomputed inside the specimen envelope by default, since
+surrounding air would otherwise drag a global threshold off the boundary.
 
-Thresholding runs on a strided sample and the binarisation streams slab
-by slab, so volumes larger than RAM are supported. The threshold is then
-recomputed inside the specimen envelope by default: air around the
-specimen inflates the low class and drags a global threshold away from
-the pore/material boundary.
-
-Methods: otsu (between class variance refined by isodata, the default
-and the same rule the porosity analysis uses), isodata (Ridler-Calvard
-intermeans), valley (histogram minimum on the lower flank of the
-material peak, needs a bimodal histogram), sigma (material peak minus k
-standard deviations, for pore populations too small for Otsu), triangle
-(Zack's rule, for a dominant material peak with a long tail) and manual.
+Methods: ``otsu`` (default), ``isodata``, ``valley``, ``sigma``,
+``triangle``, ``manual`` -- see each function's docstring.
 """
 
 from __future__ import annotations
@@ -172,14 +162,10 @@ def _smoothed_histogram(values, nbins: int, smooth: float):
 def _material_window(counts, rel_height: float = 0.02):
     """Indices bracketing the lower flank of the material peak.
 
-    The material peak is the highest intensity mode above the noise floor;
-    the window starts at the next mode below it. This keeps a third
-    population, typically the air around the specimen, from capturing the
-    valley and triangle thresholds.
-
-    rel_height is low on purpose. The pore peak of a specimen with a few
-    percent porosity is one or two percent of the air or material peak, so
-    a five percent floor would discard the mode the window is looking for.
+    The material peak is the highest mode above the noise floor; the
+    window starts at the next mode below it, keeping a third population
+    (typically surrounding air) from capturing valley/triangle. rel_height
+    is kept low since a small pore peak can be ~1-2% of the material peak.
     """
     if counts.size < 3:
         return 0, int(np.argmax(counts)) if counts.size else 0
@@ -336,12 +322,10 @@ def material_peak(values, nbins: int = 512):
 def separability_note(values, threshold):
     """Warn when the threshold lands inside the material peak.
 
-    values must come from inside the specimen, as for material_peak.
-
-    Otsu and its relatives assume two populations of comparable weight. At
-    a few percent porosity the optimum degenerates into a split of the
-    material noise, which shows as a cut within about two standard
-    deviations of the material mode.
+    *values* must come from inside the specimen, as for :func:`material_peak`.
+    Otsu-family methods assume comparable-weight populations; at low
+    porosity the optimum can degenerate into splitting the material noise,
+    seen as a cut within ~2 sigma of the material mode.
     """
     mode, sigma = material_peak(values)
     if sigma <= 0:
@@ -359,9 +343,9 @@ def separability_note(values, threshold):
 def porosity_sweep(values, ks=DEFAULT_K_SWEEP):
     """Void fraction against threshold = mode - k * sigma.
 
-    A real pore population shows up as a plateau: once k passes the
-    material noise tail the fraction stops falling steeply. Picking k on
-    the plateau measures pores, picking it on the steep part measures noise.
+    A real pore population shows as a plateau (fraction stops falling
+    steeply past the noise tail); picking k there measures pores, picking
+    it on the steep part measures noise.
     """
     v = _finite(values)
     mode, sigma = material_peak(v)
@@ -422,12 +406,9 @@ def _block_reduce(mask, factor: int):
 
 def _write_header(path, img, out_shape, zooms, affine, *,
                   dtype=np.uint8, descrip=b'FCM indicator: 1=material 0=void') -> int:
-    """Write a NIfTI-1 header carrying the source orientation.
-
-    *dtype* and *descrip* let the same writer emit the uint8 indicator and
-    the float32 volume-fraction field, which must share an affine, zooms
-    and grid or the solver would read them in different frames.
-    """
+    """Write a NIfTI-1 header carrying the source orientation. *dtype* and
+    *descrip* let the same writer emit both the uint8 indicator and the
+    float32 fraction field, which must share affine/zooms/grid."""
     import io as _io
     import struct
 
@@ -465,18 +446,11 @@ def binarize_stream(img, volume, threshold: float, out_path, *,
                     smooth: float = 0.0, downsample: int = 1,
                     slab: int = 64, progress=None, cancelled=None,
                     fraction_path=None):
-    """Threshold the volume slab by slab, writing a uint8 NIfTI.
-
-    The header is written first and the voxels stream after it, so peak
-    memory is one slab.
-
-    When *fraction_path* is given and the export is downsampled, a second
-    float32 NIfTI is written on the same grid holding the material volume
-    fraction of each coarse voxel. That fraction is counted from the fine
-    mask, so it is exact, and it is what the majority vote in the uint8
-    file discards -- see :mod:`niftitool.core.fcm_field`. At a downsample
-    of 1 there is no sub-voxel information to record and no fraction file
-    is written; the returned dictionary says so.
+    """Threshold the volume slab by slab, writing a uint8 NIfTI (peak memory
+    is one slab). When *fraction_path* is given and downsampled > 1, also
+    writes the exact material volume fraction per coarse voxel on the same
+    grid (see :mod:`niftitool.core.fcm_field`); at downsample 1 there is no
+    sub-voxel information and no fraction file is written.
     """
     out_path = Path(out_path)
     nx, ny, nz = (int(s) for s in volume.shape[:3])

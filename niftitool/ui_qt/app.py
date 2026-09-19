@@ -54,20 +54,10 @@ TOOLTIP_QSS = f"""
 class _ToolTipSuppressor(QObject):
     """Stop hover tooltips appearing anywhere in the application.
 
-    Every explanation that used to live in a tooltip is now in Help. A
-    tooltip is a poor place for one: it is unreadable on a dark-themed
-    desktop unless every widget stylesheet remembers to restyle it, it
-    disappears the moment the pointer moves, several of these ran to a
-    paragraph or more, and none of them could be searched, selected or
-    copied.
-
-    This filter swallows the tooltip event itself rather than relying on
-    every ``setToolTip`` call having been removed, so a tooltip Qt raises
-    on its own -- an elided item in a tree, a truncated header -- does not
-    reintroduce one either.
-
-    The ``QToolTip`` rule in the stylesheet is kept as a fallback: if this
-    filter is ever taken out, tooltips come back styled rather than black.
+    Every tooltip explanation now lives in Help instead (searchable,
+    selectable, not dismissed by a moved pointer). Swallows the event
+    itself so a tooltip Qt raises on its own (elided item, truncated
+    header) is suppressed too, not just ones from ``setToolTip`` calls.
     """
 
     def eventFilter(self, obj, event):
