@@ -20,6 +20,7 @@ from __future__ import annotations
 from ..deps import np, nib, nio
 from . import accel
 from .io import raw_array
+from .volume_stream import RawSliceReader, StreamingNiftiWriter
 
 
 # Reorientation
@@ -107,25 +108,105 @@ def run_angle_rotation(img, axis: str, angle_deg: float):
 
 # Cropping
 
+def _check_crop_ranges(shape, x_range, y_range, z_range):
+    for (s, e), dim, ax in zip([x_range, y_range, z_range], shape, 'XYZ'):
+        if s < 0 or e > dim or s >= e:
+            raise ValueError(f"Invalid {ax} range [{s}:{e}] for size {dim}")
+
+
+def _crop_affine(img, x0, y0, z0):
+    """Affine translation shifted so index ``(x0, y0, z0)`` keeps its world
+    position."""
+    off = np.array([x0, y0, z0])
+    new_aff = img.affine.copy()
+    new_aff[:3, 3] = img.affine[:3, :3] @ off + img.affine[:3, 3]
+    return new_aff
+
+
 def run_cropper(img, x_range, y_range, z_range):
-    """Crop *img* to the closed-open voxel index ranges provided.
+    """Crop *img* to the closed-open voxel index ranges provided, in memory.
+
+    Materialises the cropped region as a single array, so this is meant for
+    a crop small enough to hold resident (the "keep working in this
+    session" path). For anything saved straight to disk, prefer
+    :func:`run_cropper_streaming`, which never holds more than one slab
+    regardless of how large the crop is.
 
     The affine translation is shifted so the cropped volume keeps its
     world position: the voxel at index ``(x0, y0, z0)`` stays at the same
     millimetre coordinate.
     """
     shape = img.shape
-    for (s, e), dim, ax in zip([x_range, y_range, z_range], shape, 'XYZ'):
-        if s < 0 or e > dim or s >= e:
-            raise ValueError(f"Invalid {ax} range [{s}:{e}] for size {dim}")
+    _check_crop_ranges(shape, x_range, y_range, z_range)
     x0, x1 = x_range
     y0, y1 = y_range
     z0, z1 = z_range
     cropped = np.asanyarray(img.dataobj[x0:x1, y0:y1, z0:z1])
-    off     = np.array([x0, y0, z0])
-    new_t   = img.affine[:3, :3] @ off + img.affine[:3, 3]
-    new_aff = img.affine.copy()
-    new_aff[:3, 3] = new_t
+    new_aff = _crop_affine(img, x0, y0, z0)
     hdr = img.header.copy()
     hdr.set_data_shape(cropped.shape)
     return nib.Nifti1Image(cropped, new_aff, hdr)
+
+
+def run_cropper_streaming(img, x_range, y_range, z_range, out_path, *,
+                          progress=None, cancel=None):
+    """Crop *img* to the closed-open voxel index ranges and write the result
+    directly to *out_path*, one slab at a time.
+
+    Unlike :func:`run_cropper`, the cropped region is never materialised as
+    a whole -- working set is one slab
+    (:data:`niftitool.core.volume_stream.SLAB_BUDGET_BYTES`), independent of
+    the crop's size. This is what a crop saved to disk should use: the
+    in-memory version copies "nearly the whole volume, minus a thin
+    margin" into a full array and then hands it to a non-streaming
+    ``nib.save``, which for a large scan can ask Windows to commit more
+    virtual memory than the page file allows (``WinError 1455``) even when
+    the machine has plenty of free RAM for the *result* -- the transient
+    peak during the copy/compress is the problem, not the final file.
+
+    Parameters
+    ----------
+    out_path
+        Destination ``.nii``/``.nii.gz``.
+    progress
+        Optional ``fn(stage: str, fraction: float)`` callback.
+    cancel
+        Optional ``fn() -> bool``; raises
+        :class:`~niftitool.utils.OperationCancelled` when true.
+
+    Returns the cropped shape (including any trailing dimensions).
+    """
+    from ..utils import OperationCancelled
+
+    shape = img.shape
+    _check_crop_ranges(shape, x_range, y_range, z_range)
+    x0, x1 = x_range
+    y0, y1 = y_range
+    z0, z1 = z_range
+
+    reader = RawSliceReader(img)
+    new_aff = _crop_affine(img, x0, y0, z0)
+    out_shape = (x1 - x0, y1 - y0, z1 - z0) + reader.extra_shape
+    total = max(1, (z1 - z0) * max(1, int(np.prod(reader.extra_shape or (1,)))))
+    done = 0
+
+    with StreamingNiftiWriter(
+        out_path,
+        source_header=img.header,
+        affine=new_aff,
+        shape=out_shape,
+        dtype=reader.dtype,
+        slope=reader.slope,
+        inter=reader.inter,
+    ) as writer:
+        for index in np.ndindex(*reader.extra_shape) if reader.extra_shape else [()]:
+            for _, raw in reader.iter_slabs(
+                index=index, x=(x0, x1), y=(y0, y1), z=(z0, z1),
+            ):
+                if cancel is not None and cancel():
+                    raise OperationCancelled("cancelled")
+                writer.write_block(raw)
+                done += raw.shape[2]
+                if progress is not None:
+                    progress("writing", min(1.0, done / total))
+    return out_shape

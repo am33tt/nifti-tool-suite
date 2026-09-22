@@ -15,7 +15,9 @@ from pathlib import Path
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from ..config import STATS_SUBSAMPLE_VOXELS
-from ..core.geometry import run_angle_rotation, run_cropper, run_reorientation
+from ..core.geometry import (
+    run_angle_rotation, run_cropper, run_cropper_streaming, run_reorientation,
+)
 from ..core.histogram import compute_histogram
 from ..core.io import (
     LazyGrayVolume, load_nifti, preview_volume, raw_array, run_gunzip, to_gray,
@@ -746,16 +748,35 @@ class ActionsMixin:
                     f"Crop  X{ranges['X']}  Y{ranges['Y']}  Z{ranges['Z']}"
                 )
                 self._set_status("Cropping...", busy=True)
-                result = run_cropper(self._img, ranges['X'], ranges['Y'], ranges['Z'])
-                if self._abort_if_stopped("Crop"):
-                    return
-                self._append_log(f"  Cropped shape: {result.shape}", 'ok')
                 if out_path:
-                    nib.save(result, str(out_path))
+                    # Streamed straight to disk: working set is one slab,
+                    # not the cropped volume, so this doesn't hand a huge
+                    # in-memory array to a non-streaming nib.save (the
+                    # WinError 1455 / commit-limit failure on a large crop).
+                    out_shape = run_cropper_streaming(
+                        self._img, ranges['X'], ranges['Y'], ranges['Z'],
+                        out_path,
+                        progress=lambda stage, done: self._set_status(
+                            f"Crop: {stage} {done:.0%}", busy=True,
+                        ),
+                        cancel=self.cancel_requested,
+                    )
+                    if self._abort_if_stopped("Crop"):
+                        return
+                    self._append_log(f"  Cropped shape: {out_shape}", 'ok')
                     self._set_status("Crop saved.", busy=False)
                     self.after(0, lambda: self._ask_load_after_save(
                         "Cropped volume saved.", out_path))
                 else:
+                    # Kept in the session rather than saved: the point is a
+                    # smaller resident array to keep working with, so this
+                    # path materialises (it always crops the volume down,
+                    # never up).
+                    result = run_cropper(
+                        self._img, ranges['X'], ranges['Y'], ranges['Z'])
+                    if self._abort_if_stopped("Crop"):
+                        return
+                    self._append_log(f"  Cropped shape: {result.shape}", 'ok')
                     self._img = result
                     self._gray = None
                     self._slice_cache.set_volume(None)
