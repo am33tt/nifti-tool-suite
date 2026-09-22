@@ -298,12 +298,18 @@ class ActionsMixin:
 
             est_mb = g.size * 4 / (1024 ** 2)
             free_mb = available_ram_mb()
-            if free_mb is not None and est_mb > 0.60 * free_mb:
+            # free_mb is None when psutil is missing: with no RAM figure to
+            # check against, materialising unconditionally would silently
+            # drop the safety margin this method exists to enforce, so an
+            # unknown budget is treated the same as an insufficient one.
+            if free_mb is None or est_mb > 0.60 * free_mb:
+                budget_str = f"{free_mb:.0f} MiB free" if free_mb is not None \
+                    else "free RAM unknown (psutil not installed)"
                 self._append_log(
-                    f"  Volume is {est_mb:.0f} MiB float32 vs {free_mb:.0f} "
-                    f"MiB free, staying on the lazy proxy. Slicing reads "
-                    f"through the file mmap; compute steps will still "
-                    f"materialise on demand.",
+                    f"  Volume is {est_mb:.0f} MiB float32 vs {budget_str}, "
+                    f"staying on the lazy proxy. Slicing reads through the "
+                    f"file mmap; compute steps will still materialise on "
+                    f"demand.",
                     'warn',
                 )
                 return

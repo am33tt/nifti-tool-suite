@@ -6,6 +6,7 @@ NiftiApp owns the shared volume state and wires the tab mixins together.
 from __future__ import annotations
 
 import threading
+import traceback
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QKeySequence, QShortcut, QFont
@@ -439,7 +440,17 @@ class NiftiApp(
         try:
             fn()
         except Exception:
-            pass
+            # Every deferred UI update (after a volume load, a slider drag,
+            # a background task finishing) is routed through here. Swallowing
+            # silently turned real bugs into "nothing happens" with no way
+            # to diagnose them -- log the traceback instead so a failure on
+            # another machine/environment is visible, not invisible.
+            name = getattr(fn, "__name__", repr(fn))
+            self._append_log(
+                f"  Internal error in scheduled update {name!r}:\n"
+                f"{traceback.format_exc()}",
+                'err',
+            )
 
     def _do_delayed_call(self, ms: int, fn):
         if self._shutting_down:
