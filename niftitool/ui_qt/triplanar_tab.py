@@ -1176,9 +1176,15 @@ class TriplanarMixin:
             cache = self._tri_lut_cache = {}
         lut = cache.get(cmap_name)
         if lut is None:
-            import matplotlib.cm as mcm
-            lut = (mcm.get_cmap(cmap_name)(np.linspace(0.0, 1.0, 256))
-                   * 255.0).astype(np.uint8)
+            # matplotlib.cm.get_cmap was deprecated in Matplotlib 3.7 and is
+            # gone outright on some 3.9+ builds (it lingers as a warning-only
+            # alias on others, which is why this shipped without being
+            # caught: it still worked wherever it was written and tested).
+            # matplotlib.colormaps is the stable registry added in 3.5 and
+            # is used directly instead of through the removed function.
+            import matplotlib
+            cmap = matplotlib.colormaps[cmap_name]
+            lut = (cmap(np.linspace(0.0, 1.0, 256)) * 255.0).astype(np.uint8)
             cache[cmap_name] = lut
         return lut
 
